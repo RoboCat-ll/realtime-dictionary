@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "实时字典浏览器适配器",
+  "version": "0.19.8",
+  "description": "让实时字典在浏览器中直接跟随网页文字。",
+  "host_permissions": ["http://127.0.0.1:8877/*"],
+  "permissions": ["storage"],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "实时词典设置"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}

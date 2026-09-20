@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>实时词典</title>
+<style>
+  body { font: 13px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; width: 280px; margin: 0; padding: 14px 16px; color: #30343c; }
+  label { display: flex; gap: 8px; align-items: flex-start; font-weight: 600; }
+  label input { margin-top: 2px; }
+  .row { margin-top: 13px; }
+  .row label { display: block; margin-bottom: 5px; }
+  select { width: 100%; padding: 6px 8px; border: 1px solid #d8dce4; border-radius: 6px; background: #fff; }
+  #restoreIgnored { width: 100%; margin-top: 11px; padding: 7px 8px; border: 1px solid #d8dce4; border-radius: 6px; background: #fff; color: #4a5260; cursor: pointer; }
+  p { margin: 10px 0 0; color: #69707c; font-weight: 400; }
+</style>
+<label><input type="checkbox" id="autoFollow">自动跟随新内容</label>
+<div class="row"><label for="difficulty">标注密度</label><select id="difficulty"><option value="concise">精简：只标核心术语</option><option value="standard">标准：推荐</option><option value="detailed">深入：更多疑难词</option></select></div>
+<button id="restoreIgnored" type="button">恢复所有被忽略的词</button>
+<p>关闭时，只有按 Ctrl+Alt+K 才扫描一次当前页面。开启后，聊天等动态页面在内容变化时会自动重扫：只发送可视区域文字，两次之间至少间隔 8 秒。</p>
+<p>扫描到的页面文字会发送到本机分析服务（127.0.0.1）；配置了 API Key 时，文字会进一步发送给模型服务商用于术语识别。</p>
+<script src="popup.js"></script>
+</html>

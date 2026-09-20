@@ -1,0 +1,73 @@
+#semantic-overlay-browser-root {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483646;
+  pointer-events: none;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.semantic-overlay-browser-term {
+  position: fixed;
+  box-sizing: border-box;
+  padding: 0;
+  border: 1px solid rgba(240, 128, 24, .82);
+  border-radius: 3px;
+  background: rgba(255, 184, 48, .34);
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.semantic-overlay-browser-term.semantic-overlay-browser-task {
+  border-color: rgba(38, 94, 210, .88);
+  background: rgba(82, 148, 255, .28);
+}
+
+.semantic-overlay-browser-popup {
+  position: fixed;
+  box-sizing: border-box;
+  width: min(390px, calc(100vw - 16px));
+  max-height: min(360px, calc(100vh - 16px));
+  overflow: auto;
+  padding: 14px 18px 17px;
+  border: 1px solid #dadee6;
+  border-radius: 13px;
+  background: #fff;
+  color: #30343c;
+  box-shadow: 0 12px 32px rgba(20, 30, 50, .22);
+  pointer-events: auto;
+}
+
+.semantic-overlay-browser-title {
+  display: flex;
+  align-items: center;
+  min-height: 28px;
+  color: #204eb4;
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.semantic-overlay-browser-title button {
+  margin-left: auto;
+  border: 0;
+  background: transparent;
+  color: #69707c;
+  cursor: pointer;
+  font-size: 22px;
+  line-height: 24px;
+}
+
+.semantic-overlay-browser-title button:first-child { margin-left: 0; margin-right: 8px; }
+.semantic-overlay-browser-body { margin-top: 10px; font-size: 15px; line-height: 1.65; white-space: pre-wrap; }
+.semantic-overlay-browser-body a { color: #2a6bda; cursor: pointer; text-decoration: none; }
+.semantic-overlay-browser-body a:hover { text-decoration: underline; }
+.semantic-overlay-browser-footer { display: flex; align-items: center; justify-content: space-between; margin-top: 13px; padding-top: 10px; border-top: 1px solid #eef0f4; }
+.semantic-overlay-browser-footer a { margin-right: auto; color: #2a6bda; font-size: 13px; text-decoration: none; }
+.semantic-overlay-browser-footer button { margin-left: 8px; padding: 5px 10px; border: 1px solid #dadee6; border-radius: 7px; background: #fff; color: #4a5260; cursor: pointer; }
+.semantic-overlay-browser-footer button:hover { background: #f6f7f9; }
+.semantic-overlay-browser-footer button:disabled { color: #9aa1ad; cursor: wait; background: #f6f7f9; }
+.semantic-overlay-browser-footer[hidden] { display: none; }
+.semantic-overlay-calendar-form { white-space: normal; }
+.semantic-overlay-calendar-form label { display: block; margin: 9px 0; }
+.semantic-overlay-calendar-form input { display: block; width: 100%; box-sizing: border-box; font: inherit; padding: 6px; }
+.semantic-overlay-calendar-form button { padding: 8px; cursor: pointer; }
+.semantic-overlay-calendar-form p { font-size: 13px; line-height: 1.5; }
