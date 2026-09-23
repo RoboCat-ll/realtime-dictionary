@@ -50,7 +50,8 @@ class ShortcutLookupTests(unittest.TestCase):
     def test_ocr_shortcut_without_provider(self):
         with patch.object(server, "call_llm", side_effect=AssertionError("billable call")):
             result = server.lookup("Ctr1+A1t+K", "实时字典高亮")
-        self.assertIn("刷新当前窗口", result["explanation"])
+        self.assertIn("单击一条聊天消息", result["explanation"])
+        self.assertIn("10 秒", result["explanation"])
         self.assertEqual(result["lookup_mode"], "local_shortcut")
 
     def test_hyphen_and_trailing_o_are_canonicalized_locally(self):
@@ -63,7 +64,8 @@ class ShortcutLookupTests(unittest.TestCase):
                 self.assertEqual(result["lookup_mode"], "local_shortcut")
 
     def test_do_not_invent_other_apps_shortcut(self):
-        self.assertIn("刷新当前窗口", server.shortcut_explanation("Ctrl+Alt+K", "编辑器"))
+        self.assertIn("单击一条聊天消息", server.shortcut_explanation("Ctrl+Alt+K", "编辑器"))
+        self.assertIn("自动退出待选状态", server.shortcut_explanation("Ctrl+Alt+K", "编辑器"))
         self.assertIn("取决于当前软件", server.shortcut_explanation("Ctrl+Shift+P", "编辑器"))
         self.assertIsNone(server.shortcut_explanation("C++"))
         self.assertIsNone(server.shortcut_explanation("AirPodsPro6"))

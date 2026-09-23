@@ -20,6 +20,7 @@ New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
     /reference:System.Web.Extensions.dll `
     /reference:"$naudio" `
     "$hostDir\Program.cs" `
+    "$hostDir\UsageMetrics.cs" `
     "$hostDir\LocalReminders.cs" `
     "$hostDir\AudioCapture.cs" `
     "$hostDir\ProcessLoopbackAudioClient.cs"
@@ -72,6 +73,7 @@ if ($LASTEXITCODE -ne 0) {
     /reference:System.Web.Extensions.dll `
     /reference:"$naudio" `
     "$hostDir\Program.cs" `
+    "$hostDir\UsageMetrics.cs" `
     "$hostDir\LocalReminders.cs" `
     "$hostDir\AudioCapture.cs" `
     "$hostDir\ProcessLoopbackAudioClient.cs" `
@@ -115,6 +117,7 @@ if ($LASTEXITCODE -ne 0) {
     /reference:System.Web.Extensions.dll `
     /reference:"$naudio" `
     "$hostDir\Program.cs" `
+    "$hostDir\UsageMetrics.cs" `
     "$hostDir\LocalReminders.cs" `
     "$hostDir\AudioCapture.cs" `
     "$hostDir\ProcessLoopbackAudioClient.cs" `
@@ -134,6 +137,7 @@ if ($LASTEXITCODE -ne 0) {
     /reference:System.Web.Extensions.dll `
     /reference:"$naudio" `
     "$hostDir\Program.cs" `
+    "$hostDir\UsageMetrics.cs" `
     "$hostDir\LocalReminders.cs" `
     "$hostDir\AudioCapture.cs" `
     "$hostDir\ProcessLoopbackAudioClient.cs" `
@@ -149,7 +153,7 @@ if ($LASTEXITCODE -ne 0) {
     /reference:System.dll /reference:System.Core.dll `
     /reference:System.Drawing.dll /reference:System.Windows.Forms.dll `
     /reference:System.Web.Extensions.dll /reference:"$naudio" `
-    "$hostDir\Program.cs" "$hostDir\LocalReminders.cs" `
+    "$hostDir\Program.cs" "$hostDir\UsageMetrics.cs" "$hostDir\LocalReminders.cs" `
     "$hostDir\AudioCapture.cs" "$hostDir\ProcessLoopbackAudioClient.cs" `
     "$hostDir\diagnostics\RefinementTest.cs"
 if ($LASTEXITCODE -ne 0) { throw "Refinement test compilation failed." }

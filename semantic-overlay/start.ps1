@@ -114,4 +114,4 @@ if (-not $registered) {
     throw "程序已经启动，但快捷键注册未通过。请查看 _native_host.log。"
 }
 
-Write-Host "可以使用：Ctrl+Alt+K 识别当前窗口；Ctrl+Alt+G 清除高亮。"
+Write-Host "可以使用：按 Ctrl+Alt+K，再在 10 秒内单击一条微信或 QQ 消息；Ctrl+Alt+D 保留为直接查词。"

@@ -14,6 +14,9 @@
 !/semantic-overlay/configure-key.ps1
 !/semantic-overlay/package.ps1
 !/semantic-overlay/AGENTS.md
+!/semantic-overlay/PRODUCT_SCOPE.md
+!/semantic-overlay/METRICS.md
+!/semantic-overlay/REAL_WORLD_TEST_PROTOCOL.md
 !/semantic-overlay/native-host/
 /semantic-overlay/native-host/*
 !/semantic-overlay/native-host/*.cs

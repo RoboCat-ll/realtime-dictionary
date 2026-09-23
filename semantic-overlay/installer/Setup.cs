@@ -360,7 +360,7 @@ namespace RealtimeDictionary.Setup
             Label description = new Label();
             description.Text =
                 "面向微信、QQ 等聊天窗口和无原生字幕会议的实时词典。\r\n" +
-                "按 Ctrl + Alt + K 高亮疑难词，会议模式可从系统声音生成字幕。";
+                "按 Ctrl+Alt+K，再在 10 秒内单击一条微信或 QQ 消息；整窗高亮与会议字幕位于实验功能。";
             description.Location = new Point(31, 72);
             description.Size = new Size(475, 52);
             Controls.Add(description);

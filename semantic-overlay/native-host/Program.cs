@@ -5,9 +5,11 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
@@ -59,23 +61,26 @@ namespace SemanticOverlay.NativeHost
         private readonly List<HighlightItem> relativeHighlights = new List<HighlightItem>();
         private readonly StatusForm statusWindow;
         private readonly DefinitionForm definitionWindow;
+        private readonly AssistantPanelForm assistantPanel;
+        private readonly HighlightForm assistantLookupAnchor = new HighlightForm();
         private readonly CaptionLyricForm captionLyricWindow;
         private readonly CaptionHistoryForm captionHistoryWindow;
         private readonly LocalReminderManager reminders;
         private readonly ToolStripMenuItem reminderMenuItem;
         private readonly ServiceManager services;
         private readonly SelectionActionForm selectionAction = new SelectionActionForm();
+        private SelectionAnalysisForm selectionAnalysis;
         private Point? selectionDragStart;
         private IntPtr selectionTarget;
         private int selectionGeneration;
         private int selectionProbeBusy;
+        private const int MessageClickArmSeconds = 10;
+        private DateTime messageClickArmedUntilUtc = DateTime.MinValue;
         private Func<List<OcrWord>, ScanResponse> refineWords;
         private bool choosingScanRegion;
         private IntPtr customRegionWindow;
         private RectangleF customRegion;
         private readonly object refreshLock = new object();
-        private readonly Dictionary<string, LookupResponse> lookupCache =
-            new Dictionary<string, LookupResponse>(StringComparer.OrdinalIgnoreCase);
         private readonly List<LookupView> lookupHistory = new List<LookupView>();
         private readonly List<CaptionEntry> captionHistory = new List<CaptionEntry>();
         private readonly NativeMethods.WinEventDelegate winEventDelegate;
@@ -152,6 +157,8 @@ namespace SemanticOverlay.NativeHost
             reminders = new LocalReminderManager();
             statusWindow = new StatusForm();
             definitionWindow = new DefinitionForm();
+            assistantPanel = new AssistantPanelForm();
+            assistantPanel.ItemClicked += BeginAssistantItemAction;
             captionLyricWindow = new CaptionLyricForm();
             captionHistoryWindow = new CaptionHistoryForm();
             captionHistoryWindow.Lookup = delegate(string term, string context)
@@ -173,6 +180,7 @@ namespace SemanticOverlay.NativeHost
                 OpenReminderEditor(candidate, null);
             };
             definitionWindow.RetryRequested += RetryCurrentLookup;
+            definitionWindow.FeedbackSubmitted += OnDefinitionFeedback;
             dispatcher = new MessageForm();
             dispatcher.HotkeyPressed += OnHotkey;
 
@@ -198,19 +206,57 @@ namespace SemanticOverlay.NativeHost
             trayUsageItem.Enabled = false;
             menu.Items.Add(trayUsageItem);
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add("识别/刷新当前窗口", null, delegate { BeginSession(); });
-            menu.Items.Add("清除当前高亮", null, delegate { DisableSession(); });
+            ToolStripMenuItem selectionGuide = new ToolStripMenuItem(
+                "使用方法：按 Ctrl+Alt+K，再单击一条聊天消息");
+            selectionGuide.Enabled = false;
+            menu.Items.Add(selectionGuide);
             menu.Items.Add("主动查词（选中文字后 Ctrl+Alt+D）…", null,
                 delegate { OpenManualLookup(false); });
-            ToolStripMenuItem selectionMenu = new ToolStripMenuItem("划词后显示 AI 解释") {
+            ToolStripMenuItem selectionMenu = new ToolStripMenuItem("Ctrl+Alt+K 后单击消息（拖选兜底）") {
                 Checked = services.SelectionToolbarEnabled };
             selectionMenu.Click += delegate {
                 services.SetSelectionToolbarEnabled(!services.SelectionToolbarEnabled);
                 selectionMenu.Checked = services.SelectionToolbarEnabled;
                 DismissSelectionAction();
+                DisarmMessageClick("feature toggled");
             };
             menu.Items.Add(selectionMenu);
             selectionAction.ExplainRequested += ExplainSelection;
+            ToolStripMenuItem experimentalMenu = new ToolStripMenuItem(
+                "实验功能（整窗扫描 / 会议 / 提醒 / 浏览器）");
+            ToolStripMenuItem experimentalToggle = new ToolStripMenuItem("启用冻结实验功能") {
+                Checked = services.ExperimentalFeaturesEnabled
+            };
+            experimentalToggle.Click += delegate
+            {
+                services.SetExperimentalFeaturesEnabled(!services.ExperimentalFeaturesEnabled);
+                experimentalToggle.Checked = services.ExperimentalFeaturesEnabled;
+                foreach (ToolStripItem child in experimentalMenu.DropDownItems)
+                    if (child != experimentalToggle && !(child is ToolStripSeparator))
+                        child.Enabled = services.ExperimentalFeaturesEnabled;
+                if (!services.ExperimentalFeaturesEnabled && services.WorkMode == "caption")
+                {
+                    if (active) DisableSession();
+                    services.SetWorkMode("conversation");
+                }
+                ShowNotice(services.ExperimentalFeaturesEnabled
+                    ? "会议、提醒和浏览器实验功能已启用。"
+                    : "实验功能已关闭；微信与 QQ 查词不受影响。", ToolTipIcon.Info);
+            };
+            experimentalMenu.DropDownItems.Add(experimentalToggle);
+            experimentalMenu.DropDownItems.Add(new ToolStripSeparator());
+            experimentalMenu.DropDownItems.Add("扫描当前窗口（兼容）", null,
+                delegate { BeginSession(); });
+            experimentalMenu.DropDownItems.Add("清除整窗扫描结果", null,
+                delegate { DisableSession(); });
+            experimentalMenu.DropDownItems.Add(new ToolStripSeparator());
+            experimentalMenu.DropDownOpening += delegate
+            {
+                experimentalToggle.Checked = services.ExperimentalFeaturesEnabled;
+                foreach (ToolStripItem child in experimentalMenu.DropDownItems)
+                    if (child != experimentalToggle && !(child is ToolStripSeparator))
+                        child.Enabled = services.ExperimentalFeaturesEnabled;
+            };
             ToolStripMenuItem workModeMenu = new ToolStripMenuItem("工作模式");
             ToolStripMenuItem conversationModeItem = new ToolStripMenuItem("对话窗口（默认）");
             ToolStripMenuItem captionModeItem = new ToolStripMenuItem("会议语音字幕");
@@ -248,7 +294,8 @@ namespace SemanticOverlay.NativeHost
                         HideDefinition();
                         if (browserWasActive)
                             Task.Factory.StartNew(delegate { services.ClearBrowser(); });
-                        if (value == "conversation" && IsBrowserWindow(targetWindow))
+                        if (value == "conversation" && services.ExperimentalFeaturesEnabled &&
+                            IsBrowserWindow(targetWindow))
                             StartBrowserAdapter(targetWindow);
                         else
                             ScheduleRefresh(0);
@@ -264,7 +311,7 @@ namespace SemanticOverlay.NativeHost
                 };
                 workModeMenu.DropDownItems.Add(item);
             }
-            menu.Items.Add(workModeMenu);
+            experimentalMenu.DropDownItems.Add(workModeMenu);
             ToolStripMenuItem audioSourceMenu = new ToolStripMenuItem("会议音源");
             ToolStripMenuItem processAudioItem = new ToolStripMenuItem("当前会议进程优先（推荐）");
             ToolStripMenuItem systemAudioItem = new ToolStripMenuItem("全系统声音（兼容模式）");
@@ -289,13 +336,41 @@ namespace SemanticOverlay.NativeHost
                 };
                 audioSourceMenu.DropDownItems.Add(item);
             }
-            menu.Items.Add(audioSourceMenu);
-            menu.Items.Add("查看字幕记录…", null, delegate { ShowCaptionHistory(); });
+            experimentalMenu.DropDownItems.Add(audioSourceMenu);
+            experimentalMenu.DropDownItems.Add("查看字幕记录…", null, delegate { ShowCaptionHistory(); });
             reminderMenuItem = new ToolStripMenuItem();
             reminderMenuItem.Click += delegate { reminders.ShowList(); };
             reminders.CountChanged += UpdateReminderMenu;
             UpdateReminderMenu();
-            menu.Items.Add(reminderMenuItem);
+            experimentalMenu.DropDownItems.Add(reminderMenuItem);
+            menu.Items.Add(experimentalMenu);
+            ToolStripMenuItem presentationMenu = new ToolStripMenuItem("显示方式");
+            ToolStripMenuItem assistantPresentationItem = new ToolStripMenuItem("悬浮助手（默认）");
+            ToolStripMenuItem attachedPresentationItem = new ToolStripMenuItem("原文高亮（兼容）");
+            Action refreshPresentationChecks = delegate
+            {
+                assistantPresentationItem.Checked = services.PresentationMode == "assistant";
+                attachedPresentationItem.Checked = services.PresentationMode == "attached";
+            };
+            assistantPresentationItem.Click += delegate
+            {
+                services.SetPresentationMode("assistant");
+                refreshPresentationChecks();
+                HideHighlights();
+                if (active && highlightsCurrent) RenderHighlights();
+            };
+            attachedPresentationItem.Click += delegate
+            {
+                services.SetPresentationMode("attached");
+                refreshPresentationChecks();
+                HideHighlights();
+                if (active && highlightsCurrent) RenderHighlights();
+            };
+            presentationMenu.DropDownItems.Add(assistantPresentationItem);
+            presentationMenu.DropDownItems.Add(attachedPresentationItem);
+            presentationMenu.DropDownOpening += delegate { refreshPresentationChecks(); };
+            refreshPresentationChecks();
+            menu.Items.Add(presentationMenu);
             ToolStripMenuItem difficultyMenu = new ToolStripMenuItem("标注密度");
             ToolStripMenuItem conciseItem = new ToolStripMenuItem("精简（只标核心术语）");
             ToolStripMenuItem standardItem = new ToolStripMenuItem("标准（推荐）");
@@ -427,8 +502,19 @@ namespace SemanticOverlay.NativeHost
                 ShowNotice("已恢复自动隐藏的词。", ToolTipIcon.Info);
             };
             menu.Items.Add(resetFamiliarityItem);
-            menu.Items.Add("配置模型 API Key…", null, delegate { ConfigureApiKey(); });
-            menu.Items.Add("打开浏览器扩展目录…", null, delegate { ShowBrowserExtensionHelp(); });
+            menu.Items.Add("查看本地体验数据…", null, delegate
+            {
+                try { services.OpenUsageMetricsDirectory(); }
+                catch (Exception error)
+                {
+                    services.Log("Open usage metrics directory failed: " + error.Message);
+                    ShowNotice("无法打开本地体验数据目录。", ToolTipIcon.Warning);
+                }
+            });
+            menu.Items.Add("配置解释模型…", null, delegate { ConfigureApiKey(); });
+            menu.Items.Add("配置 Jev 高亮判断…", null, delegate { ConfigureTypeSafeKey(); });
+            experimentalMenu.DropDownItems.Add("打开浏览器扩展目录…", null,
+                delegate { ShowBrowserExtensionHelp(); });
             menu.Items.Add("使用帮助…", null, delegate { ShowHelp(); });
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("退出", null, delegate { ExitThread(); });
@@ -447,7 +533,7 @@ namespace SemanticOverlay.NativeHost
                 RefreshUsageStatus();
             };
             tray.Visible = true;
-            tray.DoubleClick += delegate { BeginSession(); };
+            tray.DoubleClick += delegate { ArmMessageClick(); };
 
             trackingTimer = new System.Windows.Forms.Timer();
             trackingTimer.Interval = 16;
@@ -478,7 +564,12 @@ namespace SemanticOverlay.NativeHost
         private void OnHotkey(int id)
         {
             if (id == HotkeyHighlight)
-                BeginSession();
+            {
+                if (services.WorkMode == "caption" && services.ExperimentalFeaturesEnabled)
+                    BeginSession();
+                else
+                    ArmMessageClick();
+            }
             else if (id == HotkeyClear)
                 DisableSession();
             else if (id == HotkeyLookup)
@@ -488,24 +579,58 @@ namespace SemanticOverlay.NativeHost
             }
         }
 
+        internal static bool IsMessageClickArmed(DateTime nowUtc, DateTime armedUntilUtc)
+        {
+            return armedUntilUtc != DateTime.MinValue && nowUtc <= armedUntilUtc;
+        }
+
+        private bool MessageClickArmed
+        {
+            get { return services.SelectionToolbarEnabled &&
+                IsMessageClickArmed(DateTime.UtcNow, messageClickArmedUntilUtc); }
+        }
+
+        private void ArmMessageClick()
+        {
+            DismissSelectionAction();
+            if (!services.SelectionToolbarEnabled)
+            {
+                ShowNotice("消息解释当前已关闭；请从托盘重新开启。", ToolTipIcon.Warning);
+                return;
+            }
+            messageClickArmedUntilUtc = DateTime.UtcNow.AddSeconds(MessageClickArmSeconds);
+            trayStatusItem.Text = "状态：等待点击消息（10 秒）";
+            services.Log("One-click message armed for 10 seconds");
+            ShowNotice("已准备：请在 10 秒内单击一条微信或 QQ 消息。",
+                ToolTipIcon.Info);
+        }
+
+        private void DisarmMessageClick(string reason)
+        {
+            if (messageClickArmedUntilUtc == DateTime.MinValue) return;
+            messageClickArmedUntilUtc = DateTime.MinValue;
+            services.Log("One-click message disarmed: " + reason);
+        }
+
         private ManualLookupForm manualLookup;
         private void OpenManualLookup(bool readSelection)
         {
+            string sourceApp = ClassifyChatApp(NativeMethods.GetForegroundWindow());
             if (manualLookup != null && !manualLookup.IsDisposed)
             {
                 // The existing form may be behind the source application and may
                 // still contain the previous query. A new explicit invocation must
                 // reread the current selection instead of merely activating stale UI.
-                manualLookup.Open(readSelection);
+                manualLookup.Open(readSelection, sourceApp);
                 return;
             }
             manualLookup = new ManualLookupForm(services);
-            manualLookup.Open(readSelection);
+            manualLookup.Open(readSelection, sourceApp);
         }
 
         private void ConfigureApiKey()
         {
-            using (ApiKeyForm form = new ApiKeyForm(services.ValidateApiKey))
+            using (ApiKeyForm form = new ApiKeyForm(services.ValidateApiKey, false))
             {
                 if (form.ShowDialog() != DialogResult.OK)
                     return;
@@ -544,6 +669,48 @@ namespace SemanticOverlay.NativeHost
             }
         }
 
+        private void ConfigureTypeSafeKey()
+        {
+            using (ApiKeyForm form = new ApiKeyForm(services.ValidateTypeSafeKey, true))
+            {
+                if (form.ShowDialog() != DialogResult.OK)
+                    return;
+                try
+                {
+                    services.SaveTypeSafeKey(form.ApiKey, form.BaseUrl, form.Model);
+                    trayStatusItem.Text = "状态：正在应用 Jev 配置…";
+                    Task.Factory.StartNew(delegate { return services.RestartAnalysisService(true); })
+                        .ContinueWith(delegate(Task<KeyValidationResult> task)
+                        {
+                            dispatcher.BeginInvoke(new Action(delegate
+                            {
+                                if (task.IsFaulted || task.Result == null || !task.Result.ok)
+                                {
+                                    trayStatusItem.Text = "状态：Jev 未启用，高亮使用本地降级";
+                                    string detail = task.IsFaulted
+                                        ? task.Exception.GetBaseException().Message
+                                        : task.Result.message;
+                                    ShowNotice("配置已保存，但 Jev 未启用：" + detail, ToolTipIcon.Warning);
+                                    return;
+                                }
+                                trayStatusItem.Text = "状态：Jev 已启用，等待快捷键";
+                                ShowNotice("Jev 高亮判断已连接；解释模型配置保持独立。", ToolTipIcon.Info);
+                                RefreshUsageStatus();
+                            }));
+                        });
+                }
+                catch (Exception error)
+                {
+                    services.Log("TypeSafe API Key save failed: " + error.Message);
+                    MessageBox.Show(
+                        "保存失败，请查看 _native_host.log。",
+                        "实时字典",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                }
+            }
+        }
+
         private void RefreshModelStatus()
         {
             Task.Factory.StartNew(delegate
@@ -559,16 +726,22 @@ namespace SemanticOverlay.NativeHost
                         if (task.IsFaulted || task.Result == null)
                         {
                             trayStatusItem.Text = "状态：服务异常";
+                            if (task.IsFaulted)
+                            {
+                                string detail = task.Exception.GetBaseException().Message;
+                                services.Log("Backend startup rejected: " + detail);
+                                ShowNotice(detail, ToolTipIcon.Error);
+                            }
                             return;
                         }
                         string mode = services.WorkMode == "caption" ? "会议字幕" : "对话窗口";
-                        if (task.Result.ok && task.Result.has_key)
-                            trayStatusItem.Text = "状态：" + mode + "模式，模型已配置";
-                        else if (!task.Result.has_key)
+                        if (task.Result.ok && (task.Result.has_explanation_key || task.Result.has_typesafe_key))
+                            trayStatusItem.Text = "状态：" + mode + "模式，智能服务已配置";
+                        else if (!task.Result.has_explanation_key && !task.Result.has_typesafe_key)
                         {
                             trayStatusItem.Text = "状态：" + mode + "模式，仅本地识别";
                             if (services.TakeFirstRunNotice())
-                                ShowNotice("已启动：按 Ctrl+Alt+K 识别；右键托盘可配置模型和查看帮助。", ToolTipIcon.Info);
+                                ShowNotice("已启动：按 Ctrl+Alt+K，再在 10 秒内单击一条微信或 QQ 消息。", ToolTipIcon.Info);
                         }
                         else
                             trayStatusItem.Text = "状态：" + mode + "模式，模型异常";
@@ -604,11 +777,21 @@ namespace SemanticOverlay.NativeHost
         {
             if (health == null || !health.ok)
             {
-                trayUsageItem.Text = "模型分析：服务不可用";
+                trayUsageItem.Text = "引擎：服务不可用";
                 return;
             }
+            string analysis = String.Equals(health.analysis_provider, "typesafe", StringComparison.OrdinalIgnoreCase)
+                ? "Jev / " + health.analysis_model
+                : String.Equals(health.analysis_provider, "local", StringComparison.OrdinalIgnoreCase)
+                    ? "本地规则"
+                    : "解释模型 / " + health.analysis_model;
+            string explanation = health.has_explanation_key
+                ? (health.explanation_model ?? health.model ?? "已配置")
+                : "本地/公共词典";
             trayUsageItem.Text = String.Format(
-                "模型分析：{0}/{1}（近1小时） · 缓存 {2}",
+                "高亮：{0} · 解释：{1} · 调用 {2}/{3} · 缓存 {4}",
+                analysis,
+                explanation,
                 health.model_analysis_calls_last_hour,
                 health.model_analysis_limit_per_hour,
                 health.analysis_cache_entries);
@@ -617,20 +800,28 @@ namespace SemanticOverlay.NativeHost
         private void ShowHelp()
         {
             MessageBox.Show(
-                "对话窗口（默认）\r\n" +
-                "1. 切换到微信、QQ、钉钉或飞书。\r\n" +
-                "2. 按 Ctrl + Alt + K 识别聊天正文。\r\n\r\n" +
-                "会议语音字幕（无原生字幕也可用）\r\n" +
+                "微信 / QQ 聊天（当前验证范围）\r\n" +
+                "1. 切换到微信或 QQ。\r\n" +
+                "2. 按 Ctrl + Alt + K，进入 10 秒待选状态。\r\n" +
+                "3. 单击一条需要理解的消息一次；点击后待选状态自动结束。\r\n" +
+                "4. 先阅读整段解释，再按需点击原文中的必要术语。\r\n\r\n" +
+                "程序优先读取完整消息控件；读不到时会定位整个消息气泡并 OCR。原文始终显示在面板中，可直接修改后重试。每次只处理当前消息，最多 1000 个字符。\r\n" +
+                "拖选后出现的“解释这段”仅作为单击识别失败时的兜底。\r\n" +
+                "主动查词：选中文字后按 Ctrl + Alt + D；读取不到时会自动采用明确复制的文字，仍可手动修改。\r\n" +
+                "本地体验数据不记录聊天正文、查询词或解释内容，可从托盘查看。\r\n\r\n" +
+                "实验功能（默认关闭）\r\n" +
+                "整窗 OCR 高亮、会议字幕、提醒和浏览器扩展只保留兼容测试。\r\n" +
+                "需要整窗扫描时，先启用实验功能，再点击“扫描当前窗口（兼容）”。\r\n" +
+                "会议语音字幕：\r\n" +
                 "1. 从托盘的“工作模式”切换为“会议语音字幕”。\r\n" +
                 "2. “会议音源”默认优先当前进程；遇到无声可切换全系统兼容模式。\r\n" +
                 "3. 切回会议窗口，按 Ctrl + Alt + K，并确认发送语音片段。\r\n" +
                 "4. 托盘状态会明确显示实际音源；麦克风默认不采集。\r\n\r\n" +
-                "左键点击高亮词查看中文解释；解释打开时字幕刷新会暂停。\r\n" +
+                "会议字幕仍使用原文词语高亮；解释打开时字幕刷新会暂停。\r\n" +
                 "右键高亮词可选择以后不再标注。\r\n" +
                 "蓝色时间可编辑为本地提醒；提醒保存在本机，到点弹窗，可延后10分钟。\r\n" +
                 "实时字典必须在托盘运行才能准时提醒；托盘“本地提醒”可查看和删除。\r\n" +
                 "按 Ctrl + Alt + G 结束当前高亮或字幕会话。\r\n\r\n" +
-                "未高亮的词：选中文字后按 Ctrl + Alt + D；读取不到时可输入或粘贴。\r\n\r\n" +
                 "会议模式不读取屏幕文字。静音在本地丢弃；检测到的语音片段发送到硅基流动生成字幕。临时网络错误会冷却后继续，密钥或余额错误才会停止。",
                 "实时字典使用帮助",
                 MessageBoxButtons.OK,
@@ -690,6 +881,7 @@ namespace SemanticOverlay.NativeHost
             }
             targetRect = rect;
             active = true;
+            assistantPanel.StartForTarget(targetRect);
             browserBridgeRunning = false;
             browserDomActive = false;
             highlightsCurrent = false;
@@ -713,7 +905,8 @@ namespace SemanticOverlay.NativeHost
                 StartAudioCaptionSession();
                 return;
             }
-            if (services.WorkMode != "caption" && IsBrowserWindow(foreground) &&
+            if (services.WorkMode != "caption" && services.ExperimentalFeaturesEnabled &&
+                IsBrowserWindow(foreground) &&
                 customRegionWindow != foreground)
             {
                 StartBrowserAdapter(foreground);
@@ -736,6 +929,8 @@ namespace SemanticOverlay.NativeHost
 
         private void DisableSession()
         {
+            DisarmMessageClick("session cleared");
+            DismissSelectionAction();
             services.EndAnalysisContext();
             scrollTrackingGeneration++;
             scrollTrackingFailures = 0;
@@ -1979,6 +2174,13 @@ namespace SemanticOverlay.NativeHost
 
         private void TrackTarget(object sender, EventArgs args)
         {
+            if (messageClickArmedUntilUtc != DateTime.MinValue && !MessageClickArmed)
+            {
+                DisarmMessageClick("expired");
+                DismissSelectionAction();
+                if (!active)
+                    trayStatusItem.Text = "状态：待命，按 Ctrl+Alt+K 后点击消息";
+            }
             if (selectionAction != null && selectionAction.Visible &&
                 (DateTime.UtcNow > selectionAction.ExpiresUtc ||
                  NativeMethods.GetForegroundWindow() != selectionTarget))
@@ -2064,10 +2266,18 @@ namespace SemanticOverlay.NativeHost
             DateTime due;
             lock (refreshLock)
                 due = refreshDueUtc;
-            bool popupBlocksCaptionScan = services.WorkMode == "caption" && definitionWindow.Visible;
-            if (!scanRunning && !popupBlocksCaptionScan && due != DateTime.MaxValue &&
+            bool popupBlocksScheduledScan = PopupBlocksScheduledScan(
+                services.WorkMode, definitionWindow.Visible);
+            if (!scanRunning && !popupBlocksScheduledScan && due != DateTime.MaxValue &&
                 DateTime.UtcNow >= due && NativeMethods.GetForegroundWindow() == targetWindow)
                 StartScan();
+        }
+
+        internal static bool PopupBlocksScheduledScan(string workMode, bool definitionVisible)
+        {
+            // A definition is the user's active task in every work mode.  A
+            // periodic OCR refresh must not make the card flash and disappear.
+            return definitionVisible;
         }
 
         private void QueueGeometryUpdate()
@@ -2112,6 +2322,8 @@ namespace SemanticOverlay.NativeHost
                 if (services.WorkMode == "caption" && captionLyricWindow.Visible)
                     captionLyricWindow.PositionFor(targetRect);
                 statusWindow.PositionFor(targetRect);
+                if (UseAssistantPresentation())
+                    assistantPanel.PositionFor(targetRect);
                 if (selectedHighlight != null && definitionWindow.Visible)
                     definitionWindow.PositionFor(selectedHighlight.Bounds);
             }
@@ -2124,10 +2336,14 @@ namespace SemanticOverlay.NativeHost
             trackingViewport = null;
             relativeHighlights.RemoveAll(delegate(HighlightItem item)
             {
-                return item != null &&
-                    !String.Equals(item.kind, "task", StringComparison.OrdinalIgnoreCase) &&
-                    services.ShouldSuppressTerm(item.term);
+                if (item == null) return true;
+                bool task = String.Equals(item.kind, "task", StringComparison.OrdinalIgnoreCase);
+                if (task) return !services.ExperimentalFeaturesEnabled;
+                return services.ShouldSuppressTerm(item.term);
             });
+            if (relativeHighlights.Count > 5)
+                relativeHighlights.RemoveRange(5, relativeHighlights.Count - 5);
+            assistantPanel.SetItems(relativeHighlights);
             while (windows.Count < relativeHighlights.Count)
             {
                 HighlightForm window = new HighlightForm();
@@ -2154,11 +2370,18 @@ namespace SemanticOverlay.NativeHost
             }
             services.Log("Highlight render: " + relativeHighlights.Count +
                 " windows, " + renderWatch.ElapsedMilliseconds + "ms");
+            services.RecordHighlightMetric(ClassifyChatApp(targetWindow),
+                relativeHighlights.Count, "rendered");
             return renderWatch.ElapsedMilliseconds;
         }
 
         private void PositionHighlightWindows()
         {
+            if (UseAssistantPresentation())
+            {
+                assistantPanel.PositionFor(targetRect);
+                return;
+            }
             if (relativeHighlights.Count == 0)
                 return;
             Rectangle[] boundsByIndex = new Rectangle[relativeHighlights.Count];
@@ -2215,6 +2438,19 @@ namespace SemanticOverlay.NativeHost
         private void ShowHighlightWindows()
         {
             HashSet<string> visibleTerms = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (UseAssistantPresentation())
+            {
+                foreach (HighlightForm window in windows)
+                    window.Hide();
+                foreach (HighlightItem item in relativeHighlights)
+                    if (item != null && !String.Equals(item.kind, "task", StringComparison.OrdinalIgnoreCase))
+                        visibleTerms.Add(item.term);
+                assistantPanel.ShowInactive();
+                services.UpdateVisibleTerms(visibleTerms);
+                highlightsVisible = true;
+                return;
+            }
+            assistantPanel.Hide();
             for (int index = 0; index < relativeHighlights.Count; index++)
             {
                 if (trackingViewport.HasValue)
@@ -2235,7 +2471,21 @@ namespace SemanticOverlay.NativeHost
             services.UpdateVisibleTerms(new string[0]);
             foreach (HighlightForm window in windows)
                 window.Hide();
+            assistantPanel.Hide();
             highlightsVisible = false;
+        }
+
+        private bool UseAssistantPresentation()
+        {
+            return services.WorkMode != "caption" && services.PresentationMode == "assistant";
+        }
+
+        private void BeginAssistantItemAction(HighlightItem item, Rectangle anchor)
+        {
+            if (!active || item == null)
+                return;
+            assistantLookupAnchor.SetHighlightBounds(anchor, item);
+            BeginItemAction(assistantLookupAnchor, item);
         }
 
         private void BeginLookup(HighlightForm source, string term, string context)
@@ -2329,7 +2579,7 @@ namespace SemanticOverlay.NativeHost
                 currentLookup.explanation);
         }
 
-        private void BeginLookupTerm(
+        private async void BeginLookupTerm(
             HighlightForm source,
             string term,
             string context,
@@ -2338,68 +2588,99 @@ namespace SemanticOverlay.NativeHost
             string previousExplanation = null)
         {
             selectedHighlight = source;
+            Stopwatch lookupWatch = Stopwatch.StartNew();
             int generation = ++lookupGeneration;
-            definitionWindow.ShowLoading(term, anchor, lookupHistory.Count > 0, refresh);
+            if (refresh)
+                definitionWindow.ShowLoading(term, anchor, lookupHistory.Count > 0, true);
+            else
+                definitionWindow.ShowPreview(
+                    term,
+                    String.IsNullOrWhiteSpace(context)
+                        ? "正在从本地术语索引查找，并在需要时后台补充 AI 解释。"
+                        : "已保留当前句子作为语境，正在先查本地术语索引。",
+                    anchor,
+                    lookupHistory.Count > 0);
             definitionWindow.Update();
-            services.Log("Lookup started for " + term);
+            services.Log("Lookup started (" + term.Length + " chars)");
             string normalizedContext = (context ?? String.Empty).Trim();
             if (normalizedContext.Length > 500)
                 normalizedContext = normalizedContext.Substring(0, 500);
-            string cacheKey = term + "\n" + normalizedContext;
-
             LookupResponse cached;
             if (ShortcutLookup.TryExplain(term, normalizedContext, out cached))
             {
-                ApplyLookupResponse(source, cached.term, normalizedContext, cacheKey, anchor, generation, cached, false);
+                ApplyLookupResponse(source, cached.term, normalizedContext, anchor,
+                    generation, cached, false, lookupWatch, false);
                 return;
             }
-            if (!refresh && lookupCache.TryGetValue(cacheKey, out cached))
-            {
-                ApplyLookupResponse(source, term, normalizedContext, cacheKey, anchor, generation, cached, false);
-                services.Log("Lookup cache hit for " + term);
-                return;
-            }
-
-            Task.Factory.StartNew(delegate
+            if (!refresh)
             {
                 try
                 {
                     services.EnsureRunning();
-                    return services.Lookup(term, normalizedContext, refresh, previousExplanation);
-                }
-                catch (Exception error)
-                {
-                    return new LookupResponse { term = term, error = error.Message };
-                }
-            }).ContinueWith(delegate(Task<LookupResponse> task)
-            {
-                LookupResponse response = task.Result;
-                try
-                {
-                    dispatcher.BeginInvoke(new Action(delegate
+                    LookupResponse instant = await Task.Factory.StartNew(delegate
                     {
-                        if (generation != lookupGeneration || selectedHighlight != source || !active)
+                        return services.LookupInstant(term, normalizedContext);
+                    });
+                    if (generation != lookupGeneration || selectedHighlight != source || !active)
+                        return;
+                    if (instant != null && !String.IsNullOrWhiteSpace(instant.explanation))
+                    {
+                        if (!instant.needs_model)
+                        {
+                            ApplyLookupResponse(source, term, normalizedContext, anchor,
+                                generation, instant, false, lookupWatch, instant.cached);
                             return;
-                        ApplyLookupResponse(
-                            source, term, normalizedContext, cacheKey, anchor, generation, response, refresh);
-                    }));
+                        }
+                        definitionWindow.ShowPreview(
+                            instant.term ?? term,
+                            instant.explanation,
+                            anchor,
+                            lookupHistory.Count > 0);
+                    }
                 }
                 catch (Exception error)
                 {
-                    services.Log("Lookup UI dispatch failed: " + error);
+                    services.Log("Instant lookup failed: " + error.GetType().Name);
                 }
-            });
+            }
+
+            LookupResponse response;
+            try
+            {
+                response = await Task.Factory.StartNew(delegate
+                {
+                    try
+                    {
+                        services.EnsureRunning();
+                        return services.Lookup(term, normalizedContext, refresh, previousExplanation);
+                    }
+                    catch (Exception error)
+                    {
+                        return new LookupResponse { term = term, error = error.Message };
+                    }
+                });
+            }
+            catch (Exception error)
+            {
+                response = new LookupResponse { term = term, error = error.Message };
+            }
+            if (generation != lookupGeneration || selectedHighlight != source || !active)
+                return;
+            ApplyLookupResponse(
+                source, term, normalizedContext, anchor, generation, response,
+                refresh, lookupWatch, false);
         }
 
         private void ApplyLookupResponse(
             HighlightForm source,
             string term,
             string context,
-            string cacheKey,
             Rectangle anchor,
             int generation,
             LookupResponse response,
-            bool refresh)
+            bool refresh,
+            Stopwatch lookupWatch,
+            bool cacheHit)
         {
             if (generation != lookupGeneration || selectedHighlight != source || !active)
                 return;
@@ -2415,12 +2696,14 @@ namespace SemanticOverlay.NativeHost
                     currentLookup.anchor,
                     lookupHistory.Count > 0,
                     currentLookup.can_refresh);
-                services.Log("Lookup refresh failed for " + term);
+                services.Log("Lookup refresh failed");
+                services.RecordLookupMetric("auto_highlight", ClassifyChatApp(targetWindow),
+                    "highlight", "refresh_failed",
+                    lookupWatch.ElapsedMilliseconds, false, cacheHit, false);
                 return;
             }
             if (response == null)
                 response = new LookupResponse { term = term, error = "empty response" };
-            lookupCache[cacheKey] = response;
             string explanation = response.explanation;
             if (string.IsNullOrWhiteSpace(explanation))
                 explanation = "暂时无法获取可靠解释。";
@@ -2443,8 +2726,39 @@ namespace SemanticOverlay.NativeHost
                 lookupHistory.Count > 0,
                 response.can_refresh);
             services.Log(
-                "Lookup finished for " + term +
+                "Lookup finished" +
                 (string.IsNullOrEmpty(response.error) ? ": ok" : ": failed"));
+            services.RecordLookupMetric("auto_highlight", ClassifyChatApp(targetWindow),
+                "highlight", response.lookup_mode,
+                lookupWatch.ElapsedMilliseconds, false, cacheHit,
+                String.IsNullOrWhiteSpace(response.error) && !String.IsNullOrWhiteSpace(response.explanation));
+        }
+
+        private void OnDefinitionFeedback(string feedback)
+        {
+            services.RecordFeedbackMetric("auto_highlight", ClassifyChatApp(targetWindow), feedback);
+            if (String.Equals(feedback, "useful", StringComparison.Ordinal))
+            {
+                if (currentLookup != null) services.NoteTermClicked(currentLookup.term);
+                return;
+            }
+            if (String.Equals(feedback, "unnecessary_highlight", StringComparison.Ordinal) &&
+                currentLookup != null)
+            {
+                string term = currentLookup.term;
+                services.IgnoreTerm(term);
+                relativeHighlights.RemoveAll(delegate(HighlightItem item)
+                {
+                    return item != null && String.Equals(item.term, term,
+                        StringComparison.OrdinalIgnoreCase);
+                });
+                HideDefinition();
+                RenderHighlights();
+                ShowNotice("已记录：以后不再自动标注这个词。", ToolTipIcon.Info);
+                return;
+            }
+            if (String.Equals(feedback, "wrong_explanation", StringComparison.Ordinal))
+                ShowNotice("已记录；可点击“换个解释”重试。", ToolTipIcon.Info);
         }
 
         private void NavigateBack()
@@ -2463,7 +2777,7 @@ namespace SemanticOverlay.NativeHost
                 previous.anchor,
                 lookupHistory.Count > 0,
                 previous.can_refresh);
-            services.Log("Lookup history back to " + previous.term);
+            services.Log("Lookup history back");
         }
 
         private void HideDefinition()
@@ -2585,12 +2899,28 @@ namespace SemanticOverlay.NativeHost
             NativeRect viewport = CurrentTrackingRect();
             int trackingGeneration = scrollTrackingGeneration;
             IntPtr trackedWindow = targetWindow;
+            bool expectMotion = scrollUntilUtc > DateTime.UtcNow;
             Task.Factory.StartNew(delegate
             {
                 ScrollProbeResult result = new ScrollProbeResult();
                 result.Next = ScrollFrame.Capture(viewport);
                 result.Confident = previous != null &&
                     previous.TryDisplacement(result.Next, out result.Delta);
+                // DWM can return the pre-scroll surface for the first capture even
+                // after the wheel event has arrived.  One bounded re-capture keeps
+                // the overlay on the same visual frame as the text without turning
+                // tracking into an unbounded polling loop.
+                if (expectMotion && result.Confident && result.Delta == 0)
+                {
+                    Thread.Sleep(8);
+                    ScrollFrame retry = ScrollFrame.Capture(viewport);
+                    int retryDelta;
+                    if (previous != null && previous.TryDisplacement(retry, out retryDelta))
+                    {
+                        result.Next = retry;
+                        result.Delta = retryDelta;
+                    }
+                }
                 return result;
             }).ContinueWith(delegate(Task<ScrollProbeResult> task)
             {
@@ -2689,7 +3019,7 @@ namespace SemanticOverlay.NativeHost
 
         private IntPtr OnMouseHook(int code, IntPtr message, IntPtr data)
         {
-            if (code >= 0 && services.SelectionToolbarEnabled &&
+            if (code >= 0 && MessageClickArmed &&
                 (message.ToInt64() == 0x0201 || message.ToInt64() == NativeMethods.WmLButtonUp ||
                  message.ToInt64() == NativeMethods.WmMouseWheel || message.ToInt64() == 0x0204))
             {
@@ -2747,25 +3077,83 @@ namespace SemanticOverlay.NativeHost
 
         private void ObserveSelectionGesture(int message, Point point)
         {
-            if (!services.SelectionToolbarEnabled) return;
+            if (!MessageClickArmed) return;
             if (selectionAction.Visible && selectionAction.Bounds.Contains(point)) return;
             if (message == 0x0201)
             {
                 DismissSelectionAction();
                 IntPtr foreground = NativeMethods.GetForegroundWindow();
                 if (foreground == IntPtr.Zero || IsOwnWindow(foreground)) return;
+                if (ClassifyChatApp(foreground) == "other") return;
                 selectionTarget = foreground;
                 selectionDragStart = point;
             }
             else if (message == NativeMethods.WmMouseWheel || message == 0x0204)
+            {
                 DismissSelectionAction();
+                DisarmMessageClick("cancelled by another gesture");
+            }
             else if (message == NativeMethods.WmLButtonUp && selectionDragStart.HasValue)
             {
                 Point start = selectionDragStart.Value;
                 selectionDragStart = null;
-                if (Math.Abs(start.X - point.X) < 8 && Math.Abs(start.Y - point.Y) < 8) return;
+                DisarmMessageClick("target gesture consumed");
+                trayStatusItem.Text = "状态：正在读取消息…";
+                if (Math.Abs(start.X - point.X) < 8 && Math.Abs(start.Y - point.Y) < 8)
+                {
+                    ProbeMessageClick(point, selectionTarget, selectionGeneration);
+                    return;
+                }
                 ProbeSelection(start, point, selectionTarget, selectionGeneration);
             }
+        }
+
+        private async void ProbeMessageClick(Point point, IntPtr target, int generation)
+        {
+            if (ClassifyChatApp(target) == "other") return;
+            await Task.Delay(120);
+            if (generation != selectionGeneration || NativeMethods.GetForegroundWindow() != target ||
+                Interlocked.CompareExchange(ref selectionProbeBusy, 1, 0) != 0) return;
+            Stopwatch probeWatch = Stopwatch.StartNew();
+            MessageProbeResult result = null;
+            try
+            {
+                result = await Task.Factory.StartNew(delegate
+                {
+                    NativeRect nativeWindow;
+                    if (!NativeMethods.GetWindowRect(target, out nativeWindow)) return null;
+                    Rectangle window = new Rectangle(nativeWindow.Left, nativeWindow.Top,
+                        nativeWindow.Width, nativeWindow.Height);
+                    MessageProbeResult accessible = MessageTextReader.ReadAtPoint(point, window, 1000);
+                    if (accessible != null) return accessible;
+                    Rectangle bubble;
+                    if (!MessageBubbleDetector.TryFind(window, point, out bubble)) return null;
+                    string text = services.ReadSelectionRegion(bubble);
+                    if (String.IsNullOrWhiteSpace(text)) return null;
+                    return new MessageProbeResult {
+                        Text = text.Trim(), Bounds = bubble, Source = "bubble_ocr", Exact = false };
+                });
+            }
+            catch (Exception error)
+            {
+                services.Log("One-click message probe failed: " + error.GetType().Name);
+            }
+            finally { Interlocked.Exchange(ref selectionProbeBusy, 0); }
+            if (generation != selectionGeneration || NativeMethods.GetForegroundWindow() != target)
+                return;
+            if (result == null || String.IsNullOrWhiteSpace(result.Text))
+            {
+                trayStatusItem.Text = "状态：未读到消息，请重新按 Ctrl+Alt+K";
+                ShowNotice("没有读到完整消息。请重新按 Ctrl+Alt+K 后再点击一次。",
+                    ToolTipIcon.Warning);
+                return;
+            }
+            services.Log("One-click message captured (" + result.Text.Length + " chars, " +
+                result.Source + ", " + result.Bounds.Width + "x" + result.Bounds.Height +
+                ", " + probeWatch.ElapsedMilliseconds + "ms)");
+            OpenSelectionResult(result.Text, result.Exact, result.Source, true,
+                new Point(result.Bounds.Right, result.Bounds.Bottom));
+            trayStatusItem.Text = "状态：消息解释已打开";
         }
 
         private async void ProbeSelection(Point start, Point end, IntPtr target, int generation)
@@ -2774,7 +3162,7 @@ namespace SemanticOverlay.NativeHost
             if (generation != selectionGeneration || NativeMethods.GetForegroundWindow() != target ||
                 Interlocked.CompareExchange(ref selectionProbeBusy, 1, 0) != 0) return;
             Task<string> probe = Task.Factory.StartNew(delegate {
-                try { return ManualLookupForm.ReadSelection(); }
+                try { return ManualLookupForm.ReadSelection(1000, true); }
                 finally { Interlocked.Exchange(ref selectionProbeBusy, 0); }
             });
             Task completed = await Task.WhenAny(probe, Task.Delay(800));
@@ -2787,6 +3175,7 @@ namespace SemanticOverlay.NativeHost
                 new Rectangle(window.Left, window.Top, window.Width, window.Height));
             if (String.IsNullOrWhiteSpace(text) && region.IsEmpty) return;
             selectionAction.Present(text, end, region);
+            trayStatusItem.Text = "状态：已定位选区，请点击“解释这段”";
         }
 
         private async void ExplainSelection()
@@ -2807,21 +3196,24 @@ namespace SemanticOverlay.NativeHost
                 }
                 catch { text = String.Empty; }
                 if (generation != selectionGeneration || NativeMethods.GetForegroundWindow() != target) return;
-                OpenSelectionResult(text, false);
+                OpenSelectionResult(text, false, "ocr", false, selectionAction.Location);
             }
-            else OpenSelectionResult(text, true);
+            else OpenSelectionResult(text, true, "accessibility", true, selectionAction.Location);
         }
 
-        private void OpenSelectionResult(string text, bool exactSelection)
+        private void OpenSelectionResult(string text, bool exactSelection, string textSource,
+            bool autoAnalyze, Point anchor)
         {
-            if (manualLookup != null && !manualLookup.IsDisposed) manualLookup.Close();
-            manualLookup = new ManualLookupForm(services);
-            Rectangle area = Screen.FromPoint(selectionAction.Location).WorkingArea;
-            manualLookup.StartPosition = FormStartPosition.Manual;
-            manualLookup.Location = new Point(
-                Math.Max(area.Left, Math.Min(selectionAction.Left, area.Right - manualLookup.Width)),
-                Math.Max(area.Top, Math.Min(selectionAction.Top, area.Bottom - manualLookup.Height)));
-            manualLookup.OpenText(text, exactSelection);
+            if (selectionAnalysis != null && !selectionAnalysis.IsDisposed)
+                selectionAnalysis.Close();
+            selectionAnalysis = new SelectionAnalysisForm(services);
+            Rectangle area = Screen.FromPoint(anchor).WorkingArea;
+            selectionAnalysis.StartPosition = FormStartPosition.Manual;
+            selectionAnalysis.Location = new Point(
+                Math.Max(area.Left, Math.Min(anchor.X, area.Right - selectionAnalysis.Width)),
+                Math.Max(area.Top, Math.Min(anchor.Y, area.Bottom - selectionAnalysis.Height)));
+            selectionAnalysis.OpenText(text, exactSelection, textSource,
+                ClassifyChatApp(selectionTarget), autoAnalyze);
         }
 
         private bool IsOwnWindow(IntPtr hwnd)
@@ -2848,6 +3240,28 @@ namespace SemanticOverlay.NativeHost
             {
                 return false;
             }
+        }
+
+        internal static string ClassifyChatApp(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return "other";
+            uint processId;
+            NativeMethods.GetWindowThreadProcessId(hwnd, out processId);
+            try
+            {
+                using (Process process = Process.GetProcessById((int)processId))
+                    return ClassifyChatProcessName(process.ProcessName);
+            }
+            catch { }
+            return "other";
+        }
+
+        internal static string ClassifyChatProcessName(string processName)
+        {
+            string name = (processName ?? String.Empty).ToLowerInvariant();
+            if (name.Contains("wechat") || name.Contains("weixin")) return "wechat";
+            if (name == "qq" || name.StartsWith("qq")) return "qq";
+            return "other";
         }
 
         private static string GetTargetProcessLabel(IntPtr hwnd)
@@ -3565,6 +3979,294 @@ namespace SemanticOverlay.NativeHost
             if (hue < 240) return Color.FromArgb(lo, mid, hi);
             if (hue < 300) return Color.FromArgb(mid, lo, hi);
             return Color.FromArgb(hi, lo, mid);
+        }
+    }
+
+    internal sealed class AssistantPanelForm : Form
+    {
+        private const int BubbleSize = 58;
+        private static readonly Size ExpandedSize = new Size(380, 360);
+        private readonly Label bubble;
+        private readonly Label title;
+        private readonly Label hint;
+        private readonly Button collapseButton;
+        private readonly FlowLayoutPanel termsPanel;
+        private bool expanded;
+        private bool userPositioned;
+        private bool dragging;
+        private Point dragCursor;
+        private Point dragWindow;
+
+        public event Action<HighlightItem, Rectangle> ItemClicked;
+
+        public AssistantPanelForm()
+        {
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.Manual;
+            TopMost = true;
+            BackColor = Color.White;
+            Opacity = 0.97;
+            DoubleBuffered = true;
+
+            bubble = new Label();
+            bubble.Name = "assistantBubble";
+            bubble.Text = "词";
+            bubble.TextAlign = ContentAlignment.MiddleCenter;
+            bubble.ForeColor = Color.White;
+            bubble.BackColor = Color.FromArgb(58, 122, 254);
+            bubble.Font = new Font(SystemFonts.MessageBoxFont.FontFamily, 13.0f, FontStyle.Bold);
+            bubble.Cursor = Cursors.Hand;
+            bubble.MouseDown += BubbleMouseDown;
+            bubble.MouseMove += BubbleMouseMove;
+            bubble.MouseUp += BubbleMouseUp;
+            Controls.Add(bubble);
+
+            title = new Label();
+            title.Name = "assistantTitle";
+            title.Text = "实时字典";
+            title.Font = new Font(SystemFonts.MessageBoxFont.FontFamily, 12.0f, FontStyle.Bold);
+            title.ForeColor = Color.FromArgb(25, 31, 42);
+            title.AutoSize = true;
+            Controls.Add(title);
+
+            hint = new Label();
+            hint.Text = "当前画面中值得解释的词";
+            hint.ForeColor = Color.FromArgb(108, 116, 130);
+            hint.AutoSize = true;
+            Controls.Add(hint);
+
+            collapseButton = new Button();
+            collapseButton.Name = "assistantCollapse";
+            collapseButton.Text = "×";
+            collapseButton.AccessibleName = "收起悬浮助手";
+            collapseButton.FlatStyle = FlatStyle.Flat;
+            collapseButton.FlatAppearance.BorderSize = 0;
+            collapseButton.BackColor = Color.White;
+            collapseButton.ForeColor = Color.FromArgb(105, 112, 124);
+            collapseButton.Font = new Font(SystemFonts.MessageBoxFont.FontFamily, 13.0f);
+            collapseButton.Click += delegate { SetExpanded(false); };
+            Controls.Add(collapseButton);
+
+            termsPanel = new FlowLayoutPanel();
+            termsPanel.Name = "assistantTerms";
+            termsPanel.FlowDirection = FlowDirection.TopDown;
+            termsPanel.WrapContents = false;
+            termsPanel.AutoScroll = true;
+            termsPanel.BackColor = Color.White;
+            termsPanel.Padding = new Padding(0, 3, 0, 3);
+            Controls.Add(termsPanel);
+
+            SetItems(new HighlightItem[0]);
+            ApplyLayout();
+        }
+
+        protected override bool ShowWithoutActivation { get { return true; } }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams parameters = base.CreateParams;
+                parameters.ExStyle |= NativeMethods.WsExToolWindow | NativeMethods.WsExNoActivate;
+                return parameters;
+            }
+        }
+
+        public void StartForTarget(NativeRect target)
+        {
+            userPositioned = false;
+            SetExpanded(false);
+            PositionFor(target);
+        }
+
+        public void PositionFor(NativeRect target)
+        {
+            Rectangle targetBounds = new Rectangle(target.Left, target.Top,
+                Math.Max(1, target.Width), Math.Max(1, target.Height));
+            Rectangle work = Screen.FromRectangle(targetBounds).WorkingArea;
+            if (!userPositioned)
+            {
+                int bubbleX = Math.Min(work.Right - BubbleSize - 10,
+                    Math.Max(work.Left + 10, target.Right - BubbleSize - 18));
+                int bubbleY = Math.Min(work.Bottom - BubbleSize - 10,
+                    Math.Max(work.Top + 10, target.Top + Math.Min(150, Math.Max(24, target.Height / 5))));
+                Location = expanded
+                    ? new Point(Math.Max(work.Left + 8, bubbleX - 14),
+                        Math.Max(work.Top + 8, bubbleY - 14))
+                    : new Point(bubbleX, bubbleY);
+            }
+            ClampTo(work);
+        }
+
+        public void SetItems(IEnumerable<HighlightItem> items)
+        {
+            termsPanel.SuspendLayout();
+            termsPanel.Controls.Clear();
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            int index = 0;
+            if (items != null)
+            {
+                foreach (HighlightItem item in items)
+                {
+                    if (item == null || String.IsNullOrWhiteSpace(item.term) || !seen.Add(item.term.Trim()))
+                        continue;
+                    Button termButton = new Button();
+                    termButton.Name = "assistantTerm" + index;
+                    termButton.Text = String.Equals(item.kind, "task", StringComparison.OrdinalIgnoreCase)
+                        ? "日程  " + item.term.Trim()
+                        : item.term.Trim();
+                    termButton.TextAlign = ContentAlignment.MiddleLeft;
+                    termButton.AutoEllipsis = true;
+                    termButton.Size = new Size(326, 42);
+                    termButton.Margin = new Padding(0, 0, 0, 8);
+                    termButton.Padding = new Padding(12, 0, 8, 0);
+                    termButton.FlatStyle = FlatStyle.Flat;
+                    termButton.FlatAppearance.BorderColor = Color.FromArgb(224, 229, 238);
+                    termButton.BackColor = index == 0
+                        ? Color.FromArgb(235, 243, 255)
+                        : Color.FromArgb(247, 248, 251);
+                    termButton.ForeColor = Color.FromArgb(34, 42, 57);
+                    termButton.Font = new Font(SystemFonts.MessageBoxFont.FontFamily, 10.0f, FontStyle.Regular);
+                    HighlightItem captured = item;
+                    termButton.Click += delegate(object sender, EventArgs args)
+                    {
+                        Control source = sender as Control;
+                        if (source == null || ItemClicked == null) return;
+                        ItemClicked(captured, source.RectangleToScreen(source.ClientRectangle));
+                    };
+                    termsPanel.Controls.Add(termButton);
+                    index++;
+                }
+            }
+            if (index == 0)
+            {
+                Label empty = new Label();
+                empty.Name = "assistantEmpty";
+                empty.Text = "当前画面没有发现需要解释的词。\r\n滚动或按 Ctrl+Alt+K 可重新识别。";
+                empty.ForeColor = Color.FromArgb(108, 116, 130);
+                empty.Size = new Size(326, 70);
+                empty.Padding = new Padding(10, 12, 8, 0);
+                termsPanel.Controls.Add(empty);
+            }
+            bubble.Text = index > 0 ? Math.Min(index, 9).ToString() : "词";
+            termsPanel.ResumeLayout();
+        }
+
+        public void ShowInactive()
+        {
+            IntPtr previousForeground = NativeMethods.GetForegroundWindow();
+            if (!Visible)
+                NativeMethods.ShowWindow(Handle, NativeMethods.SwShowNoActivate);
+            NativeMethods.SetWindowPos(Handle, NativeMethods.HwndTopMost,
+                Left, Top, Width, Height, NativeMethods.SwpNoActivate | NativeMethods.SwpShowWindow);
+            if (NativeMethods.GetForegroundWindow() == Handle && previousForeground != IntPtr.Zero)
+                NativeMethods.SetForegroundWindow(previousForeground);
+        }
+
+        protected override void WndProc(ref Message message)
+        {
+            if (message.Msg == NativeMethods.WmMouseActivate)
+            {
+                message.Result = new IntPtr(NativeMethods.MaNoActivate);
+                return;
+            }
+            base.WndProc(ref message);
+        }
+
+        private void SetExpanded(bool value)
+        {
+            if (expanded == value) return;
+            Point bubbleScreen = Visible ? bubble.PointToScreen(Point.Empty) : Location;
+            expanded = value;
+            ApplyLayout();
+            Location = expanded
+                ? new Point(bubbleScreen.X - bubble.Left, bubbleScreen.Y - bubble.Top)
+                : bubbleScreen;
+            Rectangle work = Screen.FromPoint(bubbleScreen).WorkingArea;
+            ClampTo(work);
+            if (Visible) ShowInactive();
+        }
+
+        private void ApplyLayout()
+        {
+            Size = expanded ? ExpandedSize : new Size(BubbleSize, BubbleSize);
+            bubble.Bounds = expanded
+                ? new Rectangle(14, 14, BubbleSize, BubbleSize)
+                : new Rectangle(0, 0, BubbleSize, BubbleSize);
+            title.Visible = expanded;
+            hint.Visible = expanded;
+            collapseButton.Visible = expanded;
+            termsPanel.Visible = expanded;
+            if (expanded)
+            {
+                title.Location = new Point(88, 17);
+                hint.Location = new Point(88, 46);
+                collapseButton.Bounds = new Rectangle(334, 12, 36, 34);
+                termsPanel.Bounds = new Rectangle(20, 88, 340, 252);
+            }
+            Region old = Region;
+            using (GraphicsPath path = new GraphicsPath())
+            {
+                if (!expanded)
+                    path.AddEllipse(ClientRectangle);
+                else
+                {
+                    int radius = 20;
+                    Rectangle bounds = new Rectangle(0, 0, Width - 1, Height - 1);
+                    path.AddArc(bounds.Left, bounds.Top, radius, radius, 180, 90);
+                    path.AddArc(bounds.Right - radius, bounds.Top, radius, radius, 270, 90);
+                    path.AddArc(bounds.Right - radius, bounds.Bottom - radius, radius, radius, 0, 90);
+                    path.AddArc(bounds.Left, bounds.Bottom - radius, radius, radius, 90, 90);
+                    path.CloseFigure();
+                }
+                Region = new Region(path);
+            }
+            if (old != null) old.Dispose();
+            Invalidate();
+        }
+
+        private void BubbleMouseDown(object sender, MouseEventArgs args)
+        {
+            if (args.Button != MouseButtons.Left) return;
+            dragging = false;
+            dragCursor = Cursor.Position;
+            dragWindow = Location;
+        }
+
+        private void BubbleMouseMove(object sender, MouseEventArgs args)
+        {
+            if (args.Button != MouseButtons.Left) return;
+            Point cursor = Cursor.Position;
+            int dx = cursor.X - dragCursor.X;
+            int dy = cursor.Y - dragCursor.Y;
+            if (!dragging && Math.Abs(dx) + Math.Abs(dy) < 6) return;
+            dragging = true;
+            userPositioned = true;
+            Location = new Point(dragWindow.X + dx, dragWindow.Y + dy);
+        }
+
+        private void BubbleMouseUp(object sender, MouseEventArgs args)
+        {
+            if (args.Button != MouseButtons.Left) return;
+            if (!dragging) SetExpanded(!expanded);
+            dragging = false;
+            ClampTo(Screen.FromPoint(Cursor.Position).WorkingArea);
+        }
+
+        private void ClampTo(Rectangle work)
+        {
+            int x = Math.Max(work.Left + 4, Math.Min(Left, work.Right - Width - 4));
+            int y = Math.Max(work.Top + 4, Math.Min(Top, work.Bottom - Height - 4));
+            Location = new Point(x, y);
+        }
+
+        protected override void OnPaint(PaintEventArgs args)
+        {
+            base.OnPaint(args);
+            if (!expanded) return;
+            using (Pen border = new Pen(Color.FromArgb(214, 220, 230), 1))
+                args.Graphics.DrawRectangle(border, 0, 0, Width - 1, Height - 1);
         }
     }
 
@@ -4374,6 +5076,7 @@ namespace SemanticOverlay.NativeHost
         private readonly Button retryButton;
         private readonly Button copyButton;
         private readonly Button editTaskButton;
+        private readonly LinkLabel feedbackLink;
         private HighlightItem taskCandidate;
         public event Action<HighlightItem> EditTaskRequested;
         private readonly LinkLabel sourceLink;
@@ -4382,6 +5085,7 @@ namespace SemanticOverlay.NativeHost
         public event Action<string> TermClicked;
         public event Action BackRequested;
         public event Action RetryRequested;
+        public event Action<string> FeedbackSubmitted;
 
         public DefinitionForm()
         {
@@ -4460,6 +5164,24 @@ namespace SemanticOverlay.NativeHost
                 }
             };
             Controls.Add(bodyLabel);
+
+            feedbackLink = new LinkLabel();
+            feedbackLink.Text = "反馈：有用 · 不需要标 · 解释不对";
+            feedbackLink.AutoSize = false;
+            feedbackLink.Size = new Size(350, 24);
+            feedbackLink.LinkColor = Color.FromArgb(90, 96, 106);
+            feedbackLink.ActiveLinkColor = Color.FromArgb(32, 78, 180);
+            feedbackLink.LinkBehavior = LinkBehavior.HoverUnderline;
+            feedbackLink.Visible = false;
+            feedbackLink.LinkClicked += delegate(object sender, LinkLabelLinkClickedEventArgs args)
+            {
+                string value = args.Link.LinkData as string;
+                if (String.IsNullOrWhiteSpace(value)) return;
+                feedbackLink.Text = "已记录，谢谢";
+                feedbackLink.Links.Clear();
+                if (FeedbackSubmitted != null) FeedbackSubmitted(value);
+            };
+            Controls.Add(feedbackLink);
 
             sourceLink = new LinkLabel();
             sourceLink.Text = "查看来源";
@@ -4555,6 +5277,7 @@ namespace SemanticOverlay.NativeHost
                 null,
                 anchor,
                 canGoBack,
+                false,
                 false);
         }
 
@@ -4567,7 +5290,16 @@ namespace SemanticOverlay.NativeHost
             bool canGoBack,
             bool canRefresh)
         {
-            SetContent(term, explanation, entities, sources, anchor, canGoBack, canRefresh);
+            SetContent(term, explanation, entities, sources, anchor, canGoBack, canRefresh, true);
+        }
+
+        public void ShowPreview(
+            string term,
+            string explanation,
+            Rectangle anchor,
+            bool canGoBack)
+        {
+            SetContent(term, explanation, null, null, anchor, canGoBack, false, false);
         }
 
         public void ShowTaskCandidate(HighlightItem item, Rectangle anchor)
@@ -4580,7 +5312,7 @@ namespace SemanticOverlay.NativeHost
                 "时间：" + timeText + "\r\n" +
                 "事项：" + title + "\r\n" +
                 "状态：等待确认，尚未写入任何日历。";
-            SetContent("发现一个安排", explanation, null, null, anchor, false, false);
+            SetContent("发现一个安排", explanation, null, null, anchor, false, false, false);
             taskCandidate = item;
             editTaskButton.Location = new Point(18, copyButton.Top);
             editTaskButton.Visible = true;
@@ -4594,7 +5326,8 @@ namespace SemanticOverlay.NativeHost
             List<string> sources,
             Rectangle anchor,
             bool canGoBack,
-            bool canRefresh)
+            bool canRefresh,
+            bool showFeedback)
         {
             titleLabel.Text = term ?? string.Empty;
             taskCandidate = null;
@@ -4605,6 +5338,12 @@ namespace SemanticOverlay.NativeHost
             retryButton.Text = "换个解释";
             retryButton.Enabled = true;
             retryButton.Visible = canRefresh;
+            feedbackLink.Text = "反馈：有用 · 不需要标 · 解释不对";
+            feedbackLink.Links.Clear();
+            feedbackLink.Links.Add(3, 2, "useful");
+            feedbackLink.Links.Add(8, 4, "unnecessary_highlight");
+            feedbackLink.Links.Add(15, 4, "wrong_explanation");
+            feedbackLink.Visible = showFeedback;
             bodyLabel.Links.Clear();
             if (entities != null)
             {
@@ -4646,14 +5385,16 @@ namespace SemanticOverlay.NativeHost
                 }
             }
             int footerTop = bodyLabel.Top + bodyHeight + 8;
-            sourceLink.Location = new Point(18, footerTop + 5);
+            feedbackLink.Location = new Point(18, footerTop);
+            sourceLink.Location = new Point(286, footerTop + 3);
             sourceLink.Visible = sourceUrl != null;
             sourceLink.Links.Clear();
             if (sourceUrl != null)
                 sourceLink.Links.Add(0, sourceLink.Text.Length, sourceUrl);
-            retryButton.Location = new Point(150, footerTop);
-            copyButton.Location = new Point(264, footerTop);
-            ClientSize = new Size(390, footerTop + copyButton.Height + 12);
+            int actionTop = footerTop + (showFeedback || sourceUrl != null ? 28 : 0);
+            retryButton.Location = new Point(150, actionTop);
+            copyButton.Location = new Point(264, actionTop);
+            ClientSize = new Size(390, actionTop + copyButton.Height + 12);
             PositionFor(anchor);
             if (!Visible)
                 NativeMethods.ShowWindow(Handle, NativeMethods.SwShowNoActivate);
@@ -4702,6 +5443,7 @@ namespace SemanticOverlay.NativeHost
         private readonly Button saveButton;
         private readonly Label statusLabel;
         private readonly Func<string, string, string, KeyValidationResult> validator;
+        private readonly bool typeSafeMode;
         private string validatedSignature;
 
         public string ApiKey
@@ -4719,10 +5461,11 @@ namespace SemanticOverlay.NativeHost
             get { return modelBox.Text.Trim(); }
         }
 
-        public ApiKeyForm(Func<string, string, string, KeyValidationResult> validator)
+        public ApiKeyForm(Func<string, string, string, KeyValidationResult> validator, bool typeSafeMode)
         {
             this.validator = validator;
-            Text = "配置模型服务";
+            this.typeSafeMode = typeSafeMode;
+            Text = typeSafeMode ? "配置 Jev 高亮判断" : "配置解释模型";
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
@@ -4733,14 +5476,18 @@ namespace SemanticOverlay.NativeHost
             Font = SystemFonts.MessageBoxFont;
 
             Label title = new Label();
-            title.Text = "配置你自己的模型服务和 API Key";
+            title.Text = typeSafeMode
+                ? "配置 TypeSafe Jev（只负责判断是否值得高亮）"
+                : "配置解释与语音模型服务";
             title.AutoSize = true;
             title.Font = new Font(Font, FontStyle.Bold);
             title.Location = new Point(18, 18);
             Controls.Add(title);
 
             Label note = new Label();
-            note.Text = "密钥只保存在当前 Windows 用户目录，不会写进安装包。";
+            note.Text = typeSafeMode
+                ? "Jev 与解释模型相互独立；密钥只保存在当前 Windows 用户目录。"
+                : "该服务负责中文解释和语音转写；密钥不会写进安装包。";
             note.AutoSize = true;
             note.ForeColor = Color.FromArgb(90, 96, 106);
             note.Location = new Point(18, 48);
@@ -4754,9 +5501,14 @@ namespace SemanticOverlay.NativeHost
 
             providerBox = new ComboBox();
             providerBox.DropDownStyle = ComboBoxStyle.DropDownList;
-            providerBox.Items.Add("硅基流动（推荐）");
-            providerBox.Items.Add("DeepSeek 官方");
-            providerBox.Items.Add("其他 OpenAI 兼容服务");
+            if (typeSafeMode)
+                providerBox.Items.Add("TypeSafe AI");
+            else
+            {
+                providerBox.Items.Add("硅基流动（推荐）");
+                providerBox.Items.Add("DeepSeek 官方");
+                providerBox.Items.Add("其他 OpenAI 兼容服务");
+            }
             providerBox.Location = new Point(92, 79);
             providerBox.Size = new Size(407, 27);
             Controls.Add(providerBox);
@@ -4829,14 +5581,22 @@ namespace SemanticOverlay.NativeHost
             CancelButton = cancel;
             providerBox.SelectedIndexChanged += delegate
             {
-                if (providerBox.SelectedIndex == 0)
+                if (typeSafeMode)
+                {
+                    baseUrlBox.Text = "https://api.typesafe.ai";
+                    modelBox.Text = "jev-latest";
+                    baseUrlBox.ReadOnly = true;
+                    modelBox.ReadOnly = false;
+                }
+                else if (providerBox.SelectedIndex == 0)
                     baseUrlBox.Text = "https://api.siliconflow.cn/v1";
                 else if (providerBox.SelectedIndex == 1)
                     baseUrlBox.Text = "https://api.deepseek.com";
-                baseUrlBox.ReadOnly = providerBox.SelectedIndex != 2;
-                if (providerBox.SelectedIndex == 0)
+                if (!typeSafeMode)
+                    baseUrlBox.ReadOnly = providerBox.SelectedIndex != 2;
+                if (!typeSafeMode && providerBox.SelectedIndex == 0)
                     modelBox.Text = "deepseek-ai/DeepSeek-V4-Flash";
-                else if (providerBox.SelectedIndex == 1)
+                else if (!typeSafeMode && providerBox.SelectedIndex == 1)
                     modelBox.Text = "deepseek-v4-flash";
                 InvalidateValidation();
             };
@@ -4853,7 +5613,9 @@ namespace SemanticOverlay.NativeHost
                     args.Cancel = true;
                     MessageBox.Show(
                         this,
-                        "请先测试当前服务商、模型和 API Key。",
+                        typeSafeMode
+                            ? "请先测试当前 Jev 模型和 TypeSafe API Key。"
+                            : "请先测试当前服务商、模型和 API Key。",
                         "实时字典",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Warning);
@@ -4900,7 +5662,7 @@ namespace SemanticOverlay.NativeHost
             baseUrlBox.Enabled = false;
             modelBox.Enabled = false;
             keyBox.Enabled = false;
-            statusLabel.Text = "正在连接模型服务…";
+            statusLabel.Text = typeSafeMode ? "正在验证 Jev 判断服务…" : "正在连接解释模型服务…";
             statusLabel.ForeColor = Color.FromArgb(90, 96, 106);
             string baseUrl = BaseUrl;
             string model = Model;
@@ -5117,6 +5879,268 @@ namespace SemanticOverlay.NativeHost
         }
     }
 
+    internal sealed class MessageProbeResult
+    {
+        internal string Text { get; set; }
+        internal Rectangle Bounds { get; set; }
+        internal string Source { get; set; }
+        internal bool Exact { get; set; }
+    }
+
+    internal static class MessageTextReader
+    {
+        internal static MessageProbeResult ReadAtPoint(Point point, Rectangle window, int maxLength)
+        {
+            try
+            {
+                var assembly = System.Reflection.Assembly.LoadFrom(Path.Combine(
+                    RuntimeEnvironment.GetRuntimeDirectory(), "WPF", "UIAutomationClient.dll"));
+                Type elementType = assembly.GetType("System.Windows.Automation.AutomationElement");
+                Type textPatternType = assembly.GetType("System.Windows.Automation.TextPattern");
+                Type valuePatternType = assembly.GetType("System.Windows.Automation.ValuePattern");
+                Type walkerType = assembly.GetType("System.Windows.Automation.TreeWalker");
+                Type pointType = Type.GetType("System.Windows.Point, WindowsBase");
+                object automationPoint = Activator.CreateInstance(pointType,
+                    new object[] { (double)point.X, (double)point.Y });
+                object element = elementType.GetMethod("FromPoint").Invoke(null,
+                    new object[] { automationPoint });
+                object walker = walkerType.GetProperty("ControlViewWalker").GetValue(null, null);
+                object best = null;
+                string bestText = null;
+                Rectangle bestBounds = Rectangle.Empty;
+                int bestScore = Int32.MinValue;
+                for (int depth = 0; element != null && depth < 9; depth++)
+                {
+                    object current = elementType.GetProperty("Current").GetValue(element, null);
+                    bool password = (bool)current.GetType().GetProperty("IsPassword").GetValue(current, null);
+                    if (!password)
+                    {
+                        Rectangle bounds = ReadBounds(current);
+                        string controlType = Convert.ToString(
+                            current.GetType().GetProperty("ControlType").GetValue(current, null));
+                        string text = ReadPatternText(element, elementType, textPatternType, maxLength);
+                        bool patternText = !String.IsNullOrWhiteSpace(text);
+                        if (!patternText)
+                            text = ReadPatternText(element, elementType, valuePatternType, maxLength);
+                        if (String.IsNullOrWhiteSpace(text))
+                            text = Convert.ToString(current.GetType().GetProperty("Name").GetValue(current, null));
+                        text = Normalize(text);
+                        if (IsCandidate(text, controlType, bounds, window, point, maxLength))
+                        {
+                            int areaPenalty = Math.Max(0, bounds.Width * bounds.Height / 5000);
+                            int score = Math.Min(text.Length, maxLength + 1) * 100 - areaPenalty +
+                                (patternText ? 500 : 0);
+                            if (score > bestScore)
+                            {
+                                best = element; bestText = text; bestBounds = bounds; bestScore = score;
+                            }
+                        }
+                    }
+                    element = walkerType.GetMethod("GetParent").Invoke(walker, new object[] { element });
+                }
+                if (best == null) return null;
+                return new MessageProbeResult { Text = bestText, Bounds = bestBounds,
+                    Source = "message_accessibility", Exact = true };
+            }
+            catch { return null; }
+        }
+
+        private static string ReadPatternText(object element, Type elementType,
+            Type patternType, int maxLength)
+        {
+            if (patternType == null) return null;
+            try
+            {
+                object id = patternType.GetField("Pattern").GetValue(null);
+                object pattern = elementType.GetMethod("GetCurrentPattern").Invoke(element,
+                    new object[] { id });
+                if (patternType.Name == "TextPattern")
+                {
+                    object range = patternType.GetProperty("DocumentRange").GetValue(pattern, null);
+                    return Convert.ToString(range.GetType().GetMethod("GetText").Invoke(range,
+                        new object[] { maxLength + 1 }));
+                }
+                object current = patternType.GetProperty("Current").GetValue(pattern, null);
+                return Convert.ToString(current.GetType().GetProperty("Value").GetValue(current, null));
+            }
+            catch { return null; }
+        }
+
+        private static Rectangle ReadBounds(object current)
+        {
+            try
+            {
+                object rect = current.GetType().GetProperty("BoundingRectangle").GetValue(current, null);
+                Type type = rect.GetType();
+                return Rectangle.Round(new RectangleF(
+                    Convert.ToSingle(type.GetProperty("X").GetValue(rect, null)),
+                    Convert.ToSingle(type.GetProperty("Y").GetValue(rect, null)),
+                    Convert.ToSingle(type.GetProperty("Width").GetValue(rect, null)),
+                    Convert.ToSingle(type.GetProperty("Height").GetValue(rect, null))));
+            }
+            catch { return Rectangle.Empty; }
+        }
+
+        internal static string Normalize(string text)
+        {
+            return Regex.Replace(text ?? String.Empty, @"\s+", " ").Trim();
+        }
+
+        internal static bool IsCandidate(string text, string controlType, Rectangle bounds,
+            Rectangle window, Point point, int maxLength)
+        {
+            if (String.IsNullOrWhiteSpace(text) || text.Length < 2 || bounds.IsEmpty ||
+                !bounds.Contains(point) || !window.IntersectsWith(bounds)) return false;
+            string kind = (controlType ?? String.Empty).ToLowerInvariant();
+            if (kind.Contains("edit") || kind.Contains("button") || kind.Contains("menu") ||
+                kind.Contains("titlebar") || kind.Contains("toolbar") || kind.Contains("image")) return false;
+            if (bounds.Height > Math.Min(600, window.Height * 3 / 4) ||
+                bounds.Width > window.Width * 97 / 100) return false;
+            if (text.Length <= 10 && Regex.IsMatch(text,
+                @"^(发送|表情|图片|文件|语音|搜索|更多|关闭|最小化|最大化)$")) return false;
+            if (text.Length <= 30 && Regex.IsMatch(text,
+                @"^\s*(?:\d{4}[/\-.年])?\d{1,2}[/\-.月]\d{1,2}(?:日)?(?:\s+\d{1,2}:\d{2})?\s*$"))
+                return false;
+            return text.Length <= maxLength + 1;
+        }
+    }
+
+    internal static class MessageBubbleDetector
+    {
+        internal static bool TryFind(Rectangle window, Point click, out Rectangle bubble)
+        {
+            bubble = Rectangle.Empty;
+            Rectangle capture = Rectangle.Intersect(window,
+                new Rectangle(click.X - 800, click.Y - 300, 1600, 600));
+            if (capture.Width < 100 || capture.Height < 60) return false;
+            using (Bitmap bitmap = new Bitmap(capture.Width, capture.Height, PixelFormat.Format32bppArgb))
+            using (Graphics graphics = Graphics.FromImage(bitmap))
+            {
+                graphics.CopyFromScreen(capture.Left, capture.Top, 0, 0, capture.Size,
+                    CopyPixelOperation.SourceCopy);
+                Rectangle local;
+                if (!FindInBitmap(bitmap,
+                    new Point(click.X - capture.Left, click.Y - capture.Top), out local)) return false;
+                bubble = Rectangle.FromLTRB(capture.Left + local.Left, capture.Top + local.Top,
+                    capture.Left + local.Right, capture.Top + local.Bottom);
+                bubble.Inflate(6, 5);
+                bubble.Intersect(window);
+                return bubble.Width >= 80 && bubble.Height >= 24;
+            }
+        }
+
+        internal static bool FindInBitmap(Bitmap bitmap, Point click, out Rectangle bounds)
+        {
+            bounds = Rectangle.Empty;
+            if (bitmap == null || click.X < 0 || click.Y < 0 ||
+                click.X >= bitmap.Width || click.Y >= bitmap.Height) return false;
+            Rectangle dataBounds = new Rectangle(0, 0, bitmap.Width, bitmap.Height);
+            BitmapData data = bitmap.LockBits(dataBounds, ImageLockMode.ReadOnly,
+                PixelFormat.Format32bppArgb);
+            byte[] pixels = new byte[Math.Abs(data.Stride) * data.Height];
+            Marshal.Copy(data.Scan0, pixels, 0, pixels.Length);
+            bitmap.UnlockBits(data);
+
+            Dictionary<int, int[]> colors = new Dictionary<int, int[]>();
+            for (int y = Math.Max(0, click.Y - 20); y <= Math.Min(bitmap.Height - 1, click.Y + 20); y++)
+                for (int x = Math.Max(0, click.X - 20); x <= Math.Min(bitmap.Width - 1, click.X + 20); x++)
+                {
+                    int offset = y * data.Stride + x * 4;
+                    int b = pixels[offset], g = pixels[offset + 1], r = pixels[offset + 2];
+                    if (r + g + b < 90) continue;
+                    int key = (r >> 3) << 10 | (g >> 3) << 5 | (b >> 3);
+                    int[] value;
+                    if (!colors.TryGetValue(key, out value))
+                    {
+                        value = new int[4]; colors[key] = value;
+                    }
+                    value[0]++; value[1] += r; value[2] += g; value[3] += b;
+            }
+            if (colors.Count == 0) return false;
+            int total = bitmap.Width * bitmap.Height;
+            Rectangle bestBounds = Rectangle.Empty;
+            int bestCount = 0;
+            foreach (int[] candidate in colors.Values
+                .OrderByDescending(value => value[0]).Take(6))
+            {
+                int red = candidate[1] / candidate[0], green = candidate[2] / candidate[0],
+                    blue = candidate[3] / candidate[0];
+                Rectangle component;
+                int count;
+                if (!TryComponent(pixels, data.Stride, bitmap.Width, bitmap.Height,
+                    click, red, green, blue, out component, out count)) continue;
+                int area = component.Width * component.Height;
+                if (count < 500 || component.Width < 70 || component.Height < 20 ||
+                    component.Height > 420 ||
+                    (area > total * 3 / 4 && count > total / 2)) continue;
+                if (count > bestCount)
+                {
+                    bestCount = count;
+                    bestBounds = component;
+                }
+            }
+            bounds = bestBounds;
+            return bestCount > 0;
+        }
+
+        private static bool TryComponent(byte[] pixels, int stride, int width, int height,
+            Point click, int red, int green, int blue, out Rectangle bounds, out int count)
+        {
+            bounds = Rectangle.Empty;
+            count = 0;
+            Point seed = Point.Empty;
+            int bestDistance = Int32.MaxValue;
+            for (int y = Math.Max(0, click.Y - 36); y <= Math.Min(height - 1, click.Y + 36); y++)
+                for (int x = Math.Max(0, click.X - 36); x <= Math.Min(width - 1, click.X + 36); x++)
+                {
+                    int offset = y * stride + x * 4;
+                    if (!Close(pixels, offset, red, green, blue)) continue;
+                    int distance = (x - click.X) * (x - click.X) + (y - click.Y) * (y - click.Y);
+                    if (distance < bestDistance) { bestDistance = distance; seed = new Point(x, y); }
+                }
+            if (bestDistance == Int32.MaxValue) return false;
+
+            int total = width * height;
+            bool[] visited = new bool[total];
+            int[] queue = new int[total];
+            int head = 0, tail = 0;
+            int seedIndex = seed.Y * width + seed.X;
+            queue[tail++] = seedIndex; visited[seedIndex] = true;
+            int minX = seed.X, maxX = seed.X, minY = seed.Y, maxY = seed.Y;
+            while (head < tail)
+            {
+                int index = queue[head++];
+                int x = index % width, y = index / width;
+                int offset = y * stride + x * 4;
+                if (!Close(pixels, offset, red, green, blue)) continue;
+                count++;
+                minX = Math.Min(minX, x); maxX = Math.Max(maxX, x);
+                minY = Math.Min(minY, y); maxY = Math.Max(maxY, y);
+                if (x > 0) Enqueue(index - 1, visited, queue, ref tail);
+                if (x + 1 < width) Enqueue(index + 1, visited, queue, ref tail);
+                if (y > 0) Enqueue(index - width, visited, queue, ref tail);
+                if (y + 1 < height) Enqueue(index + width, visited, queue, ref tail);
+            }
+            bounds = Rectangle.FromLTRB(minX, minY, maxX + 1, maxY + 1);
+            return count > 0;
+        }
+
+        private static void Enqueue(int index, bool[] visited, int[] queue, ref int tail)
+        {
+            if (visited[index]) return;
+            visited[index] = true;
+            queue[tail++] = index;
+        }
+
+        private static bool Close(byte[] pixels, int offset, int red, int green, int blue)
+        {
+            int dr = Math.Abs(pixels[offset + 2] - red);
+            int dg = Math.Abs(pixels[offset + 1] - green);
+            int db = Math.Abs(pixels[offset] - blue);
+            return dr <= 18 && dg <= 18 && db <= 18 && dr + dg + db <= 36;
+        }
+    }
+
     internal sealed class SelectionActionForm : Form
     {
         internal event Action ExplainRequested;
@@ -5151,10 +6175,20 @@ namespace SemanticOverlay.NativeHost
         internal static Rectangle DragRegion(Point start, Point end, Rectangle window)
         {
             // Drag endpoints are only an approximation; OCR text must be reviewed.
-            if (Math.Abs(start.Y - end.Y) > 80 || Math.Abs(start.X - end.X) < 8 ||
-                Math.Abs(start.X - end.X) > 1000) return Rectangle.Empty;
-            Rectangle region = Rectangle.FromLTRB(Math.Min(start.X, end.X) - 3,
-                Math.Min(start.Y, end.Y) - 18, Math.Max(start.X, end.X) + 3,
+            int deltaX = Math.Abs(start.X - end.X);
+            int deltaY = Math.Abs(start.Y - end.Y);
+            if ((deltaX < 8 && deltaY < 12) || deltaY > 360 || deltaX > 1000)
+                return Rectangle.Empty;
+            int left = Math.Min(start.X, end.X) - 6;
+            int right = Math.Max(start.X, end.X) + 6;
+            if (right - left < 80)
+            {
+                int center = (left + right) / 2;
+                left = center - 40;
+                right = center + 40;
+            }
+            Rectangle region = Rectangle.FromLTRB(left,
+                Math.Min(start.Y, end.Y) - 18, right,
                 Math.Max(start.Y, end.Y) + 18);
             region.Intersect(window);
             return region.Width < 8 || region.Height < 10 ? Rectangle.Empty : region;
@@ -5175,7 +6209,7 @@ namespace SemanticOverlay.NativeHost
         {
             base.OnPaint(e);
             e.Graphics.DrawRectangle(Pens.LightGray, 0, 0, Width - 1, Height - 1);
-            TextRenderer.DrawText(e.Graphics, String.IsNullOrWhiteSpace(SelectedText) ? "识别查词" : "AI 解释",
+            TextRenderer.DrawText(e.Graphics, "解释这段",
                 Font, new Rectangle(8, 0, 91, Height), Color.FromArgb(30, 60, 140),
                 TextFormatFlags.VerticalCenter | TextFormatFlags.HorizontalCenter);
             TextRenderer.DrawText(e.Graphics, "×", Font, new Rectangle(100, 0, 25, Height), Color.Gray,
@@ -5190,16 +6224,406 @@ namespace SemanticOverlay.NativeHost
         }
     }
 
+    internal sealed class SelectionAnalysisForm : Form
+    {
+        private readonly ServiceManager services;
+        private readonly Label heading = new Label {
+            Text = "这句话的意思", Dock = DockStyle.Fill, Font = new Font("Microsoft YaHei UI", 12, FontStyle.Bold),
+            TextAlign = ContentAlignment.MiddleLeft };
+        private readonly TextBox source = new TextBox { Multiline = true, MaxLength = 1000,
+            ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill };
+        private readonly Label sourceNotice = new Label { Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft };
+        private readonly Label status = new Label { Dock = DockStyle.Fill,
+            ForeColor = Color.DimGray, TextAlign = ContentAlignment.MiddleLeft };
+        private readonly TextBox body = new TextBox { Multiline = true, ReadOnly = true,
+            ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill, BackColor = Color.White };
+        private readonly Label sentenceTitle = new Label { Text = "原句（可点击术语）",
+            Dock = DockStyle.Fill, Font = new Font("Microsoft YaHei UI", 9, FontStyle.Bold),
+            TextAlign = ContentAlignment.MiddleLeft };
+        private readonly LinkLabel sentence = new LinkLabel { Dock = DockStyle.Fill,
+            AutoSize = false, LinkBehavior = LinkBehavior.HoverUnderline,
+            LinkColor = Color.FromArgb(20, 92, 190), ActiveLinkColor = Color.FromArgb(180, 70, 20),
+            Padding = new Padding(4), BackColor = Color.FromArgb(246, 249, 253) };
+        private readonly FlowLayoutPanel terms = new FlowLayoutPanel { Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight, WrapContents = true, AutoScroll = true };
+        private readonly Label termHeading = new Label { Text = "词语注释",
+            Dock = DockStyle.Fill, Font = new Font("Microsoft YaHei UI", 9, FontStyle.Bold),
+            TextAlign = ContentAlignment.MiddleLeft };
+        private readonly TextBox termBody = new TextBox { Multiline = true, ReadOnly = true,
+            ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill, BackColor = Color.White,
+            Text = "点击上方高亮词语查看它在这句话里的含义。" };
+        private readonly LinkLabel editSource = new LinkLabel {
+            Text = "识别有误？展开并修改原文", Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft, LinkBehavior = LinkBehavior.HoverUnderline };
+        private readonly Button analyze = new Button { Text = "确认并解释", Width = 112, Height = 30 };
+        private readonly TableLayoutPanel layout;
+        private int generation;
+        private int termGeneration;
+        private bool settingText;
+        private bool sourceEditorVisible;
+        private string passageText = String.Empty;
+        private string passageExplanation = String.Empty;
+        private string sourceApp = "other";
+        private string textSource = "ocr";
+        private string initialText = String.Empty;
+
+        internal SelectionAnalysisForm(ServiceManager service)
+        {
+            services = service;
+            Text = "消息解释";
+            Size = new Size(620, 690);
+            MinimumSize = new Size(540, 620);
+            TopMost = true;
+            Font = new Font("Microsoft YaHei UI", 9);
+
+            layout = new TableLayoutPanel {
+                Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 12, Padding = new Padding(12) };
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 140));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 100));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 70));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 82));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 0));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 0));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+            FlowLayoutPanel actions = new FlowLayoutPanel { Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.LeftToRight, WrapContents = false };
+            actions.Controls.Add(analyze);
+            layout.Controls.Add(heading, 0, 0);
+            layout.Controls.Add(status, 0, 1);
+            layout.Controls.Add(body, 0, 2);
+            layout.Controls.Add(sentenceTitle, 0, 3);
+            layout.Controls.Add(sentence, 0, 4);
+            layout.Controls.Add(terms, 0, 5);
+            layout.Controls.Add(termHeading, 0, 6);
+            layout.Controls.Add(termBody, 0, 7);
+            layout.Controls.Add(editSource, 0, 8);
+            layout.Controls.Add(source, 0, 9);
+            layout.Controls.Add(sourceNotice, 0, 10);
+            layout.Controls.Add(actions, 0, 11);
+            Controls.Add(layout);
+
+            analyze.Click += async delegate { await RunAnalysis(); };
+            editSource.LinkClicked += delegate { SetSourceEditorVisible(!sourceEditorVisible); };
+            sentence.LinkClicked += async delegate(object sender, LinkLabelLinkClickedEventArgs args)
+            {
+                SelectionTerm item = args.Link.LinkData as SelectionTerm;
+                if (item != null) await ShowTerm(item);
+            };
+            source.TextChanged += delegate
+            {
+                if (settingText) return;
+                generation++;
+                termGeneration++;
+                passageExplanation = String.Empty;
+                body.Clear();
+                sentence.Text = source.Text;
+                sentence.Links.Clear();
+                terms.Controls.Clear();
+                termHeading.Text = "词语注释";
+                termBody.Text = "重新解释后可查看词语注释。";
+                analyze.Text = "确认并解释";
+                status.Text = "文字已修改，确认后才会发送。";
+            };
+            FormClosed += delegate { generation++; termGeneration++; };
+        }
+
+        internal void OpenText(string text, bool exactSelection, string textSource,
+            string originatingApp)
+        {
+            OpenText(text, exactSelection, textSource, originatingApp, exactSelection);
+        }
+
+        internal void OpenText(string text, bool exactSelection, string textSource,
+            string originatingApp, bool autoAnalyze)
+        {
+            sourceApp = originatingApp ?? "other";
+            this.textSource = textSource ?? (exactSelection ? "accessibility" : "ocr");
+            passageText = String.Empty;
+            passageExplanation = String.Empty;
+            body.Clear();
+            sentence.Text = String.Empty;
+            sentence.Links.Clear();
+            terms.Controls.Clear();
+            termHeading.Text = "词语注释";
+            termBody.Text = "点击上方高亮词语查看它在这句话里的含义。";
+            int request = ++generation;
+            termGeneration++;
+            string value = (text ?? String.Empty).Trim();
+            initialText = value;
+            settingText = true;
+            source.Text = value.Length <= 1000 ? value : String.Empty;
+            settingText = false;
+            Show();
+            Activate();
+            if (value.Length == 0)
+            {
+                sourceNotice.Text = "没有读到所选文字，请重新拖选。";
+                status.Text = String.Empty;
+                return;
+            }
+            if (value.Length > 1000)
+            {
+                sourceNotice.Text = "所选文字超过 1000 个字符，请缩小选区后重试。";
+                status.Text = "内容没有被截断或发送。";
+                analyze.Enabled = false;
+                return;
+            }
+            analyze.Enabled = true;
+            if (autoAnalyze)
+            {
+                SetSourceEditorVisible(false);
+                sourceNotice.Text = exactSelection
+                    ? "已读取这条消息的完整文字，只会发送这一条。"
+                    : "已定位并识别整个消息气泡，正在解释；如有错误可直接修改。";
+                analyze.Text = "重新解释";
+                BeginInvoke(new Action(async delegate
+                {
+                    if (!IsDisposed && request == generation) await RunAnalysis();
+                }));
+            }
+            else
+            {
+                SetSourceEditorVisible(true);
+                sourceNotice.Text = "这是选区 OCR 结果。请先校对，确认后才会发送。";
+                analyze.Text = "确认并解释";
+                source.Focus();
+                source.SelectionStart = source.TextLength;
+            }
+            services.Log("Selection panel opened (" + value.Length + " chars, " +
+                (textSource ?? "unknown") + ", " + sourceApp + ")");
+        }
+
+        private async Task RunAnalysis()
+        {
+            string value = source.Text.Trim();
+            if (value.Length == 0)
+            {
+                status.Text = "请保留至少一个字符。";
+                return;
+            }
+            if (value.Length > 1000)
+            {
+                status.Text = "所选文字超过 1000 个字符，请缩小选区。";
+                return;
+            }
+            int request = ++generation;
+            termGeneration++;
+            passageText = value;
+            passageExplanation = String.Empty;
+            analyze.Enabled = false;
+            terms.Controls.Clear();
+            sentence.Text = value;
+            sentence.Links.Clear();
+            sentenceTitle.Text = "原句";
+            termHeading.Text = "词语注释";
+            termBody.Text = "正在等待整句分析…";
+            body.Text = "正在理解这段话…";
+            status.Text = "只分析当前消息";
+            Stopwatch watch = Stopwatch.StartNew();
+            try
+            {
+                SelectionAnalysisResponse response = await Task.Factory.StartNew(delegate
+                {
+                    services.EnsureRunning();
+                    bool allowCorrection = textSource == "bubble_ocr" || textSource == "ocr";
+                    return services.AnalyzeSelection(value, allowCorrection);
+                });
+                if (IsDisposed || request != generation) return;
+                watch.Stop();
+                passageExplanation = response == null ? String.Empty : response.explanation ?? String.Empty;
+                passageText = response == null || String.IsNullOrWhiteSpace(response.display_text)
+                    ? value : response.display_text.Trim();
+                body.Text = String.IsNullOrWhiteSpace(passageExplanation)
+                    ? "暂时没有可靠的整段解释，请重试。" : passageExplanation;
+                sentence.Text = passageText;
+                sentenceTitle.Text = response != null && response.ocr_corrected
+                    ? "原句（已校正，可点击术语）" : "原句（可点击术语）";
+                status.Text = (response != null && response.analysis_mode == "model"
+                    ? "AI 整段解释" : "本地状态") + " · " +
+                    (watch.ElapsedMilliseconds / 1000.0).ToString("0.0") + " 秒";
+                analyze.Text = response != null && response.can_retry ? "重新解释" : "再次检查";
+                RenderTermsSafely(response == null ? null : response.terms);
+                services.RecordSelectionMetric(
+                    sourceApp, textSource,
+                    response == null ? "empty" : response.analysis_mode,
+                    (int)Math.Min(Int32.MaxValue, watch.ElapsedMilliseconds),
+                    !String.Equals(initialText, value, StringComparison.Ordinal),
+                    response != null && response.analysis_mode == "model" &&
+                        !String.IsNullOrWhiteSpace(response.explanation),
+                    response == null || response.terms == null ? 0 : response.terms.Count);
+                services.Log("Selection analysis completed: " +
+                    (response == null ? "empty" : response.analysis_mode));
+            }
+            catch (Exception error)
+            {
+                if (!IsDisposed && request == generation)
+                {
+                    body.Text = "整段解释失败。请检查托盘中的解释模型配置后重试。";
+                    status.Text = "解释失败";
+                    services.Log("Selection analysis failed: " + error.GetType().Name);
+                }
+            }
+            finally
+            {
+                if (!IsDisposed && request == generation)
+                {
+                    analyze.Enabled = true;
+                }
+            }
+        }
+
+        private void RenderTerms(List<SelectionTerm> items)
+        {
+            terms.Controls.Clear();
+            sentence.Links.Clear();
+            if (items == null || items.Count == 0)
+            {
+                terms.Controls.Add(new Label { Text = "这段话没有必要单独拆出的术语。",
+                    AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 9, 3, 3) });
+                termHeading.Text = "词语注释";
+                termBody.Text = "这句话没有需要单独解释的术语。";
+                return;
+            }
+            var unique = new List<SelectionTerm>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (SelectionTerm item in items)
+            {
+                if (item == null || String.IsNullOrWhiteSpace(item.text)) continue;
+                string termText = item.text.Trim();
+                if (!seen.Add(termText)) continue;
+                unique.Add(new SelectionTerm { text = termText, explanation = item.explanation });
+                if (unique.Count >= 5) break;
+            }
+            if (unique.Count == 0)
+            {
+                RenderTerms(null);
+                return;
+            }
+            terms.Controls.Add(new Label { Text = "按需查看：", AutoSize = true,
+                Margin = new Padding(3, 9, 3, 3) });
+            foreach (SelectionTerm item in unique)
+            {
+                SelectionTerm captured = item;
+                Button button = new Button { Text = item.text, AutoSize = true, Height = 30,
+                    FlatStyle = FlatStyle.Flat, Margin = new Padding(3) };
+                button.Click += async delegate { await ShowTerm(captured); };
+                terms.Controls.Add(button);
+            }
+            var linkedRanges = new List<Tuple<int, int>>();
+            foreach (SelectionTerm item in unique.OrderByDescending(value => value.text.Length))
+            {
+                int start = 0;
+                while (start < passageText.Length)
+                {
+                    int found = passageText.IndexOf(item.text, start, StringComparison.Ordinal);
+                    if (found < 0) break;
+                    int end = found + item.text.Length;
+                    bool overlaps = linkedRanges.Any(range =>
+                        found < range.Item2 && end > range.Item1);
+                    if (!overlaps)
+                    {
+                        sentence.Links.Add(found, item.text.Length, item);
+                        linkedRanges.Add(Tuple.Create(found, end));
+                    }
+                    start = found + item.text.Length;
+                }
+            }
+            termHeading.Text = "词语注释";
+            termBody.Text = "点击原句中的蓝色词语或下方词语按钮查看注释。";
+        }
+
+        private void RenderTermsSafely(List<SelectionTerm> items)
+        {
+            try { RenderTerms(items); }
+            catch (Exception error)
+            {
+                sentence.Links.Clear();
+                terms.Controls.Clear();
+                terms.Controls.Add(new Label {
+                    Text = "术语暂时无法显示，整句解释仍可查看。",
+                    AutoSize = true, ForeColor = Color.DimGray,
+                    Margin = new Padding(3, 9, 3, 3)
+                });
+                termHeading.Text = "词语注释";
+                termBody.Text = "术语区域显示失败，可重新解释。";
+                services.Log("Selection term rendering failed: " + error.GetType().Name);
+            }
+        }
+
+        private async Task ShowTerm(SelectionTerm item)
+        {
+            int request = ++termGeneration;
+            termHeading.Text = "词语注释 · " + item.text;
+            if (!String.IsNullOrWhiteSpace(item.explanation))
+            {
+                termBody.Text = item.explanation;
+                return;
+            }
+            termBody.Text = "正在解释这个术语…";
+            try
+            {
+                LookupResponse response = await Task.Factory.StartNew(delegate
+                {
+                    services.EnsureRunning();
+                    return services.Lookup(item.text, passageText, false, null);
+                });
+                if (IsDisposed || request != termGeneration) return;
+                termBody.Text = response == null || String.IsNullOrWhiteSpace(response.explanation)
+                    ? "暂时没有可靠解释。" : response.explanation;
+            }
+            catch
+            {
+                if (!IsDisposed && request == termGeneration)
+                    termBody.Text = "术语解释失败，请稍后重试。";
+            }
+        }
+
+        private void SetSourceEditorVisible(bool visible)
+        {
+            sourceEditorVisible = visible;
+            source.Visible = visible;
+            sourceNotice.Visible = visible;
+            layout.RowStyles[9].Height = visible ? 100 : 0;
+            layout.RowStyles[10].Height = visible ? 38 : 0;
+            editSource.Text = visible
+                ? "收起原文编辑" : "识别有误？展开并修改原文";
+            if (visible)
+            {
+                int bottom = Screen.FromControl(this).WorkingArea.Bottom;
+                Height = Math.Min(820, Math.Max(690, bottom - Top - 12));
+            }
+            else if (Height > 690)
+                Height = 690;
+        }
+    }
+
     internal sealed class ManualLookupForm : Form
     {
         private readonly ServiceManager services;
         private readonly TextBox query = new TextBox { MaxLength = 200, Dock = DockStyle.Top };
         private readonly TextBox body = new TextBox { Multiline = true, ReadOnly = true,
             ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill };
-        private readonly Button lookup = new Button { Text = "解释", Dock = DockStyle.Bottom, Height = 34 };
+        private readonly Button lookup = new Button { Text = "AI 解释", Width = 112, Height = 30 };
+        private readonly Button retry = new Button { Text = "换个解释", Width = 112, Height = 30, Visible = false };
+        private readonly Button paste = new Button { Text = "粘贴并解释", Width = 112, Height = 30 };
+        private readonly LinkLabel related = new LinkLabel { Dock = DockStyle.Bottom, Height = 30,
+            AutoEllipsis = true, LinkBehavior = LinkBehavior.HoverUnderline, Visible = false };
+        private readonly LinkLabel feedback = new LinkLabel { Dock = DockStyle.Bottom, Height = 26,
+            AutoEllipsis = true, LinkBehavior = LinkBehavior.HoverUnderline, Visible = false };
         private readonly Label notice = new Label { Text = "选中文字后按 Ctrl+Alt+D；也可以在这里输入或粘贴词语。",
             Dock = DockStyle.Top, Height = 48 };
         private int generation;
+        private string currentExplanation;
+        private string inputSource = "typed";
+        private string initialQuery = String.Empty;
+        private string sourceApp = "other";
 
         // Show the waiting state immediately without stealing focus from the
         // source application. UI Automation still needs that application's
@@ -5209,47 +6633,208 @@ namespace SemanticOverlay.NativeHost
         internal ManualLookupForm(ServiceManager service)
         {
             services = service;
-            Text = "主动查词"; Size = new Size(440, 310); MinimumSize = Size;
+            Text = "AI 查词"; Size = new Size(460, 350); MinimumSize = Size;
             StartPosition = FormStartPosition.CenterScreen; TopMost = true;
-            Controls.Add(body); Controls.Add(query); Controls.Add(notice); Controls.Add(lookup);
+            FlowLayoutPanel actions = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 40,
+                FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(0, 4, 6, 0) };
+            actions.Controls.Add(retry); actions.Controls.Add(lookup); actions.Controls.Add(paste);
+            Controls.Add(body); Controls.Add(related); Controls.Add(feedback); Controls.Add(actions);
+            Controls.Add(query); Controls.Add(notice);
             AcceptButton = lookup;
-            lookup.Click += async delegate
+            lookup.Click += async delegate { await RunLookup(false); };
+            retry.Click += async delegate { await RunLookup(true); };
+            paste.Click += async delegate
             {
-                string term = query.Text.Trim();
-                if (term.Length == 0) { notice.Text = "请输入或粘贴需要解释的词语。"; return; }
-                int request = ++generation;
-                body.Text = "正在查询…"; lookup.Enabled = false;
-                services.Log("Manual lookup submitted (" + term.Length + " chars)");
-                try
+                string copied = ReadClipboardText();
+                if (String.IsNullOrWhiteSpace(copied))
                 {
-                    LookupResponse response = await Task.Factory.StartNew(delegate {
-                        LookupResponse local;
-                        if (ShortcutLookup.TryExplain(term, String.Empty, out local)) return local;
-                        services.EnsureRunning();
-                        return services.Lookup(term, String.Empty, false, null);
-                    });
-                    if (IsDisposed || request != generation) return;
-                    body.Text = response == null || String.IsNullOrWhiteSpace(response.explanation)
-                        ? "暂时没有可靠解释，请稍后重试。" : response.explanation;
-                    services.NoteTermClicked(term);
-                    services.Log("Manual lookup completed");
+                    notice.Text = "剪贴板中没有可查询的文字。";
+                    return;
                 }
-                catch (Exception error)
-                {
-                    services.Log("Manual lookup failed: " + error.GetType().Name);
-                    if (!IsDisposed && request == generation) body.Text = "查询失败，请稍后重试。";
-                }
-                finally { if (!IsDisposed && request == generation) lookup.Enabled = true; }
+                inputSource = "clipboard";
+                initialQuery = copied;
+                query.Text = copied;
+                await RunLookup(false);
+            };
+            related.LinkClicked += async delegate(object sender, LinkLabelLinkClickedEventArgs args)
+            {
+                string term = args.Link.LinkData as string;
+                if (String.IsNullOrWhiteSpace(term)) return;
+                inputSource = "typed";
+                initialQuery = term;
+                query.Text = term;
+                await RunLookup(false);
+            };
+            feedback.Text = "反馈：有用 · 不需要标 · 解释不对";
+            feedback.Links.Add(3, 2, "useful");
+            feedback.Links.Add(8, 4, "unnecessary_highlight");
+            feedback.Links.Add(15, 4, "wrong_explanation");
+            feedback.LinkClicked += delegate(object sender, LinkLabelLinkClickedEventArgs args)
+            {
+                string value = args.Link.LinkData as string;
+                if (String.IsNullOrWhiteSpace(value)) return;
+                services.RecordFeedbackMetric("active_lookup", sourceApp, value);
+                if (value == "useful") services.NoteTermClicked(query.Text);
+                else if (value == "unnecessary_highlight") services.IgnoreTerm(query.Text);
+                feedback.Text = "已记录，谢谢";
+                feedback.Links.Clear();
             };
         }
 
-        internal async void Open(bool readSelection)
+        private async Task RunLookup(bool refresh)
         {
+            string term = query.Text.Trim();
+            if (term.Length == 0) { notice.Text = "请输入或粘贴需要解释的词语。"; return; }
+            int request = ++generation;
+            Stopwatch watch = Stopwatch.StartNew();
+            body.Text = refresh ? "正在换一种解释…" : "正在先查本地术语索引…";
+            related.Visible = false; related.Links.Clear();
+            feedback.Visible = false;
+            lookup.Enabled = false; retry.Enabled = false;
+            services.Log("Manual lookup submitted (" + term.Length + " chars)");
+            try
+            {
+                string previous = refresh ? currentExplanation : null;
+                LookupResponse response;
+                if (!refresh)
+                {
+                    LookupResponse instant = await Task.Factory.StartNew(delegate {
+                        LookupResponse local;
+                        if (ShortcutLookup.TryExplain(term, String.Empty, out local)) return local;
+                        services.EnsureRunning();
+                        return services.LookupInstant(term, String.Empty);
+                    });
+                    if (IsDisposed || request != generation) return;
+                    if (instant != null && !String.IsNullOrWhiteSpace(instant.explanation))
+                    {
+                        string instantCanonical = (instant.term ?? String.Empty).Trim();
+                        if (!String.IsNullOrWhiteSpace(instantCanonical)) query.Text = instantCanonical;
+                        body.Text = instant.explanation;
+                        currentExplanation = instant.explanation;
+                        ShowRelatedTerms(instant.entities,
+                            String.IsNullOrWhiteSpace(instantCanonical) ? term : instantCanonical);
+                        if (!instant.needs_model)
+                        {
+                            response = instant;
+                            goto RenderCompletedLookup;
+                        }
+                        notice.Text = "本地即时结果 · AI 正在后台补充";
+                    }
+                }
+
+                response = await Task.Factory.StartNew(delegate {
+                    LookupResponse local;
+                    if (ShortcutLookup.TryExplain(term, String.Empty, out local)) return local;
+                    services.EnsureRunning();
+                    return services.Lookup(term, String.Empty, refresh, previous);
+                });
+                if (IsDisposed || request != generation) return;
+RenderCompletedLookup:
+                watch.Stop();
+                string canonical = response == null ? String.Empty : (response.term ?? String.Empty).Trim();
+                if (!String.IsNullOrWhiteSpace(canonical)) query.Text = canonical;
+                currentExplanation = response == null ? null : response.explanation;
+                body.Text = String.IsNullOrWhiteSpace(currentExplanation)
+                    ? "暂时没有可靠解释，请稍后重试。" : currentExplanation;
+                string mode = response == null ? "无结果" :
+                    String.Equals(response.lookup_mode, "model", StringComparison.OrdinalIgnoreCase)
+                        ? "AI 模型解释"
+                        : String.Equals(response.lookup_mode, "local_shortcut", StringComparison.OrdinalIgnoreCase)
+                            ? "本地快捷键规则"
+                            : String.Equals(response.lookup_mode, "local_glossary", StringComparison.OrdinalIgnoreCase)
+                                ? "本地术语索引"
+                            : response.can_refresh ? "本地兜底（AI 暂不可用）" : "本地/公共词典";
+                notice.Text = mode + " · " + (watch.ElapsedMilliseconds / 1000.0).ToString("0.0") + " 秒";
+                retry.Visible = response != null && response.can_refresh;
+                feedback.Text = "反馈：有用 · 不需要标 · 解释不对";
+                feedback.Links.Clear();
+                feedback.Links.Add(3, 2, "useful");
+                feedback.Links.Add(8, 4, "unnecessary_highlight");
+                feedback.Links.Add(15, 4, "wrong_explanation");
+                feedback.Visible = response != null && !String.IsNullOrWhiteSpace(currentExplanation);
+                string resolvedTerm = String.IsNullOrWhiteSpace(canonical) ? term : canonical;
+                ShowRelatedTerms(response == null ? null : response.entities, resolvedTerm);
+                services.NoteTermClicked(resolvedTerm);
+                services.Log("Manual lookup completed: " + (response == null ? "empty" : response.lookup_mode));
+                services.RecordLookupMetric("active_lookup", sourceApp, inputSource,
+                    response == null ? "empty" : response.lookup_mode,
+                    watch.ElapsedMilliseconds,
+                    initialQuery.Length > 0 && !String.Equals(initialQuery, term, StringComparison.Ordinal),
+                    response != null && response.cached,
+                    response != null && !String.IsNullOrWhiteSpace(response.explanation));
+            }
+            catch (Exception error)
+            {
+                services.Log("Manual lookup failed: " + error.GetType().Name);
+                if (!IsDisposed && request == generation)
+                {
+                    body.Text = "AI 查询失败，请检查托盘中的解释模型配置后重试。";
+                    notice.Text = "查询失败";
+                    retry.Visible = true;
+                    services.RecordLookupMetric("active_lookup", sourceApp, inputSource, "client_error",
+                        watch.ElapsedMilliseconds,
+                        initialQuery.Length > 0 && !String.Equals(initialQuery, term, StringComparison.Ordinal),
+                        false, false);
+                }
+            }
+            finally
+            {
+                if (!IsDisposed && request == generation)
+                {
+                    lookup.Enabled = true;
+                    retry.Enabled = true;
+                }
+            }
+        }
+
+        private void ShowRelatedTerms(List<AnalysisEntity> entities, string originalTerm)
+        {
+            related.Links.Clear();
+            if (entities == null || entities.Count == 0)
+            {
+                related.Visible = false;
+                return;
+            }
+            StringBuilder text = new StringBuilder("继续查：");
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            List<KeyValuePair<int, string>> links = new List<KeyValuePair<int, string>>();
+            foreach (AnalysisEntity entity in entities)
+            {
+                string term = entity == null ? String.Empty : (entity.text ?? String.Empty).Trim();
+                if (term.Length == 0 || String.Equals(term, originalTerm, StringComparison.OrdinalIgnoreCase) ||
+                    !seen.Add(term)) continue;
+                if (seen.Count > 1) text.Append(" · ");
+                int start = text.Length;
+                text.Append(term);
+                links.Add(new KeyValuePair<int, string>(start, term));
+                if (seen.Count >= 4) break;
+            }
+            related.Text = text.ToString();
+            foreach (KeyValuePair<int, string> link in links)
+                related.Links.Add(link.Key, link.Value.Length, link.Value);
+            related.Visible = seen.Count > 0;
+        }
+
+        internal async void Open(bool readSelection, string originatingApp = "other")
+        {
+            sourceApp = originatingApp ?? "other";
             int request = ++generation;
             if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
             lookup.Enabled = true;
             query.Text = String.Empty;
             body.Text = String.Empty;
+            currentExplanation = null;
+            retry.Visible = false;
+            related.Visible = false;
+            related.Links.Clear();
+            feedback.Visible = false;
+            feedback.Text = "反馈：有用 · 不需要标 · 解释不对";
+            feedback.Links.Clear();
+            feedback.Links.Add(3, 2, "useful");
+            feedback.Links.Add(8, 4, "unnecessary_highlight");
+            feedback.Links.Add(15, 4, "wrong_explanation");
+            inputSource = "typed";
+            initialQuery = String.Empty;
 
             if (!readSelection)
             {
@@ -5284,6 +6869,8 @@ namespace SemanticOverlay.NativeHost
             }
             else
             {
+                inputSource = "accessibility";
+                initialQuery = text;
                 notice.Text = "已读取所选文字，正在为你解释。";
                 services.Log("Manual lookup selection read (" + text.Length + " chars)");
             }
@@ -5301,17 +6888,32 @@ namespace SemanticOverlay.NativeHost
             query.Focus();
         }
 
-        internal void OpenText(string text, bool exactSelection)
+        internal void OpenText(string text, bool exactSelection, string textSource,
+            string originatingApp = "other")
         {
+            sourceApp = originatingApp ?? "other";
             query.Text = (text ?? String.Empty).Length > 200 ? text.Substring(0, 200) : text;
+            inputSource = textSource ?? (exactSelection ? "accessibility" : "ocr");
+            initialQuery = query.Text;
+            body.Text = String.Empty;
+            currentExplanation = null;
+            retry.Visible = false;
+            related.Visible = false;
+            related.Links.Clear();
+            feedback.Visible = false;
             notice.Text = exactSelection ? "已读取所选文字，正在为你解释。" :
-                "这是所选区域的 OCR 结果，请核对或修改后点击解释。";
+                "这是所选区域的 OCR 结果，请核对或修改后点击 AI 解释。";
             Show(); Activate();
             if (exactSelection && !String.IsNullOrWhiteSpace(query.Text)) lookup.PerformClick();
             else query.Focus();
         }
 
         internal static string ReadSelection()
+        {
+            return ReadSelection(200, false);
+        }
+
+        internal static string ReadSelection(int maxLength, bool retainOversizeMarker)
         {
             try
             {
@@ -5329,10 +6931,57 @@ namespace SemanticOverlay.NativeHost
                 Array ranges = (Array)patternType.GetMethod("GetSelection").Invoke(pattern, null);
                 if (ranges == null || ranges.Length != 1) return String.Empty;
                 object range = ranges.GetValue(0);
-                string text = (string)range.GetType().GetMethod("GetText").Invoke(range, new object[] { 201 });
-                return text != null && text.Trim().Length <= 200 ? text.Trim() : String.Empty;
+                string text = (string)range.GetType().GetMethod("GetText").Invoke(
+                    range, new object[] { Math.Max(2, maxLength + 1) });
+                string value = (text ?? String.Empty).Trim();
+                if (value.Length <= maxLength) return value;
+                return retainOversizeMarker ? value : String.Empty;
             }
             catch { return String.Empty; }
+        }
+
+        internal static string ReadClipboardText()
+        {
+            try
+            {
+                if (!Clipboard.ContainsText()) return String.Empty;
+                string value = Clipboard.GetText(TextDataFormat.UnicodeText);
+                value = Regex.Replace(value ?? String.Empty, @"\s+", " ").Trim();
+                return value.Length > 200 ? String.Empty : value;
+            }
+            catch { return String.Empty; }
+        }
+
+        internal static string PreferCopiedSelection(string ocr, string copied)
+        {
+            ocr = (ocr ?? String.Empty).Trim();
+            copied = (copied ?? String.Empty).Trim();
+            if (copied.Length == 0 || copied.Length > 200) return ocr;
+            // The user already clicked the selection toolbar's explanation
+            // action. If the bounded OCR crop produced nothing, the copied
+            // selection is the only exact local text source and should fill the
+            // query without requiring another paste action.
+            if (ocr.Length == 0) return copied;
+            string left = Regex.Replace(ocr.ToLowerInvariant(), @"[^0-9a-z\u4e00-\u9fff]+", "");
+            string right = Regex.Replace(copied.ToLowerInvariant(), @"[^0-9a-z\u4e00-\u9fff]+", "");
+            if (left.Length == 0 || right.Length == 0) return ocr;
+            if (left == right) return copied;
+            int longest = Math.Max(left.Length, right.Length);
+            if (longest < 4) return ocr;
+            int[] previous = Enumerable.Range(0, right.Length + 1).ToArray();
+            for (int row = 1; row <= left.Length; row++)
+            {
+                int[] current = new int[right.Length + 1];
+                current[0] = row;
+                for (int column = 1; column <= right.Length; column++)
+                    current[column] = Math.Min(Math.Min(
+                        current[column - 1] + 1,
+                        previous[column] + 1),
+                        previous[column - 1] + (left[row - 1] == right[column - 1] ? 0 : 1));
+                previous = current;
+            }
+            int distance = previous[right.Length];
+            return distance <= 2 && distance / (double)longest <= 0.34 ? copied : ocr;
         }
     }
 
@@ -5569,8 +7218,12 @@ namespace SemanticOverlay.NativeHost
 
     internal sealed class ServiceManager : IDisposable
     {
+        internal const string ExpectedProductId = "realtime-dictionary";
+        internal const int SupportedProtocolVersion = 2;
+        internal const string ClientVersion = "0.20.0-dev";
         internal static string WorkModeOverrideForDiagnostics { get; set; }
         internal static bool DisableFamiliarityPersistenceForDiagnostics { get; set; }
+        internal static bool DisableUsageMetricsForDiagnostics { get; set; }
 
         private readonly string projectRoot;
         private readonly string logPath;
@@ -5584,6 +7237,7 @@ namespace SemanticOverlay.NativeHost
         private readonly HashSet<string> ignoredTerms =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly TermFamiliarityStore familiarity;
+        private readonly UsageMetricsStore usageMetrics;
         private string serviceToken;
         private Process windowsOcrWorker;
         private Task<string> windowsOcrErrorTask;
@@ -5592,9 +7246,11 @@ namespace SemanticOverlay.NativeHost
         public string AnalysisContextId { get; private set; }
         public string ScanScope { get; private set; }
         public string WorkMode { get; private set; }
+        public string PresentationMode { get; private set; }
         public string CaptionAudioScope { get; private set; }
         public bool AutoLearnFamiliarTerms { get; private set; }
         public bool SelectionToolbarEnabled { get; private set; }
+        public bool ExperimentalFeaturesEnabled { get; private set; }
         public int IgnoredTermCount { get { return ignoredTerms.Count; } }
         public int AutoSuppressedTermCount { get { return familiarity.SuppressedCount; } }
 
@@ -5603,6 +7259,19 @@ namespace SemanticOverlay.NativeHost
             string directory = Path.Combine(projectRoot, "browser-extension");
             if (!Directory.Exists(directory))
                 throw new DirectoryNotFoundException(directory);
+            ProcessStartInfo info = new ProcessStartInfo();
+            info.FileName = "explorer.exe";
+            info.Arguments = "\"" + directory + "\"";
+            info.UseShellExecute = true;
+            Process.Start(info);
+        }
+
+        public void OpenUsageMetricsDirectory()
+        {
+            string directory = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "RealtimeDictionary");
+            Directory.CreateDirectory(directory);
             ProcessStartInfo info = new ProcessStartInfo();
             info.FileName = "explorer.exe";
             info.Arguments = "\"" + directory + "\"";
@@ -5629,12 +7298,20 @@ namespace SemanticOverlay.NativeHost
                     ? "caption" : "conversation";
             CaptionAudioScope = preferences.TryGetValue("caption_audio_scope", out value) && value == "system"
                 ? "system" : "process";
+            PresentationMode = preferences.TryGetValue("presentation_mode", out value) && value == "attached"
+                ? "attached" : "assistant";
             AutoLearnFamiliarTerms = !preferences.TryGetValue("auto_learn_familiar_terms", out value) ||
                 !String.Equals(value, "false", StringComparison.OrdinalIgnoreCase);
             LoadIgnoredTerms();
             SelectionToolbarEnabled = !preferences.TryGetValue("selection_toolbar", out value) || value != "false";
+            ExperimentalFeaturesEnabled = preferences.TryGetValue("experimental_features", out value) &&
+                String.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
+            if (!ExperimentalFeaturesEnabled && WorkMode == "caption" &&
+                WorkModeOverrideForDiagnostics != "caption")
+                WorkMode = "conversation";
             familiarity = new TermFamiliarityStore(
                 DisableFamiliarityPersistenceForDiagnostics ? null : FamiliarityPath());
+            usageMetrics = DisableUsageMetricsForDiagnostics ? null : new UsageMetricsStore();
             BeginAnalysisContext();
             Task.Factory.StartNew(delegate
             {
@@ -5672,6 +7349,33 @@ namespace SemanticOverlay.NativeHost
             familiarity.NoteClicked(term);
         }
 
+        public void RecordLookupMetric(string triggerMode, string sourceApp, string textSource, string lookupMode,
+            long elapsedMilliseconds, bool manualCorrection, bool cacheHit, bool success)
+        {
+            if (usageMetrics != null)
+                usageMetrics.RecordLookup(triggerMode, sourceApp, textSource, lookupMode,
+                    elapsedMilliseconds > Int32.MaxValue ? Int32.MaxValue : (int)elapsedMilliseconds,
+                manualCorrection, cacheHit, success);
+        }
+
+        public void RecordSelectionMetric(string sourceApp, string textSource, string analysisMode,
+            int elapsedMs, bool manualCorrection, bool success, int termCount)
+        {
+            if (usageMetrics != null)
+                usageMetrics.RecordSelection(sourceApp, textSource, analysisMode,
+                    elapsedMs, manualCorrection, success, termCount);
+        }
+
+        public void RecordFeedbackMetric(string triggerMode, string sourceApp, string feedback)
+        {
+            if (usageMetrics != null) usageMetrics.RecordFeedback(triggerMode, sourceApp, feedback);
+        }
+
+        public void RecordHighlightMetric(string sourceApp, int count, string analysisMode)
+        {
+            if (usageMetrics != null) usageMetrics.RecordHighlights(sourceApp, count, analysisMode);
+        }
+
         public bool ShouldSuppressTerm(string term)
         {
             return AutoLearnFamiliarTerms && familiarity.ShouldSuppress(term);
@@ -5686,6 +7390,14 @@ namespace SemanticOverlay.NativeHost
             SavePreferences();
             if (enabled) familiarity.BeginSession();
             Log("Local familiarity learning " + (enabled ? "enabled" : "disabled"));
+        }
+
+        public void SetExperimentalFeaturesEnabled(bool enabled)
+        {
+            ExperimentalFeaturesEnabled = enabled;
+            preferences["experimental_features"] = enabled ? "true" : "false";
+            SavePreferences();
+            Log("Experimental features " + (enabled ? "enabled" : "disabled"));
         }
 
         public void ClearFamiliarTerms()
@@ -5749,6 +7461,14 @@ namespace SemanticOverlay.NativeHost
             preferences["work_mode"] = WorkMode;
             SavePreferences();
             Log("Work mode changed to " + WorkMode);
+        }
+
+        public void SetPresentationMode(string value)
+        {
+            PresentationMode = value == "attached" ? "attached" : "assistant";
+            preferences["presentation_mode"] = PresentationMode;
+            SavePreferences();
+            Log("Conversation presentation changed to " + PresentationMode);
         }
 
         public void SetCaptionAudioScope(string value)
@@ -5834,9 +7554,18 @@ namespace SemanticOverlay.NativeHost
         {
             lock (serviceLock)
             {
-                if (!IsHealthy("http://127.0.0.1:8877/health", 350))
-                    StartPython("server.py");
-                WaitForHealth("http://127.0.0.1:8877/health", 10000);
+                ServiceHealth health = TryGetAnalysisHealth(350);
+                if (health != null)
+                {
+                    if (IsCompatibleHealth(health))
+                        return;
+                    throw new InvalidOperationException(
+                        "端口 8877 正在运行旧版或不兼容的实时字典服务。请先从托盘退出旧版本，再启动当前版本。");
+                }
+                if (IsHealthy("http://127.0.0.1:8877/health", 350))
+                    throw new InvalidOperationException("端口 8877 已被其他本地服务占用。");
+                StartPython("server.py");
+                WaitForCompatibleAnalysisService(10000);
             }
         }
 
@@ -5941,11 +7670,39 @@ namespace SemanticOverlay.NativeHost
 
         public void SaveApiKey(string apiKey, string baseUrl, string model)
         {
-            string key = (apiKey ?? string.Empty).Trim();
+            string key;
+            string endpoint;
+            string modelId;
+            NormalizeProviderConfig(apiKey, baseUrl, model, out key, out endpoint, out modelId);
+            Dictionary<string, object> changes = new Dictionary<string, object>();
+            changes["base_url"] = endpoint;
+            changes["model"] = modelId;
+            changes["api_key"] = key;
+            UpdateProviderConfig(changes);
+        }
+
+        public void SaveTypeSafeKey(string apiKey, string baseUrl, string model)
+        {
+            string key;
+            string endpoint;
+            string modelId;
+            NormalizeProviderConfig(apiKey, baseUrl, model, out key, out endpoint, out modelId);
+            Dictionary<string, object> changes = new Dictionary<string, object>();
+            changes["typesafe_base_url"] = endpoint;
+            changes["typesafe_model"] = modelId;
+            changes["typesafe_api_key"] = key;
+            UpdateProviderConfig(changes);
+        }
+
+        private static void NormalizeProviderConfig(
+            string apiKey, string baseUrl, string model,
+            out string key, out string endpoint, out string modelId)
+        {
+            key = (apiKey ?? string.Empty).Trim();
             if (key.Length < 8)
                 throw new ArgumentException("API Key 不能为空。", "apiKey");
-            string endpoint = (baseUrl ?? string.Empty).Trim().TrimEnd('/');
-            string modelId = (model ?? string.Empty).Trim();
+            endpoint = (baseUrl ?? string.Empty).Trim().TrimEnd('/');
+            modelId = (model ?? string.Empty).Trim();
             Uri endpointUri;
             bool validUri = Uri.TryCreate(endpoint, UriKind.Absolute, out endpointUri);
             bool localHttp = validUri && endpointUri.Scheme == Uri.UriSchemeHttp &&
@@ -5954,18 +7711,26 @@ namespace SemanticOverlay.NativeHost
                 throw new ArgumentException("模型服务地址必须是 HTTPS，或本机地址。", "baseUrl");
             if (modelId.Length == 0 || modelId.Length > 160)
                 throw new ArgumentException("模型名称不能为空。", "model");
+        }
+
+        private void UpdateProviderConfig(Dictionary<string, object> changes)
+        {
             string configDir = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
                 "RealtimeDictionary");
             Directory.CreateDirectory(configDir);
-            Dictionary<string, string> config = new Dictionary<string, string>();
-            config["base_url"] = endpoint;
-            config["model"] = modelId;
-            config["api_key"] = key;
-            File.WriteAllText(
-                Path.Combine(configDir, "config.json"),
-                serializer.Serialize(config),
-                new UTF8Encoding(false));
+            string path = Path.Combine(configDir, "config.json");
+            Dictionary<string, object> config = new Dictionary<string, object>();
+            if (File.Exists(path))
+            {
+                Dictionary<string, object> existing = serializer.Deserialize<Dictionary<string, object>>(
+                    File.ReadAllText(path, Encoding.UTF8));
+                if (existing != null)
+                    config = existing;
+            }
+            foreach (KeyValuePair<string, object> change in changes)
+                config[change.Key] = change.Value;
+            File.WriteAllText(path, serializer.Serialize(config), new UTF8Encoding(false));
         }
 
         public bool TakeFirstRunNotice()
@@ -5998,6 +7763,16 @@ namespace SemanticOverlay.NativeHost
                 "http://127.0.0.1:8877/validate-key", payload, 12000);
         }
 
+        public KeyValidationResult ValidateTypeSafeKey(string apiKey, string baseUrl, string model)
+        {
+            Dictionary<string, string> payload = new Dictionary<string, string>();
+            payload["api_key"] = (apiKey ?? string.Empty).Trim();
+            payload["base_url"] = (baseUrl ?? string.Empty).Trim();
+            payload["model"] = (model ?? string.Empty).Trim();
+            return PostJson<KeyValidationResult>(
+                "http://127.0.0.1:8877/validate-typesafe-key", payload, 12000);
+        }
+
         public KeyValidationResult ValidateCurrentConfiguration()
         {
             return PostJson<KeyValidationResult>(
@@ -6011,8 +7786,26 @@ namespace SemanticOverlay.NativeHost
             return GetJson<ServiceHealth>("http://127.0.0.1:8877/health", false);
         }
 
+        internal static bool IsCompatibleHealth(ServiceHealth health)
+        {
+            return health != null && health.ok &&
+                String.Equals(health.product_id, ExpectedProductId, StringComparison.Ordinal) &&
+                health.protocol_version == SupportedProtocolVersion;
+        }
+
         public KeyValidationResult RestartAnalysisService()
         {
+            return RestartAnalysisService(false);
+        }
+
+        public KeyValidationResult RestartAnalysisService(bool requireTypeSafe)
+        {
+            ServiceHealth current = TryGetAnalysisHealth(500);
+            if (current != null && !IsCompatibleHealth(current))
+                throw new InvalidOperationException(
+                    "检测到旧版或不兼容的后端。请先退出旧版实时字典，再重新打开当前版本。");
+            if (current == null && IsHealthy("http://127.0.0.1:8877/health", 350))
+                throw new InvalidOperationException("端口 8877 已被其他本地服务占用，不能自动重启。");
             try
             {
                 PostJson<OperationResponse>(
@@ -6034,16 +7827,20 @@ namespace SemanticOverlay.NativeHost
                 if (IsHealthy("http://127.0.0.1:8877/health", 250))
                     throw new InvalidOperationException("旧分析服务没有按时退出。");
                 StartPython("server.py");
-                WaitForHealth("http://127.0.0.1:8877/health", 10000);
+                WaitForCompatibleAnalysisService(10000);
             }
             ResetServiceToken();
             ServiceHealth health = GetServiceStatus();
+            bool configured = health != null && (requireTypeSafe
+                ? health.has_typesafe_key && String.Equals(health.analysis_provider, "typesafe",
+                    StringComparison.OrdinalIgnoreCase)
+                : health.has_explanation_key);
             return new KeyValidationResult {
-                ok = health != null && health.ok && health.has_key,
-                configured = health != null && health.has_key,
-                model = health == null ? null : health.model,
-                model_available = health != null && health.ok && health.has_key,
-                message = health != null && health.ok && health.has_key
+                ok = health != null && health.ok && configured,
+                configured = configured,
+                model = health == null ? null : (requireTypeSafe ? health.analysis_model : health.explanation_model),
+                model_available = health != null && health.ok && configured,
+                message = health != null && health.ok && configured
                     ? "配置已应用" : "配置未能加载"
             };
         }
@@ -6054,11 +7851,36 @@ namespace SemanticOverlay.NativeHost
             bool refresh,
             string previousExplanation)
         {
+            return LookupCore(term, context, refresh, previousExplanation, false);
+        }
+
+        public LookupResponse LookupInstant(string term, string context)
+        {
+            return LookupCore(term, context, false, null, true);
+        }
+
+        public SelectionAnalysisResponse AnalyzeSelection(string text, bool allowOcrCorrection)
+        {
+            Dictionary<string, string> payload = new Dictionary<string, string>();
+            payload["text"] = text;
+            payload["allow_ocr_correction"] = allowOcrCorrection ? "true" : "false";
+            return PostJson<SelectionAnalysisResponse>(
+                "http://127.0.0.1:8877/selection/analyze", payload, 22000);
+        }
+
+        private LookupResponse LookupCore(
+            string term,
+            string context,
+            bool refresh,
+            string previousExplanation,
+            bool instant)
+        {
             Dictionary<string, string> payload = new Dictionary<string, string>();
             payload["term"] = term;
             payload["context"] = context ?? String.Empty;
             payload["refresh"] = refresh ? "true" : "false";
             payload["previous_explanation"] = refresh ? (previousExplanation ?? String.Empty) : String.Empty;
+            payload["mode"] = instant ? "instant" : "full";
             byte[] body = Encoding.UTF8.GetBytes(serializer.Serialize(payload));
             for (int attempt = 0; ; attempt++)
             {
@@ -6236,8 +8058,12 @@ namespace SemanticOverlay.NativeHost
                     try
                     {
                         SessionInfo session = GetJson<SessionInfo>("http://127.0.0.1:8877/session", false);
-                        if (session != null && !String.IsNullOrEmpty(session.token))
+                        if (session != null && !String.IsNullOrEmpty(session.token) &&
+                            String.Equals(session.product_id, ExpectedProductId, StringComparison.Ordinal) &&
+                            session.protocol_version == SupportedProtocolVersion)
                             serviceToken = session.token;
+                        else if (session != null)
+                            throw new InvalidOperationException("后端会话协议与当前程序不兼容。");
                     }
                     catch (Exception error)
                     {
@@ -6761,6 +8587,40 @@ namespace SemanticOverlay.NativeHost
             catch { return false; }
         }
 
+        private ServiceHealth TryGetAnalysisHealth(int timeout)
+        {
+            try
+            {
+                HttpWebRequest request = (HttpWebRequest)WebRequest.Create(
+                    "http://127.0.0.1:8877/health");
+                request.Method = "GET";
+                request.Timeout = timeout;
+                using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
+                using (StreamReader reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
+                    return serializer.Deserialize<ServiceHealth>(reader.ReadToEnd());
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private void WaitForCompatibleAnalysisService(int maxMilliseconds)
+        {
+            Stopwatch watch = Stopwatch.StartNew();
+            while (watch.ElapsedMilliseconds < maxMilliseconds)
+            {
+                ServiceHealth health = TryGetAnalysisHealth(500);
+                if (IsCompatibleHealth(health))
+                    return;
+                if (health != null)
+                    throw new InvalidOperationException(
+                        "启动后的后端协议不兼容，请确认前端与 server.py 来自同一版本。");
+                Thread.Sleep(250);
+            }
+            throw new InvalidOperationException("实时字典后端未能在限定时间内启动。");
+        }
+
         private static void WaitForHealth(string url, int maxMilliseconds)
         {
             Stopwatch watch = Stopwatch.StartNew();
@@ -6849,6 +8709,29 @@ namespace SemanticOverlay.NativeHost
         public List<string> sources { get; set; }
         public string lookup_mode { get; set; }
         public bool can_refresh { get; set; }
+        public bool cached { get; set; }
+        public bool needs_model { get; set; }
+        public string error { get; set; }
+    }
+
+    internal sealed class SelectionTerm
+    {
+        public string text { get; set; }
+        public string explanation { get; set; }
+    }
+
+    internal sealed class SelectionAnalysisResponse
+    {
+        public bool ok { get; set; }
+        public string source_text { get; set; }
+        public string display_text { get; set; }
+        public bool ocr_corrected { get; set; }
+        public string explanation { get; set; }
+        public List<SelectionTerm> terms { get; set; }
+        public string analysis_mode { get; set; }
+        public bool can_retry { get; set; }
+        public int duration_ms { get; set; }
+        public string notice { get; set; }
         public string error { get; set; }
     }
 
@@ -6867,6 +8750,9 @@ namespace SemanticOverlay.NativeHost
     {
         public string token { get; set; }
         public bool has_key { get; set; }
+        public string product_id { get; set; }
+        public int protocol_version { get; set; }
+        public string app_version { get; set; }
     }
 
     internal sealed class KeyValidationResult
@@ -6881,9 +8767,19 @@ namespace SemanticOverlay.NativeHost
     internal sealed class ServiceHealth
     {
         public bool ok { get; set; }
+        public string product_id { get; set; }
+        public int protocol_version { get; set; }
+        public string app_version { get; set; }
         public bool has_key { get; set; }
+        public bool has_explanation_key { get; set; }
+        public bool has_typesafe_key { get; set; }
         public string model { get; set; }
+        public string explanation_provider { get; set; }
+        public string explanation_model { get; set; }
+        public string analysis_provider { get; set; }
+        public string analysis_model { get; set; }
         public string analysis_mode { get; set; }
+        public string speech_model { get; set; }
         public int model_analysis_calls_last_hour { get; set; }
         public int model_analysis_limit_per_hour { get; set; }
         public int analysis_cache_entries { get; set; }
@@ -6996,7 +8892,7 @@ namespace SemanticOverlay.NativeHost
             string normalized = canonical.ToLowerInvariant();
             string body = canonical + " 是键盘组合快捷键：按住前面的修饰键，再按最后一个键。具体功能取决于当前软件的设置。";
             if (normalized == "ctrl+alt+g") body = canonical + " 在实时字典中用于清除高亮并结束当前会话，程序仍在托盘运行。";
-            if (normalized == "ctrl+alt+k") body = canonical + " 在实时字典中用于启用或刷新当前窗口高亮。";
+            if (normalized == "ctrl+alt+k") body = canonical + " 在实时字典的对话模式中用于进入一次 10 秒待选状态；随后单击一条聊天消息即可解释，点击后自动退出待选状态。";
             if (normalized == "ctrl+alt+d") body = canonical + " 在实时字典中用于查询选中文字；读取不到时可以输入或粘贴。";
             result = new LookupResponse { term = canonical, explanation = body + "\n\n来源：本地快捷键规则。",
                 lookup_mode = "local_shortcut", can_refresh = false };
@@ -7091,6 +8987,8 @@ namespace SemanticOverlay.NativeHost
         [DllImport("dwmapi.dll")]
         public static extern int DwmFlush();
         public const int WmMouseWheel = 0x020A;
+        public const int WmMouseActivate = 0x0021;
+        public const int MaNoActivate = 3;
         public const int WmLButtonUp = 0x0202;
         public const int WhMouseLl = 14;
         public const int WsExTransparent = 0x00000020;

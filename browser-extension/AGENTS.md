@@ -12,7 +12,10 @@
   and attaches the `X-RealtimeDictionary-Token` header. Web pages cannot reach the
   service themselves because the server only returns CORS headers for
   `chrome-extension://` origins.
-- A full-page scan happens only when the user presses `Ctrl+Alt+K`.
+- Browser scanning is a frozen compatibility experiment. A scan starts only from
+  the tray's explicit experimental scan command after experimental features are
+  enabled; the default `Ctrl+Alt+K` workflow is reserved for one clicked WeChat
+  or QQ message and must not silently trigger a browser-wide scan.
 - Automatic rescans on DOM mutations are opt-in (`chrome.storage.local.autoFollow`,
   toggled from the extension popup): they send only viewport text and keep at least
   8 seconds between calls. The popup page also discloses that scanned text is sent
@@ -36,7 +39,8 @@
 
 - Validate `manifest.json` as JSON and run `node --check` on every JS file.
 - Load the folder as an unpacked extension in Chrome/Edge (reload after updates).
-- Confirm `Ctrl+Alt+K` from the tray host triggers a scan on a normal HTML page.
+- Enable experimental features, invoke the explicit compatibility scan from the
+  tray, and confirm that it triggers one scan on a normal HTML page.
 - Confirm page scroll/resize repositions term rectangles and the popup without reloading the page.
 - With "auto follow" off (default), mutating the page must not cause any `/analyze` request.
 - With "auto follow" on, chat-style page updates must produce viewport-only `/analyze` calls no more often than once per 8 seconds.

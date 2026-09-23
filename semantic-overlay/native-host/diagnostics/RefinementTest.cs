@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.IO;
 using System.Reflection;
 using System.Runtime.Serialization;
 using System.Threading;
@@ -40,6 +41,7 @@ namespace SemanticOverlay.NativeHost
         }
         private static int Run()
         {
+            ServiceManager.DisableUsageMetricsForDiagnostics = true;
             NativeMethods.SetProcessDPIAware();
             Application.EnableVisualStyles();
             string unicodeText = "😀😀 Ctrl+Alt+G";
@@ -51,12 +53,69 @@ namespace SemanticOverlay.NativeHost
             Assert(unicodeText.Substring(spans[0].start, spans[0].end - spans[0].start) == "Ctrl+Alt+G",
                 "Converted range does not cover full shortcut");
             Console.WriteLine("unicode-shortcut-exact-span-ok");
+            DateTime armNow = DateTime.UtcNow;
+            Assert(OverlayContext.IsMessageClickArmed(armNow, armNow.AddSeconds(10)) &&
+                !OverlayContext.IsMessageClickArmed(armNow, armNow.AddMilliseconds(-1)) &&
+                !OverlayContext.IsMessageClickArmed(armNow, DateTime.MinValue),
+                "One-shot message click arming did not honor its deadline");
+            Console.WriteLine("message-click-one-shot-deadline-ok");
             Assert(OverlayContext.IsModelAnalysisMode("jev") &&
                 OverlayContext.IsModelAnalysisMode("llm") &&
                 OverlayContext.IsModelAnalysisMode("local_strong") &&
                 !OverlayContext.IsModelAnalysisMode("local_fallback"),
                 "Jev or fallback analysis mode was classified incorrectly");
             Console.WriteLine("jev-model-mode-classification-ok");
+            Assert(ServiceManager.IsCompatibleHealth(new ServiceHealth {
+                    ok = true,
+                    product_id = ServiceManager.ExpectedProductId,
+                    protocol_version = ServiceManager.SupportedProtocolVersion }) &&
+                !ServiceManager.IsCompatibleHealth(new ServiceHealth {
+                    ok = true,
+                    product_id = ServiceManager.ExpectedProductId,
+                    protocol_version = ServiceManager.SupportedProtocolVersion - 1 }) &&
+                !ServiceManager.IsCompatibleHealth(new ServiceHealth {
+                    ok = true,
+                    product_id = "another-local-service",
+                    protocol_version = ServiceManager.SupportedProtocolVersion }),
+                "Backend identity/protocol handshake accepted an incompatible service");
+            Console.WriteLine("backend-identity-protocol-handshake-ok");
+            Assert(OverlayContext.ClassifyChatProcessName("WeChat") == "wechat" &&
+                OverlayContext.ClassifyChatProcessName("Weixin") == "wechat" &&
+                OverlayContext.ClassifyChatProcessName("QQ") == "qq" &&
+                OverlayContext.ClassifyChatProcessName("QQNT") == "qq" &&
+                OverlayContext.ClassifyChatProcessName("chrome") == "other",
+                "WeChat and QQ process classification was not bounded to the supported apps");
+            Console.WriteLine("wechat-qq-metrics-classification-ok");
+            using (var image = new Bitmap(500, 240))
+            using (Graphics graphics = Graphics.FromImage(image))
+            using (Brush bubbleBrush = new SolidBrush(Color.FromArgb(190, 226, 248)))
+            using (Brush selectionBrush = new SolidBrush(Color.FromArgb(84, 174, 232)))
+            {
+                graphics.Clear(Color.FromArgb(244, 244, 244));
+                graphics.FillRectangle(bubbleBrush, new Rectangle(80, 60, 340, 100));
+                graphics.FillRectangle(selectionBrush, new Rectangle(105, 76, 255, 25));
+                graphics.FillRectangle(selectionBrush, new Rectangle(96, 108, 282, 25));
+                graphics.FillRectangle(Brushes.Black, new Rectangle(150, 86, 140, 8));
+                graphics.FillRectangle(Brushes.Black, new Rectangle(115, 118, 220, 8));
+                Rectangle bubble;
+                Assert(MessageBubbleDetector.FindInBitmap(image, new Point(175, 89), out bubble) &&
+                    bubble.Left <= 82 && bubble.Right >= 418 &&
+                    bubble.Top <= 62 && bubble.Bottom >= 158,
+                    "One-click fallback mistook selected-text color for the whole message bubble");
+            }
+            Assert(MessageTextReader.IsCandidate("完整消息文字", "ControlType.Text",
+                    new Rectangle(100, 100, 300, 80), new Rectangle(0, 0, 800, 600),
+                    new Point(150, 120), 1000) &&
+                !MessageTextReader.IsCandidate("输入框草稿", "ControlType.Edit",
+                    new Rectangle(100, 400, 500, 120), new Rectangle(0, 0, 800, 600),
+                    new Point(150, 420), 1000),
+                "One-click accessibility filter accepted an editor or rejected message text");
+            Console.WriteLine("one-click-message-accessibility-and-whole-bubble-fallback-ok");
+            Assert(OverlayContext.PopupBlocksScheduledScan("conversation", true) &&
+                OverlayContext.PopupBlocksScheduledScan("caption", true) &&
+                !OverlayContext.PopupBlocksScheduledScan("conversation", false),
+                "A definition popup did not block background OCR in every work mode");
+            Console.WriteLine("definition-popup-blocks-scheduled-scan-ok");
             var stableProgressive = new List<HighlightItem> { new HighlightItem {
                 term = "oneAPI", kind = "concept", context = "old", x = 10, y = 20, w = 60, h = 18 } };
             var stableReference = stableProgressive[0];
@@ -87,6 +146,32 @@ namespace SemanticOverlay.NativeHost
                     "OCR shortcut was not canonicalized: " + source);
             }
             Console.WriteLine("shortcut-hyphen-and-trailing-o-canonicalization-ok");
+            Assert(ManualLookupForm.PreferCopiedSelection("", "GitHub") == "GitHub" &&
+                ManualLookupForm.PreferCopiedSelection("“itHub0", "GitHub") == "GitHub" &&
+                ManualLookupForm.PreferCopiedSelection("realtime-dictionar", "realtime dictionary") ==
+                    "realtime dictionary" &&
+                ManualLookupForm.PreferCopiedSelection("model", "GitHub") == "model",
+                "Clipboard selection did not prefer only closely matching copied text");
+            Console.WriteLine("clipboard-selection-bounded-ocr-repair-ok");
+            string metricsPath = Path.Combine(Path.GetTempPath(),
+                "realtime-dictionary-metrics-" + Guid.NewGuid().ToString("N") + ".jsonl");
+            var metrics = new UsageMetricsStore(metricsPath);
+            metrics.RecordLookup("active_lookup", "wechat", "clipboard", "model",
+                321, false, false, true);
+            metrics.RecordSelection("qq", "ocr", "model", 456, true, true, 2);
+            metrics.RecordFeedback("active_lookup", "wechat", "useful");
+            metrics.RecordHighlights("qq", 9, "jev");
+            string metricsText = File.ReadAllText(metricsPath);
+            Assert(metricsText.Contains("\"text_source\":\"clipboard\"") &&
+                metricsText.Contains("\"source_app\":\"wechat\"") &&
+                metricsText.Contains("\"trigger_mode\":\"selection_passage\"") &&
+                metricsText.Contains("\"manual_correction\":true") &&
+                metricsText.Contains("\"feedback\":\"useful\"") &&
+                metricsText.Contains("\"count\":5") &&
+                !metricsText.Contains("GitHub") && !metricsText.Contains("explanation"),
+                "Privacy-safe metrics schema leaked content or failed to bound values");
+            File.Delete(metricsPath);
+            Console.WriteLine("content-free-local-usage-metrics-ok");
             using (var service = new ServiceManager())
             using (var lookupForm = new ManualLookupForm(service))
             {
@@ -101,6 +186,8 @@ namespace SemanticOverlay.NativeHost
                     "Repeated manual lookup did not reset and focus the editable fallback");
                 TextBox lookupBody = Get<TextBox>(lookupForm, "body");
                 Button lookupButton = Get<Button>(lookupForm, "lookup");
+                Button pasteButton = Get<Button>(lookupForm, "paste");
+                Assert(pasteButton.Text == "粘贴并解释", "Explicit clipboard lookup action is missing");
                 lookupQuery.Text = "Ctrl+Alt+D";
                 lookupButton.PerformClick();
                 Pump(() => lookupButton.Enabled);
@@ -108,6 +195,95 @@ namespace SemanticOverlay.NativeHost
                     "Manual lookup submit did not render the local shortcut explanation");
             }
             Console.WriteLine("manual-lookup-editable-fallback-reopen-and-submit-ok");
+            using (var assistantTarget = new Form { Text = "Assistant target", Size = new Size(720, 520) })
+            using (var assistant = new AssistantPanelForm())
+            {
+                assistantTarget.Show();
+                NativeMethods.SetForegroundWindow(assistantTarget.Handle);
+                Application.DoEvents();
+                HighlightItem clicked = null;
+                assistant.ItemClicked += delegate(HighlightItem item, Rectangle anchor) { clicked = item; };
+                assistant.SetItems(new[] {
+                    new HighlightItem { term = "Conv2D", context = "神经网络中的 Conv2D" },
+                    new HighlightItem { term = "Conv2D", context = "重复词" },
+                    new HighlightItem { term = "BatchNorm", context = "归一化" }
+                });
+                assistant.StartForTarget(new NativeRect { Left = 100, Top = 100, Right = 820, Bottom = 620 });
+                Call(assistant, "SetExpanded", true);
+                assistant.ShowInactive();
+                Application.DoEvents();
+                Assert(NativeMethods.GetForegroundWindow() != assistant.Handle,
+                    "Showing the floating assistant activated it over the chat target");
+                FlowLayoutPanel terms = Get<FlowLayoutPanel>(assistant, "termsPanel");
+                Assert(terms.Controls.Count == 2,
+                    "Floating assistant did not deduplicate the current term list");
+                Button firstTerm = terms.Controls[0] as Button;
+                Assert(firstTerm != null && firstTerm.Text == "Conv2D",
+                    "Floating assistant did not expose the recognized term");
+                typeof(Button).GetMethod("OnClick", BindingFlags.Instance | BindingFlags.NonPublic)
+                    .Invoke(firstTerm, new object[] { EventArgs.Empty });
+                Application.DoEvents();
+                Assert(clicked != null && clicked.term == "Conv2D",
+                    "Floating assistant term did not enter the explanation flow");
+                Assert(NativeMethods.GetForegroundWindow() != assistant.Handle,
+                    "Floating assistant term action stole foreground focus from the chat target");
+            }
+            Console.WriteLine("floating-assistant-nonactivating-term-panel-ok");
+            using (var definition = new DefinitionForm())
+            {
+                definition.ShowDefinition("term", "中文解释", new List<AnalysisEntity>(),
+                    new List<string>(), new Rectangle(20, 20, 40, 20), false, true);
+                Application.DoEvents();
+                LinkLabel feedbackLink = Get<LinkLabel>(definition, "feedbackLink");
+                Assert(feedbackLink.Visible && feedbackLink.Links.Count == 3 &&
+                    feedbackLink.Width >= 340,
+                    "Definition feedback actions were not shown for a completed explanation");
+            }
+            Console.WriteLine("definition-outcome-feedback-visible-ok");
+            using (var service = new ServiceManager())
+            using (var selection = new SelectionAnalysisForm(service))
+            {
+                selection.OpenText("OCR 识别的 bootcamp 段落", false, "ocr", "qq");
+                Application.DoEvents();
+                TextBox source = Get<TextBox>(selection, "source");
+                TextBox body = Get<TextBox>(selection, "body");
+                Button analyze = Get<Button>(selection, "analyze");
+                Label sourceNotice = Get<Label>(selection, "sourceNotice");
+                Label heading = Get<Label>(selection, "heading");
+                LinkLabel sentence = Get<LinkLabel>(selection, "sentence");
+                Assert(source.Text.Contains("bootcamp") && body.Text.Length == 0 &&
+                    analyze.Enabled && analyze.Text == "确认并解释" &&
+                    sourceNotice.Text.Contains("先校对") && source.Visible &&
+                    heading.Text == "这句话的意思",
+                    "OCR selection was sent before explicit confirmation or was not editable");
+                Set(selection, "passageText", "先使用 oneAPI 和 bootcamp，随后再次使用 oneAPI");
+                sentence.Text = "先使用 oneAPI 和 bootcamp，随后再次使用 oneAPI";
+                Call(selection, "RenderTerms", new List<SelectionTerm> {
+                    new SelectionTerm { text = "oneAPI", explanation = "统一编程体系。" },
+                    new SelectionTerm { text = "bootcamp", explanation = "集中训练。" },
+                    new SelectionTerm { text = "oneAPI", explanation = "重复项。" },
+                });
+                FlowLayoutPanel termControls = Get<FlowLayoutPanel>(selection, "terms");
+                Assert(sentence.Links.Count == 3 && termControls.Controls.Count == 3 &&
+                    body.Text.Length == 0,
+                    "Repeated clickable terms overlapped, duplicated buttons, or hid the whole-message explanation");
+                Call(selection, "ShowTerm", new SelectionTerm {
+                    text = "oneAPI", explanation = "统一编程体系。" });
+                Assert(Get<TextBox>(selection, "termBody").Text == "统一编程体系。" &&
+                    body.Text.Length == 0,
+                    "Term annotation replaced the whole-message explanation");
+            }
+            using (var service = new ServiceManager())
+            using (var oversized = new SelectionAnalysisForm(service))
+            {
+                oversized.OpenText(new string('a', 1001), false, "ocr", "qq");
+                Application.DoEvents();
+                Assert(Get<TextBox>(oversized, "source").Text.Length == 0 &&
+                    !Get<Button>(oversized, "analyze").Enabled &&
+                    Get<Label>(oversized, "sourceNotice").Text.Contains("1000"),
+                    "Oversized selection was silently truncated or left submittable");
+            }
+            Console.WriteLine("selected-passage-ocr-confirmation-and-size-boundary-ok");
             bool skipLiveAccessibility = String.Equals(
                 Environment.GetEnvironmentVariable("SKIP_LIVE_ACCESSIBILITY"), "1",
                 StringComparison.Ordinal);
@@ -143,6 +319,11 @@ namespace SemanticOverlay.NativeHost
                             new Point(bounds.Left + 30, bounds.Top + 50),
                             new Point(bounds.Left + 130, bounds.Top + 50), bounds);
                         Assert(!region.IsEmpty && bounds.Contains(region), "Selection OCR crop escaped the target");
+                        Rectangle multiLine = SelectionActionForm.DragRegion(
+                            new Point(bounds.Left + 80, bounds.Top + 45),
+                            new Point(bounds.Left + 84, bounds.Top + 180), bounds);
+                        Assert(!multiLine.IsEmpty && multiLine.Width >= 80 && bounds.Contains(multiLine),
+                            "Multi-line passage selection did not create a bounded editable OCR crop");
                         toolbar.Present(selectionTask.Result, new Point(bounds.Right - 50, bounds.Bottom - 50), region);
                         Application.DoEvents();
                         Assert(toolbar.Visible && NativeMethods.GetForegroundWindow() == focusBefore,
@@ -239,24 +420,30 @@ namespace SemanticOverlay.NativeHost
             ServiceManager.DisableFamiliarityPersistenceForDiagnostics = true;
             var ctx = (OverlayContext)FormatterServices.GetUninitializedObject(typeof(OverlayContext));
             using (var services = new ServiceManager())
-            using (var target = new Form { Text = "Refinement regression", Bounds = new Rectangle(240, 180, 650, 350) })
+            using (var target = new Form { Text = "Refinement regression", Bounds = new Rectangle(240, 180, 650, 350), TopMost = true })
             using (var dispatcher = new MessageForm())
             using (var status = new StatusForm())
             using (var definition = new DefinitionForm())
+            using (var assistantPanel = new AssistantPanelForm())
+            using (var assistantAnchor = new HighlightForm())
             using (var lyric = new CaptionLyricForm())
             using (var menu = new ToolStripMenuItem())
             {
                 target.Show();
+                Application.DoEvents();
                 IntPtr dispatchHandle = dispatcher.Handle;
                 NativeRect rect;
                 NativeMethods.GetWindowRect(target.Handle, out rect);
                 Set(ctx, "services", services); Set(ctx, "dispatcher", dispatcher);
                 Set(ctx, "statusWindow", status); Set(ctx, "definitionWindow", definition);
+                Set(ctx, "assistantPanel", assistantPanel);
+                Set(ctx, "assistantLookupAnchor", assistantAnchor);
                 Set(ctx, "captionLyricWindow", lyric);
                 Set(ctx, "trayStatusItem", menu); Set(ctx, "active", true);
                 Set(ctx, "targetWindow", target.Handle); Set(ctx, "targetRect", rect);
                 Set(ctx, "refreshLock", new object());
                 Set(ctx, "relativeHighlights", new List<HighlightItem>());
+                services.GetType().GetProperty("PresentationMode").SetValue(services, "attached", null);
                 var windows = new List<HighlightForm>(); Set(ctx, "windows", windows);
                 try
                 {
@@ -379,6 +566,7 @@ namespace SemanticOverlay.NativeHost
                     Assert(averageCaptureMs < 20.0,
                         "Sparse tracking capture is too slow for a 24ms cadence: " + averageCaptureMs);
                     int originalY = Get<List<HighlightItem>>(ctx, "relativeHighlights")[0].y;
+                    Set(ctx, "scrollUntilUtc", DateTime.UtcNow.AddMilliseconds(500));
                     drawingOffset = -53; target.Invalidate(); target.Update(); NativeMethods.DwmFlush();
                     Call(ctx, "QueueScrollProbe");
                     Pump(() => Get<int>(ctx, "scrollProbeRunning") == 0);

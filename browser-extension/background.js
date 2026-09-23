@@ -6,6 +6,8 @@
 
 const API = 'http://127.0.0.1:8877';
 const TOKEN_HEADER = 'X-RealtimeDictionary-Token';
+const EXPECTED_PRODUCT_ID = 'realtime-dictionary';
+const SUPPORTED_PROTOCOL_VERSION = 2;
 let serviceToken = null;
 
 async function ensureToken() {
@@ -13,6 +15,10 @@ async function ensureToken() {
   const response = await fetch(API + '/session');
   if (!response.ok) throw new Error('session HTTP ' + response.status);
   const data = await response.json();
+  if (!data || data.product_id !== EXPECTED_PRODUCT_ID ||
+      data.protocol_version !== SUPPORTED_PROTOCOL_VERSION) {
+    throw new Error('本地实时字典版本不兼容，请退出旧版本后启动当前版本');
+  }
   serviceToken = data && data.token ? data.token : null;
   if (!serviceToken) throw new Error('session response has no token');
   return serviceToken;

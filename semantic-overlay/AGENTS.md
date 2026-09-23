@@ -2,11 +2,43 @@
 
 ## Product Contract
 
+- The default workflow is one-shot message explanation: `Ctrl+Alt+K` arms one
+  target gesture for 10 seconds, and the next click on a WeChat or QQ message
+  reads the complete message and opens its passage explanation. The click is
+  observed but never intercepted, so the source application keeps its normal
+  click behavior. Ordinary clicks while unarmed do nothing.
+- Prefer the complete UI Automation text and bounds for the clicked message. If the
+  client does not expose them, locate the whole visual message bubble around the click
+  locally and OCR that bounded bubble. Never infer a wrapped message from only the two
+  endpoints of a text drag.
+- Accept 1-1000 message characters. Never silently truncate. Accessibility text may
+  be analyzed after the armed message click. Whole-bubble OCR starts the same
+  one-shot analysis, remains visible/editable in the panel, and a user edit invalidates
+  the pending result before a corrected retry.
+- Analyze only the clicked message. Do not include adjacent chat messages, window
+  titles, contacts, or other screen text in the request.
+- One passage-analysis request returns the passage explanation and zero to five useful
+  terms. A term must occur verbatim in the submitted passage; do not force a term count
+  and do not render invented or fragmentary terms.
+- Full-window OCR/highlighting is an explicit experimental compatibility feature. It
+  must not be the default tray action, hotkey action, or product promise.
 - The user experience is a background Windows utility, not a visible desktop app.
-- Primary surfaces are chat conversation content and live foreign-language
-  meeting captions. Browser document reading remains optional compatibility work;
-  do not optimize the product around academic-paper browsing.
-- The persisted work mode is either conversation (default) or live captions.
+- Conversation results support two presentation modes. The default floating-assistant
+  mode shows one non-activating draggable bubble attached to the target chat window;
+  expanding it lists the current terms and opens the existing definition flow. The
+  compatibility mode keeps the existing text-attached highlight rectangles. Switching
+  presentation mode must not rescan, call a model, or discard the current result.
+- The floating assistant must hide when the target window is minimized or leaves the
+  foreground, reappear without re-analysis when the target returns, and never become
+  the foreground window merely because the user clicks its bubble or term buttons.
+- The validated product target is Windows desktop chat in WeChat and QQ. Both
+  clients share one conversation workflow and acceptance standard; do not add
+  client-specific product behavior unless a real compatibility failure requires it.
+- Active selected-text lookup is the reliability baseline. Automatic highlighting
+  is an optional experiment that must prove it restores understanding faster without
+  excessive interruption. Meeting captions, schedules/reminders, and the browser
+  extension are frozen experimental capabilities, not first-run or release promises.
+- The persisted work mode is either conversation (default) or experimental live captions.
   Conversation mode remains event-driven and OCR-backed. Live-caption mode is
   explicit opt-in and transcribes captured meeting audio; it must never infer
   speech from screen OCR. `Ctrl+Alt+G` ends either mode.
@@ -30,9 +62,10 @@
 - Every active caption status must name the bound meeting window separately
   from the real audio source (`仅会议进程` or `全系统声音`);
   never imply that binding the overlay window isolates its audio.
-- Speech recognition is a distinct operation from DeepSeek text analysis.
+- Speech recognition is a distinct operation from text analysis.
   The current beta reuses an explicitly configured SiliconFlow endpoint/key for
-  both operations; a separate provider configuration UI is future work. Audio is sent
+  transcription and explanations. TypeSafe Jev has its own validated configuration
+  entry and is used only for structured highlight judgments. Audio is sent
   only during an explicitly active meeting session, never saved automatically,
   and never written to logs.
 - Starting the tray host or reading `/health` must never perform a billable
@@ -44,6 +77,15 @@
 - The bounded Jev desktop diagnostic must preflight `/health` and trigger no
   hotkeys unless the active service reports `analysis_provider=typesafe` and
   `analysis_mode=jev`; a missing or different provider aborts the diagnostic.
+- With a generative API key configured, full analysis reads the original sentence
+  context and discovers/selects concepts in one request, without local candidate
+  hints or a candidate-presence gate. Jev is compatibility-only when no generative
+  key exists; never serially call both providers. Health must report this routing.
+- Sentence discovery requests only verbatim concept strings; local code locates
+  spans. On SiliconFlow, default to the validated fast lookup-model preset for
+  analysis unless explicitly overridden. Generative background analysis has a
+  bounded 10-second default deadline (not a first-visible latency promise).
+  Existing local previews stay visible. Local action extraction remains available.
 - Model analysis uses a bounded in-memory exact-text cache, skips only a closed
   set of clearly mundane greetings/acknowledgements, coalesces duplicate work, and enforces a
   per-hour request ceiling. Reaching the ceiling must preserve local highlights
@@ -80,7 +122,13 @@
   boxes, never every word from the surrounding scan region. If a refinement is
   already running, retain only the newest committed line for the next throttled
   request; never resend the same committed generation.
-- `Ctrl+Alt+K` enables or refreshes highlights for the current foreground window.
+- In conversation mode, `Ctrl+Alt+K` arms exactly one message selection for 10
+  seconds. The next click or deliberate drag inside a foreground WeChat or QQ
+  window consumes that armed state; ordinary clicks while unarmed do nothing.
+  Expired or cancelled armed states must not start OCR or a model request. The
+  same shortcut may start captions only in the explicitly enabled caption
+  experiment. Full-window highlighting starts only from the explicit
+  experimental tray command.
 - `Ctrl+Alt+G` disables the current highlight session.
 - Moving a target window must move existing highlights without OCR.
 - Resizing, scrolling, or changing target content must trigger a debounced refresh.
@@ -182,6 +230,25 @@
   apply the same exact-span validation, mundane-term filter and overlap rules.
 - No implementation may create an opaque full-window overlay.
 - A highlighted term is clickable and opens one nearby, non-activating definition popup.
+- Definition lookup is progressive. The card must open immediately with a local
+  glossary/structural result or an honest context-first placeholder; it must not
+  remain a blank spinner while a provider request is pending. The local stage
+  never calls a model or public network. Deterministic app-shortcut results are
+  final. Every ordinary explicit lookup automatically starts the configured
+  online explanation request; bundled-glossary and structural text are preview
+  only, never a reason to require a second AI button click. A late response may
+  replace only the preview for the same lookup generation.
+- Short dictionary explanations use a dedicated fast non-thinking lookup model
+  when the configured provider is SiliconFlow; do not spend the flagship model's
+  latency on one- or two-sentence definitions. The model name must be visible in
+  health/status output and overridable without changing the speech or structured
+  highlight engines. Other providers continue to use their configured model.
+- Whole-message explanation uses its own fast non-thinking selection model when
+  the configured provider is SiliconFlow. It must be independently overridable
+  and reported by `/health`; changing it must not alter dictionary lookup,
+  sentence concept discovery, TypeSafe judgment, or speech. A successful model
+  response retains source-exact deterministic local terms that the model omitted,
+  capped by the same five-term limit.
 - Definition lookup carries a bounded local sentence context around the term.
   Cache keys include both normalized term and context so meanings from unrelated
   conversations cannot contaminate each other. Logs record the term only, never
@@ -272,7 +339,12 @@
 - The local service binds only to `127.0.0.1`, and the port is fixed at `8877`:
   the native host and the browser extension both hardcode it, so `config.json`
   must not offer a port option (the server ignores and warns about one).
-- The server generates a random token at startup. `/analyze`, `/lookup`, and
+- The native host accepts the analysis service only when `/health` and `/session`
+  identify `realtime-dictionary` with the exact supported protocol version. A stale
+  build or unrelated process on port 8877 must produce an explicit error instead of
+  being treated as a healthy backend. Health/status responses may expose provider
+  and model names but never tokens or credentials.
+- The server generates a random token at startup. `/selection/analyze`, `/analyze`, `/lookup`, and
   every `/browser/*` endpoint require the `X-RealtimeDictionary-Token` header.
 - The token is handed out only by `GET /session`. Requests with a non-loopback
   `Host` header are rejected (DNS-rebinding defense), and CORS responses echo
@@ -296,7 +368,7 @@
   OCR completes. They must never be retained in the project or installation tree.
 - Live-caption mode must disclose that foreground captions can be sent repeatedly
   while the mode is active. It never scans a background window.
-- The browser adapter scans only on an explicit `Ctrl+Alt+K` trigger by default.
+- The browser adapter scans only from the explicit experimental scan command by default.
   Automatic rescans require the user to enable "auto follow" in the extension
   popup, and then send only viewport text with at least 8 seconds between calls.
 
@@ -331,6 +403,25 @@ PowerShell implementation behind it.
 - Ctrl+Alt+D explicitly looks up selected text using Windows accessibility, with
   an editable text fallback when the application does not expose its selection.
   Never replace clipboard contents or intercept ordinary unhighlighted clicks.
+- Clipboard text may be read only after the user explicitly clicks `粘贴并解释`
+  in the direct-lookup window. The clicked-message flow never substitutes
+  clipboard text for an unreadable selection; it shows editable region OCR instead.
+  Never poll the clipboard, and never replace its contents.
+- The clicked-message panel is meaning-first: show the whole-message explanation
+  before the sentence and term controls. For `bubble_ocr` or bounded region OCR,
+  the same single model request may propose a corrected sentence, but the backend
+  accepts it only when a conservative punctuation-insensitive similarity check
+  proves it is a small OCR repair. It may restore at most a tiny, context-unique
+  Chinese omission when the same message makes the missing one-to-two-character
+  word unambiguous; it must preserve every readable source fragment and never
+  paraphrase. Accessibility-exact text is never rewritten.
+- Render accepted corrected text as the visible sentence and make each returned
+  exact sentence term clickable in place. A term annotation must not hide the
+  whole-message explanation. Keep raw OCR editable behind an explicit correction
+  control; editing invalidates every pending result and requires a new request.
+- A model-proposed canonical lookup term may replace the editable query only
+  after the local service verifies that it is a small OCR-like correction of
+  the submitted text. Unrelated model renaming must be discarded.
 - A user-enabled selection toolbar may appear after a deliberate text drag,
   independently of a highlight session. It is small, non-activating and dismisses
   on another click, scrolling, target changes or timeout. Reading a selection is
@@ -373,7 +464,7 @@ PowerShell implementation behind it.
 - Offline regression: `python -m unittest discover -s tests -v`
 - Compile: `pwsh -File native-host/build.ps1`
 - Python syntax: `D:\Dev\anaconda\python.exe -m py_compile ocr_service.py server.py`
-- Service test: POST sample text to `/analyze` and a term to `/lookup` with the token from `GET /session`; validate entity offsets and explanation output. Without the token both endpoints must return 403, and a request with a foreign `Host` header must return 403.
+- Service test: POST a passage to `/selection/analyze`, sample text to `/analyze`, and a term to `/lookup` with the token from `GET /session`; validate source-exact terms, entity offsets, and explanation output. Without the token all three endpoints must return 403, and a request with a foreign `Host` header must return 403.
 - Browser bridge test: POST `/browser/trigger` (with token), then verify an installed extension acknowledges the generation.
 - Runtime: confirm `Ctrl+Alt+K` and `Ctrl+Alt+G` register successfully.
 - Visual: verify no window larger than an individual term rectangle is created for highlighting.

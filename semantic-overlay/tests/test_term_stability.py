@@ -13,6 +13,9 @@ import server
 
 class TermStabilityTests(unittest.TestCase):
     def setUp(self):
+        self.typesafe_patch = mock.patch.object(server, "TYPESAFE_API_KEY", "")
+        self.typesafe_patch.start()
+        self.addCleanup(self.typesafe_patch.stop)
         server.ANALYZE_CACHE.clear()
         server.ANALYZE_INFLIGHT.clear()
         server.MODEL_ANALYSIS_CALLS.clear()
