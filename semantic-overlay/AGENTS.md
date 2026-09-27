@@ -468,9 +468,11 @@
   adaptive audio segmentation, and the process-loopback activation bridge.
 - `native-host/windows_ocr.ps1`: thin bridge to the built-in Windows OCR engine.
 - `native-host/diagnostics/`: standalone visual targets used to verify follow behavior.
-- `media/`: public-facing demo media. Capture only synthetic test windows and
-  application overlays, never private chats, desktop background, credentials,
-  or real meeting audio. Keep GIFs small and label experimental behavior honestly.
+- `media/`: public-facing demo media. Prefer synthetic test windows. A real
+  chat capture requires the user's explicit authorization; retain only the
+  selected message and application overlay, and mask contacts, adjacent chat,
+  desktop background, credentials, and unrelated content before publication.
+  Label screenshot composites and experimental behavior honestly. Keep GIFs small.
 - `ocr_service.py`: fallback OCR service started only when Windows OCR fails.
 - `server.py`: term analysis and lookup service.
 - `outlook_calendar.py`: delegated Microsoft calendar login/check/create; tokens
