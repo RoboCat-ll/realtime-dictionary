@@ -147,6 +147,14 @@ namespace SemanticOverlay.NativeHost
                     new Rectangle(100, 400, 500, 120), new Rectangle(0, 0, 800, 600),
                     new Point(150, 420), 1000),
                 "One-click accessibility filter accepted an editor or rejected message text");
+            var automationClient = Assembly.LoadFrom(Path.Combine(
+                System.Runtime.InteropServices.RuntimeEnvironment.GetRuntimeDirectory(),
+                "WPF", "UIAutomationClient.dll"));
+            Type automationElement = automationClient.GetType(
+                "System.Windows.Automation.AutomationElement");
+            Type automationPoint = MessageTextReader.ResolvePointType(automationElement);
+            Assert(automationPoint != null && automationPoint.FullName == "System.Windows.Point",
+                "One-click accessibility could not resolve the UI Automation point type");
             Console.WriteLine("one-click-message-accessibility-and-whole-bubble-fallback-ok");
             Assert(OverlayContext.PopupBlocksScheduledScan("conversation", true) &&
                 OverlayContext.PopupBlocksScheduledScan("caption", true) &&

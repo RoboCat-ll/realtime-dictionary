@@ -6905,7 +6905,7 @@ namespace SemanticOverlay.NativeHost
                 Type textPatternType = assembly.GetType("System.Windows.Automation.TextPattern");
                 Type valuePatternType = assembly.GetType("System.Windows.Automation.ValuePattern");
                 Type walkerType = assembly.GetType("System.Windows.Automation.TreeWalker");
-                Type pointType = Type.GetType("System.Windows.Point, WindowsBase");
+                Type pointType = ResolvePointType(elementType);
                 object automationPoint = Activator.CreateInstance(pointType,
                     new object[] { (double)point.X, (double)point.Y });
                 object element = elementType.GetMethod("FromPoint").Invoke(null,
@@ -6949,6 +6949,16 @@ namespace SemanticOverlay.NativeHost
                     Source = "message_accessibility", Exact = true };
             }
             catch { return null; }
+        }
+
+        internal static Type ResolvePointType(Type elementType)
+        {
+            // WindowsBase may live alongside UIAutomationClient rather than in the
+            // default assembly search path. Use the API's own parameter type.
+            var fromPoint = elementType == null ? null : elementType.GetMethod("FromPoint");
+            var parameters = fromPoint == null ? null : fromPoint.GetParameters();
+            return parameters != null && parameters.Length == 1
+                ? parameters[0].ParameterType : null;
         }
 
         private static string ReadPatternText(object element, Type elementType,
