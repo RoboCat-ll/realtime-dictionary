@@ -194,8 +194,13 @@ def clarify_calendar(payload):
     # Prefer user correction over the source phrase, retaining only explicit fields.
     def find(pattern):
         return re.search(pattern, supplement) or re.search(pattern, original)
-    year = find(r'(?<!\d)(\d{4})\s*年')
-    day = find(r'(?<!\d)(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]')
+    year = find(r'(?<!\d)(\d{4})\s*(?:年|[./-](?=\d{1,2}[./-]\d{1,2}))')
+    chinese_day = r'(?<!\d)(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]'
+    dotted_day = (r'(?<!\d)(\d{1,2})\s*[./-]\s*(\d{1,2})(?!\d)'
+                  r'(?=\s*(?:(?:凌晨|早上|上午|中午|下午|晚上)?\s*\d{1,2}\s*[:：点时]|[,，。]|$))')
+    day = next((match for value in (supplement, original)
+                for pattern in (chinese_day, dotted_day)
+                for match in [re.search(pattern, value)] if match), None)
     # A UTC offset is not a replacement meeting start time.
     clock_pattern = r'(凌晨|早上|上午|中午|下午|晚上)?\s*(\d{1,2})\s*[:：点时]\s*(\d{1,2})?(?:分)?'
     clock_sources = [re.sub(r'UTC\s*[+-]\d{2}:\d{2}', '', value, flags=re.IGNORECASE)

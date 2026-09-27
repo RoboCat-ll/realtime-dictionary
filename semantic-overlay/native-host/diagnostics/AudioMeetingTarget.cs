@@ -18,7 +18,7 @@ namespace SemanticOverlay.Diagnostics
         {
             speechPath=speech; screenshotPath=screenshot;
             Text="无原生字幕的会议测试窗口"; StartPosition=FormStartPosition.CenterScreen;
-            ClientSize=new Size(1100,700); BackColor=Color.FromArgb(29,32,38); TopMost=true;
+            ClientSize=new Size(850,500); BackColor=Color.FromArgb(29,32,38); TopMost=true;
             Label title=new Label { Text="Meeting in progress · captions unavailable", ForeColor=Color.White,
                 Font=new Font("Segoe UI",18,FontStyle.Bold), AutoSize=true, Location=new Point(40,35) };
             Label message=new Label { Text="这个窗口本身没有字幕。声音由电脑扬声器播放，实时字典应自行听取并生成透明字幕。",
@@ -31,7 +31,7 @@ namespace SemanticOverlay.Diagnostics
             Timer timer=new Timer { Interval=1000 };
             timer.Tick += delegate {
                 ticks++;
-                if(ticks==2) { TopMost=true; Activate(); BringToFront(); Native.SwitchToThisWindow(Handle,true); Native.SetForegroundWindow(Handle); }
+                if(ticks>=2 && ticks<=6) { TopMost=true; Activate(); BringToFront(); Native.SwitchToThisWindow(Handle,true); Native.SetForegroundWindow(Handle); }
                 if(ticks==5) { Activate(); BringToFront(); using(SoundPlayer player=new SoundPlayer(speechPath)) player.Play(); }
                 if(ticks==20) {
                     using(Bitmap image=new Bitmap(Width,Height)) using(Graphics graphics=Graphics.FromImage(image)) {
@@ -51,6 +51,7 @@ namespace SemanticOverlay.Diagnostics
         [DllImport("user32.dll",SetLastError=true)] static extern uint SendInput(uint count,Input[] inputs,int size);
         [DllImport("user32.dll")] internal static extern bool SetForegroundWindow(IntPtr window);
         [DllImport("user32.dll")] internal static extern void SwitchToThisWindow(IntPtr window,bool altTab);
+        [DllImport("user32.dll")] internal static extern bool SetProcessDPIAware();
         internal static void SendHotkey(ushort key) {
             ushort[] keys={0x11,0x12,key,key,0x12,0x11}; Input[] inputs=new Input[keys.Length];
             for(int i=0;i<inputs.Length;i++){inputs[i].type=1;inputs[i].data.keyboard.key=keys[i];inputs[i].data.keyboard.flags=i>=3?2u:0u;}
@@ -60,6 +61,7 @@ namespace SemanticOverlay.Diagnostics
     internal static class AudioMeetingTarget
     {
         [STAThread] static void Main(string[] args) {
+            Native.SetProcessDPIAware();
             Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new AudioMeetingTargetForm(args[0],args[1]));
         }

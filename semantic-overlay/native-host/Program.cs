@@ -60,11 +60,20 @@ namespace SemanticOverlay.NativeHost
         private readonly List<HighlightForm> windows = new List<HighlightForm>();
         private readonly List<HighlightItem> relativeHighlights = new List<HighlightItem>();
         private readonly StatusForm statusWindow;
+        private readonly CaptionStatusForm captionStatusWindow;
         private readonly DefinitionForm definitionWindow;
         private readonly AssistantPanelForm assistantPanel;
         private readonly HighlightForm assistantLookupAnchor = new HighlightForm();
         private readonly CaptionLyricForm captionLyricWindow;
+        private readonly System.Windows.Forms.Timer audioDisplayTimer;
+        private readonly System.Windows.Forms.Timer audioRetryTimer;
+        private readonly Queue<CaptionSpeechSegment> audioDisplayQueue = new Queue<CaptionSpeechSegment>();
+        private readonly List<CaptionSpeechSegment> audioDisplayLines = new List<CaptionSpeechSegment>();
         private readonly CaptionHistoryForm captionHistoryWindow;
+        private readonly CaptionHistoryArchive captionArchive = new CaptionHistoryArchive(
+            CaptionHistoryArchive.DefaultDirectory);
+        private readonly System.Windows.Forms.Timer historyOpenTimer;
+        private bool archiveFailureShown;
         private readonly LocalReminderManager reminders;
         private readonly ToolStripMenuItem reminderMenuItem;
         private readonly ServiceManager services;
@@ -142,13 +151,19 @@ namespace SemanticOverlay.NativeHost
         private SystemAudioCaptionCapture audioCapture;
         private int audioSessionGeneration;
         private bool audioTranscriptionRunning;
-        private readonly Queue<byte[]> queuedAudio = new Queue<byte[]>();
+        private readonly CaptionAudioBacklog queuedAudio = new CaptionAudioBacklog(AudioQueueLimit);
+        private readonly System.Windows.Forms.Timer audioHealthTimer;
+        private DateTime audioCaptureStartedUtc = DateTime.MinValue;
+        private DateTime audioLastTranscriptUtc = DateTime.MinValue;
+        private string audioTargetLabel = "会议窗口";
         private string lastAudioTranscript;
         private string lastAudioTranscriptIdentity;
         private bool audioFailureShown;
         private int audioTransientFailures;
+        private int audioDroppedChunks;
         private DateTime audioRetryNotBeforeUtc = DateTime.MinValue;
         private int audioTextGeneration;
+        private string captionStatusText = String.Empty;
 
         public OverlayContext()
         {
@@ -156,16 +171,34 @@ namespace SemanticOverlay.NativeHost
             refineWords = services.RefineWords;
             reminders = new LocalReminderManager();
             statusWindow = new StatusForm();
+            captionStatusWindow = new CaptionStatusForm();
             definitionWindow = new DefinitionForm();
             assistantPanel = new AssistantPanelForm();
             assistantPanel.ItemClicked += BeginAssistantItemAction;
             captionLyricWindow = new CaptionLyricForm();
+            captionLyricWindow.HistoryRequested += QueueShowCaptionHistory;
+            audioDisplayTimer = new System.Windows.Forms.Timer { Interval = 320 };
+            audioDisplayTimer.Tick += AdvanceAudioDisplay;
+            audioRetryTimer = new System.Windows.Forms.Timer { Interval = 500 };
+            audioRetryTimer.Tick += ResumeAudioAfterCooldown;
+            audioHealthTimer = new System.Windows.Forms.Timer { Interval = 1000 };
+            audioHealthTimer.Tick += RefreshAudioHealth;
             captionHistoryWindow = new CaptionHistoryForm();
+            captionHistoryWindow.ArchiveDateRequested = captionArchive.LoadDate;
+            captionHistoryWindow.VisibleChanged += delegate {
+                services.Log("Caption history visible=" + captionHistoryWindow.Visible);
+            };
+            historyOpenTimer = new System.Windows.Forms.Timer { Interval = 120 };
+            historyOpenTimer.Tick += delegate {
+                historyOpenTimer.Stop();
+                ShowCaptionHistory();
+            };
             captionHistoryWindow.Lookup = delegate(string term, string context)
             {
                 services.EnsureRunning();
                 return services.Lookup(term, context, false, null);
             };
+            captionHistoryWindow.Translate = services.TranslateCaption;
             captionHistoryWindow.ClearRequested += ClearCaptionHistory;
             captionHistoryWindow.Analyze = services.AnalyzeHistoricalCaption;
             captionHistoryWindow.EditTaskRequested += delegate(HighlightItem candidate)
@@ -210,6 +243,8 @@ namespace SemanticOverlay.NativeHost
                 "使用方法：按 Ctrl+Alt+K，再单击一条聊天消息");
             selectionGuide.Enabled = false;
             menu.Items.Add(selectionGuide);
+            menu.Items.Add("字幕记录（按日期回看）…", null,
+                delegate { QueueShowCaptionHistory(); });
             menu.Items.Add("主动查词（选中文字后 Ctrl+Alt+D）…", null,
                 delegate { OpenManualLookup(false); });
             ToolStripMenuItem selectionMenu = new ToolStripMenuItem("Ctrl+Alt+K 后单击消息（拖选兜底）") {
@@ -337,7 +372,16 @@ namespace SemanticOverlay.NativeHost
                 audioSourceMenu.DropDownItems.Add(item);
             }
             experimentalMenu.DropDownItems.Add(audioSourceMenu);
-            experimentalMenu.DropDownItems.Add("查看字幕记录…", null, delegate { ShowCaptionHistory(); });
+            ToolStripMenuItem captionPromptItem = new ToolStripMenuItem(
+                "启动字幕前询问是否发送语音") { Checked = services.CaptionPromptEnabled };
+            captionPromptItem.Click += delegate
+            {
+                services.SetCaptionPromptEnabled(!services.CaptionPromptEnabled);
+                captionPromptItem.Checked = services.CaptionPromptEnabled;
+            };
+            experimentalMenu.DropDownItems.Add(captionPromptItem);
+            experimentalMenu.DropDownItems.Add("查看字幕记录…", null,
+                delegate { QueueShowCaptionHistory(); });
             reminderMenuItem = new ToolStripMenuItem();
             reminderMenuItem.Click += delegate { reminders.ShowList(); };
             reminders.CountChanged += UpdateReminderMenu;
@@ -566,7 +610,17 @@ namespace SemanticOverlay.NativeHost
             if (id == HotkeyHighlight)
             {
                 if (services.WorkMode == "caption" && services.ExperimentalFeaturesEnabled)
-                    BeginSession();
+                {
+                    IntPtr foreground = NativeMethods.GetForegroundWindow();
+                    if (ShouldReuseCaptionSession(active, targetWindow, foreground))
+                    {
+                        captionStatusWindow.ShowState(
+                            String.IsNullOrEmpty(captionStatusText)
+                                ? "字幕：正在启动…" : captionStatusText, targetRect);
+                        services.Log("Caption hotkey reused active session for same target");
+                    }
+                    else BeginSession();
+                }
                 else
                     ArmMessageClick();
             }
@@ -577,6 +631,12 @@ namespace SemanticOverlay.NativeHost
                 services.Log("Ctrl+Alt+D received");
                 OpenManualLookup(true);
             }
+        }
+
+        internal static bool ShouldReuseCaptionSession(bool sessionActive,
+            IntPtr boundWindow, IntPtr foreground)
+        {
+            return sessionActive && boundWindow != IntPtr.Zero && boundWindow == foreground;
         }
 
         internal static bool IsMessageClickArmed(DateTime nowUtc, DateTime armedUntilUtc)
@@ -815,8 +875,8 @@ namespace SemanticOverlay.NativeHost
                 "会议语音字幕：\r\n" +
                 "1. 从托盘的“工作模式”切换为“会议语音字幕”。\r\n" +
                 "2. “会议音源”默认优先当前进程；遇到无声可切换全系统兼容模式。\r\n" +
-                "3. 切回会议窗口，按 Ctrl + Alt + K，并确认发送语音片段。\r\n" +
-                "4. 托盘状态会明确显示实际音源；麦克风默认不采集。\r\n\r\n" +
+                "3. 切回会议窗口，按 Ctrl + Alt + K；首次确认时可选以后不再询问。\r\n" +
+                "4. 窗口旁的小框显示启动、收音或转写状态；托盘显示实际音源。麦克风默认不采集。\r\n\r\n" +
                 "会议字幕仍使用原文词语高亮；解释打开时字幕刷新会暂停。\r\n" +
                 "右键高亮词可选择以后不再标注。\r\n" +
                 "蓝色时间可编辑为本地提醒；提醒保存在本机，到点弹窗，可延后10分钟。\r\n" +
@@ -864,11 +924,14 @@ namespace SemanticOverlay.NativeHost
             if (!TryGetUsableRect(foreground, out rect))
                 return;
 
-            if (services.WorkMode == "caption" && MessageBox.Show(
-                    "会议字幕会根据托盘中的“会议音源”设置捕获播放声音，并把本地检测到的语音片段发送到硅基流动生成字幕。\r\n\r\n" +
-                    "如果 Windows 或会议软件不支持隔离，会明确回退为全系统声音；不会读取屏幕文字，也不会采集麦克风或保存录音。是否开始？",
-                    "开始语音字幕", MessageBoxButtons.YesNo, MessageBoxIcon.Information) != DialogResult.Yes)
-                return;
+            if (services.WorkMode == "caption" && services.CaptionPromptEnabled)
+            {
+                using (var consent = new CaptionConsentForm())
+                {
+                    if (consent.ShowDialog() != DialogResult.OK) return;
+                    if (consent.RememberApproval) services.SetCaptionPromptEnabled(false);
+                }
+            }
 
             targetWindow = foreground;
             services.BeginAnalysisContext();
@@ -893,6 +956,9 @@ namespace SemanticOverlay.NativeHost
             pendingCaptionCommitted = false;
             pendingCaptionWords = null;
             captionLyricWindow.SetSourceTop(-1);
+            audioDisplayTimer.Stop();
+            audioDisplayQueue.Clear();
+            audioDisplayLines.Clear();
             HideHighlights();
             captionLyricWindow.Hide();
             HideDefinition();
@@ -902,6 +968,7 @@ namespace SemanticOverlay.NativeHost
                 : "状态：正在识别当前对话窗口";
             if (services.WorkMode == "caption")
             {
+                SetCaptionStatus("字幕：正在连接音源…");
                 StartAudioCaptionSession();
                 return;
             }
@@ -954,6 +1021,8 @@ namespace SemanticOverlay.NativeHost
             HideHighlights();
             captionLyricWindow.Hide();
             statusWindow.Hide();
+            captionStatusWindow.Hide();
+            captionStatusText = String.Empty;
             HideDefinition();
             services.Log("Highlight session disabled");
             trayStatusItem.Text = services.WorkMode == "caption"
@@ -969,10 +1038,13 @@ namespace SemanticOverlay.NativeHost
             int generation = ++audioSessionGeneration;
             audioFailureShown = false;
             audioTransientFailures = 0;
+            audioDroppedChunks = 0;
             audioRetryNotBeforeUtc = DateTime.MinValue;
             lastAudioTranscript = null;
             lastAudioTranscriptIdentity = null;
             queuedAudio.Clear();
+            audioCaptureStartedUtc = DateTime.MinValue;
+            audioLastTranscriptUtc = DateTime.MinValue;
             audioTranscriptionRunning = false;
             uint processId;
             NativeMethods.GetWindowThreadProcessId(targetWindow, out processId);
@@ -981,6 +1053,8 @@ namespace SemanticOverlay.NativeHost
                 ProcessLoopbackAudioClient.IsSupported &&
                 !IsKnownProcessLoopbackUnsupported(targetWindow);
             string targetLabel = GetTargetProcessLabel(targetWindow);
+            audioTargetLabel = targetLabel;
+            captionArchive.BeginSession(DateTime.Now, targetLabel);
             trayStatusItem.Text = "状态：正在初始化 " + targetLabel + " 的会议音源…";
             Task.Factory.StartNew(delegate
             {
@@ -1007,11 +1081,14 @@ namespace SemanticOverlay.NativeHost
                             return;
                         }
                         audioCapture = started;
+                        audioCaptureStartedUtc = DateTime.UtcNow;
+                        audioHealthTimer.Start();
                         if (task.Result.Item2)
                             ShowNotice("当前会议进程无法单独捕获，已回退为全系统声音。请关闭其他会发声的软件。",
                                 ToolTipIcon.Warning);
                         string sourceName = audioCapture.IsProcessIsolated ? "仅会议进程" : "全系统声音";
                         trayStatusItem.Text = "状态：字幕目标 " + targetLabel + " · 音源：" + sourceName;
+                        SetCaptionStatus("字幕：正在收音 · 等待发言");
                         services.Log("Audio caption capture started for target process " + targetLabel +
                             "; source=" + sourceName + "; microphone disabled");
                     }));
@@ -1067,36 +1144,37 @@ namespace SemanticOverlay.NativeHost
 
         private void QueueAudioTranscription(byte[] wav, int generation)
         {
+            DateTime capturedAt = DateTime.Now;
             try
             {
                 dispatcher.BeginInvoke(new Action(delegate
                 {
                     if (!active || generation != audioSessionGeneration || audioCapture == null) return;
+                    CaptionAudioChunk dropped = queuedAudio.Enqueue(wav, capturedAt);
+                    if (dropped != null)
+                    {
+                        RecordAudioGap(dropped.CapturedAt, "识别服务积压");
+                        services.Log("Audio transcription queue full; marked oldest pending chunk as gap");
+                    }
+                    if (audioTranscriptionRunning) return;
                     if (DateTime.UtcNow < audioRetryNotBeforeUtc)
-                    {
-                        services.Log("Discarded audio chunk during transient provider cooldown");
-                        return;
-                    }
-                    if (audioTranscriptionRunning)
-                    {
-                        if (queuedAudio.Count >= AudioQueueLimit)
-                        {
-                            queuedAudio.Dequeue();
-                            services.Log("Audio transcription queue full; dropped oldest pending chunk");
-                        }
-                        queuedAudio.Enqueue(wav);
-                        return;
-                    }
-                    BeginAudioTranscription(wav, generation);
+                        audioRetryTimer.Start();
+                    else BeginAudioTranscription(generation);
                 }));
             }
             catch { }
         }
 
-        private void BeginAudioTranscription(byte[] wav, int generation)
+        private void BeginAudioTranscription(int generation)
         {
+            audioRetryTimer.Stop();
+            CaptionAudioChunk chunk = queuedAudio.TakeNext();
+            if (chunk == null) return;
             audioTranscriptionRunning = true;
-            Task.Factory.StartNew(delegate { return services.TranscribeAudio(wav); })
+            SetCaptionStatus(audioDroppedChunks > 0
+                ? "字幕：正在转写 · 缺失" + audioDroppedChunks + "段"
+                : "字幕：正在转写语音…");
+            Task.Factory.StartNew(delegate { return services.TranscribeAudio(chunk.Wav); })
                 .ContinueWith(delegate(Task<AudioTranscriptionResponse> task)
                 {
                     try
@@ -1107,38 +1185,73 @@ namespace SemanticOverlay.NativeHost
                             audioTranscriptionRunning = false;
                             if (task.IsFaulted || task.Result == null || !task.Result.ok)
                             {
-                                string message = task.IsFaulted ? task.Exception.GetBaseException().Message :
+                                Exception failure = task.IsFaulted ? task.Exception.GetBaseException() : null;
+                                string message = failure != null ? failure.Message :
                                     (task.Result == null ? "语音识别没有返回结果" : task.Result.error);
-                                bool retryable = !task.IsFaulted && task.Result != null && task.Result.retryable;
+                                bool retryable = failure is TimeoutException ||
+                                    failure is System.Net.WebException || failure is IOException ||
+                                    (!task.IsFaulted && task.Result != null && task.Result.retryable);
                                 if (!retryable)
                                 {
+                                    RecordAudioGap(chunk.CapturedAt, "识别服务已停止");
                                     StopAudioAfterFailure(generation, message);
                                     return;
                                 }
                                 audioTransientFailures++;
-                                int delaySeconds = Math.Min(20, 4 * audioTransientFailures);
+                                bool retryingSameChunk = queuedAudio.HoldForRetry(chunk);
+                                if (!retryingSameChunk)
+                                    RecordAudioGap(chunk.CapturedAt, "重试后仍无法转录");
+                                int delaySeconds = Math.Min(12, 2 * audioTransientFailures);
                                 audioRetryNotBeforeUtc = DateTime.UtcNow.AddSeconds(delaySeconds);
-                                queuedAudio.Clear();
-                                trayStatusItem.Text = "状态：语音服务暂时不可用，" + delaySeconds + " 秒后继续";
-                                services.Log("Transient audio transcription failure; cooldown seconds=" + delaySeconds);
+                                audioRetryTimer.Start();
+                                trayStatusItem.Text = "状态：" + message + "，" +
+                                    delaySeconds + " 秒后" + (retryingSameChunk ? "重试本段" : "继续后续") +
+                                    "；待转录 " + queuedAudio.PendingCount + " 段";
+                                SetCaptionStatus(retryingSameChunk ? "字幕：重试这段声音…" :
+                                    "字幕：缺失" + audioDroppedChunks + "段");
+                                services.Log("Transient audio transcription failure; retry_same_chunk=" +
+                                    retryingSameChunk + "; cooldown seconds=" + delaySeconds);
                             }
                             else if (!String.IsNullOrWhiteSpace(task.Result.text))
                             {
                                 audioTransientFailures = 0;
                                 audioRetryNotBeforeUtc = DateTime.MinValue;
-                                ApplyAudioTranscript(task.Result.text.Trim(), generation);
+                                ApplyAudioTranscript(task.Result.text.Trim(), generation,
+                                    chunk.CapturedAt, task.Result.raw_text,
+                                    task.Result.term_corrections);
                             }
-                            byte[] next = queuedAudio.Count > 0 ? queuedAudio.Dequeue() : null;
-                            if (next != null && active && generation == audioSessionGeneration &&
+                            else if (task.Result != null && task.Result.ok)
+                            {
+                                audioTransientFailures = 0;
+                                audioRetryNotBeforeUtc = DateTime.MinValue;
+                                SetCaptionStatus("字幕：正在收音 · 等待发言");
+                            }
+                            if (queuedAudio.HasWork && active && generation == audioSessionGeneration &&
                                 DateTime.UtcNow >= audioRetryNotBeforeUtc)
-                                BeginAudioTranscription(next, generation);
+                                BeginAudioTranscription(generation);
                         }));
                     }
                     catch { }
                 });
         }
 
-        private void ApplyAudioTranscript(string text, int generation)
+        private void ResumeAudioAfterCooldown(object sender, EventArgs args)
+        {
+            if (!active || audioCapture == null || services.WorkMode != "caption")
+            {
+                audioRetryTimer.Stop();
+                return;
+            }
+            if (audioTranscriptionRunning || DateTime.UtcNow < audioRetryNotBeforeUtc) return;
+            audioRetryTimer.Stop();
+            if (queuedAudio.HasWork)
+                BeginAudioTranscription(audioSessionGeneration);
+            else
+                SetCaptionStatus("字幕：正在收音 · 等待发言");
+        }
+
+        private void ApplyAudioTranscript(string text, int generation, DateTime capturedAt,
+            string rawText, int termCorrections)
         {
             if (!active || generation != audioSessionGeneration) return;
             text = (text ?? String.Empty).Trim();
@@ -1153,19 +1266,68 @@ namespace SemanticOverlay.NativeHost
                 services.Log("Discarded duplicate audio transcript");
                 return;
             }
-            string previous = lastAudioTranscript ?? String.Empty;
             lastAudioTranscript = text;
             lastAudioTranscriptIdentity = identity;
             pendingCaptionText = text;
             pendingCaptionCommitted = true;
-            captionHistory.Add(new CaptionEntry { timestamp = DateTime.Now, text = text });
+            audioLastTranscriptUtc = DateTime.UtcNow;
+            rawText = (rawText ?? String.Empty).Trim();
+            if (rawText.Length > 500 || String.Equals(rawText, text, StringComparison.Ordinal))
+                rawText = String.Empty;
+            CaptionEntry entry = new CaptionEntry {
+                timestamp = capturedAt, text = text,
+                raw_text = rawText
+            };
+            SaveCaptionEntry(entry, false);
+            captionHistory.Add(entry);
+            captionHistory.Sort(delegate(CaptionEntry left, CaptionEntry right) {
+                return left.timestamp.CompareTo(right.timestamp);
+            });
             if (captionHistory.Count > CaptionHistoryLimit) captionHistory.RemoveAt(0);
-            captionHistoryWindow.SetEntries(captionHistory);
-            if (NativeMethods.GetForegroundWindow() == targetWindow)
-                captionLyricWindow.ShowLines(previous, text, targetRect);
-            trayStatusItem.Text = "状态：系统声音字幕已更新";
+            captionHistoryWindow.RefreshArchiveDate();
+            foreach (CaptionSpeechSegment segment in SplitCaptionSpeech(text))
+                audioDisplayQueue.Enqueue(segment);
+            if (!audioDisplayTimer.Enabled)
+                AdvanceAudioDisplay(null, EventArgs.Empty);
+            trayStatusItem.Text = "状态：" +
+                (audioCapture != null && audioCapture.IsProcessIsolated ? "会议进程" : "全系统声音") +
+                "字幕已更新";
+            SetCaptionStatus(termCorrections > 0 && rawText.Length > 0
+                ? "字幕：已更新 · 术语校正" + termCorrections + "处"
+                : audioDroppedChunks > 0
+                    ? "字幕：已更新，缺失" + audioDroppedChunks + "段"
+                    : "字幕：已更新 · 继续收音");
             services.Log("Accepted audio transcript with " + text.Length + " characters");
             StartAudioTextAnalysis(text, generation, ++audioTextGeneration);
+        }
+
+        private void RecordAudioGap(DateTime capturedAt, string reason)
+        {
+            audioDroppedChunks++;
+            CaptionEntry gap = new CaptionEntry {
+                timestamp = capturedAt,
+                text = "这段声音未能转录（" + reason + "）",
+                is_gap = true
+            };
+            SaveCaptionEntry(gap, false);
+            captionHistory.Add(gap);
+            captionHistory.Sort(delegate(CaptionEntry left, CaptionEntry right) {
+                return left.timestamp.CompareTo(right.timestamp);
+            });
+            if (captionHistory.Count > CaptionHistoryLimit) captionHistory.RemoveAt(0);
+            captionHistoryWindow.RefreshArchiveDate();
+            trayStatusItem.Text = "状态：字幕已有 " + audioDroppedChunks + " 处明确缺口";
+            SetCaptionStatus("字幕：缺失" + audioDroppedChunks + "段");
+        }
+
+        private void SaveCaptionEntry(CaptionEntry entry, bool replaceLast)
+        {
+            if (captionArchive.Append(entry, replaceLast)) return;
+            if (archiveFailureShown) return;
+            archiveFailureShown = true;
+            services.Log("Caption archive write failed; transcript remains in session memory");
+            ShowNotice("字幕仍在本次会话中，但保存到本地历史失败。请检查磁盘空间。",
+                ToolTipIcon.Warning);
         }
 
         internal static string NormalizeTranscriptIdentity(string text)
@@ -1175,6 +1337,63 @@ namespace SemanticOverlay.NativeHost
             foreach (char value in text)
                 if (Char.IsLetterOrDigit(value)) builder.Append(Char.ToUpperInvariant(value));
             return builder.ToString();
+        }
+
+        internal static List<CaptionSpeechSegment> SplitCaptionSpeech(string text)
+        {
+            var result = new List<CaptionSpeechSegment>();
+            if (String.IsNullOrWhiteSpace(text)) return result;
+            int start = 0;
+            for (int index = 0; index < text.Length; index++)
+            {
+                char value = text[index];
+                bool boundary = value == '。' || value == '！' || value == '？' ||
+                    ((value == '.' || value == '!' || value == '?') &&
+                     (index + 1 == text.Length || Char.IsWhiteSpace(text[index + 1])));
+                if (!boundary) continue;
+                AddCaptionSpeechSegment(result, text, start, index + 1);
+                start = index + 1;
+            }
+            AddCaptionSpeechSegment(result, text, start, text.Length);
+            return result;
+        }
+
+        private static void AddCaptionSpeechSegment(
+            List<CaptionSpeechSegment> result, string source, int start, int end)
+        {
+            while (start < end && Char.IsWhiteSpace(source[start])) start++;
+            while (end > start && Char.IsWhiteSpace(source[end - 1])) end--;
+            if (end > start)
+                result.Add(new CaptionSpeechSegment { Text = source.Substring(start, end - start), Offset = start });
+        }
+
+        private void AdvanceAudioDisplay(object sender, EventArgs args)
+        {
+            if (!active || services.WorkMode != "caption" || audioDisplayQueue.Count == 0)
+            {
+                audioDisplayTimer.Stop();
+                return;
+            }
+            CaptionSpeechSegment segment = audioDisplayQueue.Dequeue();
+            audioDisplayLines.Add(segment);
+            if (audioDisplayLines.Count > 2) audioDisplayLines.RemoveAt(0);
+            bool targetForeground = NativeMethods.GetForegroundWindow() == targetWindow;
+            if (targetForeground)
+                ShowAudioDisplay();
+            services.Log("Audio display: foreground_match=" + targetForeground +
+                " visible=" + captionLyricWindow.Visible +
+                " bounds=" + captionLyricWindow.Bounds);
+            if (audioDisplayQueue.Count > 0) audioDisplayTimer.Start();
+            else audioDisplayTimer.Stop();
+        }
+
+        private void ShowAudioDisplay()
+        {
+            if (audioDisplayLines.Count == 0) return;
+            CaptionSpeechSegment current = audioDisplayLines[audioDisplayLines.Count - 1];
+            string previous = audioDisplayLines.Count > 1
+                ? audioDisplayLines[audioDisplayLines.Count - 2].Text : String.Empty;
+            captionLyricWindow.ShowAudioLines(previous, current.Text, current.Offset, targetRect);
         }
 
         private void StartAudioTextAnalysis(string text, int sessionGeneration, int textGeneration)
@@ -1222,14 +1441,7 @@ namespace SemanticOverlay.NativeHost
 
         private void ReportAudioFailure(int generation, string message)
         {
-            if (generation != audioSessionGeneration) return;
-            trayStatusItem.Text = "状态：语音字幕异常";
-            services.Log("Audio caption failure: " + message);
-            if (!audioFailureShown)
-            {
-                audioFailureShown = true;
-                ShowNotice("语音字幕失败：" + message, ToolTipIcon.Error);
-            }
+            StopAudioAfterFailure(generation, message);
         }
 
         private void StopAudioAfterFailure(int generation, string message)
@@ -1240,6 +1452,11 @@ namespace SemanticOverlay.NativeHost
             captionLyricWindow.Hide();
             HideHighlights();
             trayStatusItem.Text = "状态：语音字幕已停止 — " + message;
+            captionStatusText = String.Empty;
+            if (NativeMethods.GetForegroundWindow() == targetWindow)
+                captionStatusWindow.ShowTemporary("字幕：已停止，请看托盘", targetRect, 5000);
+            else
+                captionStatusWindow.Hide();
             services.Log("Audio caption failure: " + message);
             if (!audioFailureShown)
             {
@@ -1251,6 +1468,11 @@ namespace SemanticOverlay.NativeHost
         private void StopAudioCaptionSession()
         {
             audioSessionGeneration++;
+            audioRetryTimer.Stop();
+            audioHealthTimer.Stop();
+            audioDisplayTimer.Stop();
+            audioDisplayQueue.Clear();
+            audioDisplayLines.Clear();
             queuedAudio.Clear();
             audioTranscriptionRunning = false;
             audioTextGeneration++;
@@ -1262,6 +1484,50 @@ namespace SemanticOverlay.NativeHost
             }
             lastAudioTranscript = null;
             lastAudioTranscriptIdentity = null;
+            audioCaptureStartedUtc = DateTime.MinValue;
+            audioLastTranscriptUtc = DateTime.MinValue;
+        }
+
+        private void SetCaptionStatus(string message)
+        {
+            if (String.Equals(captionStatusText, message, StringComparison.Ordinal)) return;
+            captionStatusText = message ?? String.Empty;
+            if (active && targetWindow != IntPtr.Zero &&
+                NativeMethods.GetForegroundWindow() == targetWindow)
+                captionStatusWindow.ShowState(captionStatusText, targetRect);
+        }
+
+        private void RefreshAudioHealth(object sender, EventArgs args)
+        {
+            if (!active || audioCapture == null || services.WorkMode != "caption")
+            {
+                audioHealthTimer.Stop();
+                return;
+            }
+            DateTime now = DateTime.UtcNow;
+            DateTime packet = audioCapture.LastPacketUtc;
+            DateTime voice = audioCapture.LastVoiceUtc;
+            string sourceName = audioCapture.IsProcessIsolated ? "仅会议进程" : "全系统声音";
+            bool noPackets = packet == DateTime.MinValue || (now - packet).TotalSeconds >= 10;
+            bool noVoice = voice == DateTime.MinValue || (now - voice).TotalSeconds >= 10;
+            int level = packet != DateTime.MinValue && (now - packet).TotalSeconds < 2
+                ? audioCapture.RecentLevelBars : 0;
+            string lastResult = audioLastTranscriptUtc == DateTime.MinValue ? "暂无" :
+                Math.Max(0, (int)(now - audioLastTranscriptUtc).TotalSeconds) + "秒前";
+            string activity = now < audioRetryNotBeforeUtc ? " · 等待重试" :
+                (audioTranscriptionRunning ? " · 正在转写" : String.Empty);
+            trayStatusItem.Text = "状态：目标 " + audioTargetLabel + " · 音源 " + sourceName +
+                " · 声级 " + level + "/4 · 最近字幕 " + lastResult +
+                activity + (audioDroppedChunks > 0 ? " · 缺失" + audioDroppedChunks + "段" : String.Empty);
+            if (audioTranscriptionRunning || now < audioRetryNotBeforeUtc) return;
+            if (audioCaptureStartedUtc != DateTime.MinValue &&
+                (now - audioCaptureStartedUtc).TotalSeconds >= 10 && noPackets)
+                SetCaptionStatus("字幕：音源无数据");
+            else if (audioCaptureStartedUtc != DateTime.MinValue &&
+                     (now - audioCaptureStartedUtc).TotalSeconds >= 10 && noVoice)
+                SetCaptionStatus("字幕：当前音源静音");
+            else if (!noVoice)
+                SetCaptionStatus("字幕：有声，等待出字");
         }
 
         private void StartBrowserAdapter(IntPtr capturedWindow)
@@ -1320,7 +1586,7 @@ namespace SemanticOverlay.NativeHost
         {
             if (!active || scanRunning || choosingScanRegion || targetWindow == IntPtr.Zero)
                 return;
-            if (services.WorkMode == "caption" && audioCapture != null)
+            if (services.WorkMode == "caption")
                 return;
 
             ScanTiming scanTiming = new ScanTiming();
@@ -1954,7 +2220,8 @@ namespace SemanticOverlay.NativeHost
                             pendingCaptionText, StringComparison.Ordinal))
                     {
                         captionHistory[captionHistory.Count - 1].text = text;
-                        captionHistoryWindow.SetEntries(captionHistory);
+                        SaveCaptionEntry(captionHistory[captionHistory.Count - 1], true);
+                        captionHistoryWindow.RefreshArchiveDate();
                     }
                 }
                 pendingCaptionText = text;
@@ -1985,13 +2252,15 @@ namespace SemanticOverlay.NativeHost
                     pendingCaptionText,
                     StringComparison.Ordinal))
             {
-                captionHistory.Add(new CaptionEntry {
+                CaptionEntry entry = new CaptionEntry {
                     timestamp = DateTime.Now,
                     text = pendingCaptionText
-                });
+                };
+                SaveCaptionEntry(entry, false);
+                captionHistory.Add(entry);
                 if (captionHistory.Count > CaptionHistoryLimit)
                     captionHistory.RemoveAt(0);
-                captionHistoryWindow.SetEntries(captionHistory);
+                captionHistoryWindow.RefreshArchiveDate();
             }
             pendingCaptionCommitted = true;
             captionLyricWindow.ShowLines(PreviousCaptionText(), pendingCaptionText, targetRect);
@@ -2196,6 +2465,7 @@ namespace SemanticOverlay.NativeHost
             {
                 HideHighlights();
                 captionLyricWindow.Hide();
+                captionStatusWindow.Hide();
                 return;
             }
 
@@ -2207,14 +2477,20 @@ namespace SemanticOverlay.NativeHost
                 HideHighlights();
                 captionLyricWindow.Hide();
                 statusWindow.Hide();
+                captionStatusWindow.Hide();
                 HideDefinition();
             }
             else
             {
-                if (services.WorkMode == "caption" &&
-                    !String.IsNullOrWhiteSpace(pendingCaptionText))
+                if (services.WorkMode == "caption" && audioCapture != null)
+                    ShowAudioDisplay();
+                else if (services.WorkMode == "caption" &&
+                         !String.IsNullOrWhiteSpace(pendingCaptionText))
                     captionLyricWindow.ShowLines(
                         PreviousCaptionText(), pendingCaptionText, targetRect);
+                if (services.WorkMode == "caption" && active &&
+                    !String.IsNullOrEmpty(captionStatusText) && !captionStatusWindow.Visible)
+                    captionStatusWindow.ShowState(captionStatusText, targetRect);
 
                 if (browserBridgeRunning)
                     statusWindow.ShowScanning(targetRect);
@@ -2254,14 +2530,6 @@ namespace SemanticOverlay.NativeHost
             if (foreground == targetWindow && services.WorkMode == "caption" &&
                 !definitionWindow.Visible)
                 TryStartCaptionRefinement();
-
-            if (foreground == targetWindow && services.WorkMode == "caption" &&
-                !browserBridgeRunning && !browserDomActive && !scanRunning &&
-                !definitionWindow.Visible && now >= nextCaptionProbeUtc)
-            {
-                nextCaptionProbeUtc = now.AddMilliseconds(CaptionProbeInterval);
-                ScheduleRefresh(0);
-            }
 
             DateTime due;
             lock (refreshLock)
@@ -2322,6 +2590,7 @@ namespace SemanticOverlay.NativeHost
                 if (services.WorkMode == "caption" && captionLyricWindow.Visible)
                     captionLyricWindow.PositionFor(targetRect);
                 statusWindow.PositionFor(targetRect);
+                captionStatusWindow.PositionFor(targetRect);
                 if (UseAssistantPresentation())
                     assistantPanel.PositionFor(targetRect);
                 if (selectedHighlight != null && definitionWindow.Visible)
@@ -3206,7 +3475,7 @@ namespace SemanticOverlay.NativeHost
         {
             if (selectionAnalysis != null && !selectionAnalysis.IsDisposed)
                 selectionAnalysis.Close();
-            selectionAnalysis = new SelectionAnalysisForm(services);
+            selectionAnalysis = new SelectionAnalysisForm(services, OpenReminderEditor);
             Rectangle area = Screen.FromPoint(anchor).WorkingArea;
             selectionAnalysis.StartPosition = FormStartPosition.Manual;
             selectionAnalysis.Location = new Point(
@@ -3354,12 +3623,25 @@ namespace SemanticOverlay.NativeHost
             tray.ShowBalloonTip(2500);
         }
 
+        private void QueueShowCaptionHistory()
+        {
+            historyOpenTimer.Stop();
+            historyOpenTimer.Start();
+        }
+
         private void ShowCaptionHistory()
         {
-            captionHistoryWindow.SetEntries(captionHistory);
-            if (!captionHistoryWindow.Visible)
-                captionHistoryWindow.Show();
-            captionHistoryWindow.Activate();
+            try
+            {
+                captionHistoryWindow.PresentArchive();
+                services.Log("Opened caption history; visible=" + captionHistoryWindow.Visible +
+                    "; native_visible=" + NativeMethods.IsWindowVisible(captionHistoryWindow.Handle));
+            }
+            catch (Exception error)
+            {
+                services.Log("Failed to open caption history: " + error.GetType().Name);
+                ShowNotice("字幕记录窗口打开失败，请重新启动后再试。", ToolTipIcon.Error);
+            }
         }
 
         private void UpdateReminderMenu()
@@ -3370,7 +3652,7 @@ namespace SemanticOverlay.NativeHost
         private void ClearCaptionHistory()
         {
             captionHistory.Clear();
-            captionHistoryWindow.SetEntries(captionHistory);
+            captionHistoryWindow.RefreshArchiveDate();
             if (active && services.WorkMode == "caption" &&
                 !String.IsNullOrWhiteSpace(pendingCaptionText))
                 captionLyricWindow.ShowLines(String.Empty, pendingCaptionText, targetRect);
@@ -3391,13 +3673,18 @@ namespace SemanticOverlay.NativeHost
             if (manualLookup != null) manualLookup.Dispose();
             selectionGeneration++;
             selectionAction.Dispose();
+            historyOpenTimer.Dispose();
             tray.Visible = false;
             tray.Dispose();
             foreach (HighlightForm window in windows)
                 window.Dispose();
             statusWindow.Dispose();
+            captionStatusWindow.Dispose();
             definitionWindow.Dispose();
             captionLyricWindow.Dispose();
+            audioDisplayTimer.Dispose();
+            audioRetryTimer.Dispose();
+            audioHealthTimer.Dispose();
             captionHistoryWindow.Dispose();
             reminders.Dispose();
             services.Dispose();
@@ -3406,10 +3693,189 @@ namespace SemanticOverlay.NativeHost
         }
     }
 
+    internal sealed class CaptionAudioChunk
+    {
+        public byte[] Wav { get; set; }
+        public DateTime CapturedAt { get; set; }
+        public int Attempts { get; set; }
+    }
+
+    internal sealed class CaptionAudioBacklog
+    {
+        private readonly Queue<CaptionAudioChunk> pending = new Queue<CaptionAudioChunk>();
+        private readonly int pendingLimit;
+        private CaptionAudioChunk retry;
+
+        public CaptionAudioBacklog(int pendingLimit)
+        {
+            if (pendingLimit < 1) throw new ArgumentOutOfRangeException("pendingLimit");
+            this.pendingLimit = pendingLimit;
+        }
+
+        public int PendingCount { get { return pending.Count; } }
+        public bool HasWork { get { return retry != null || pending.Count > 0; } }
+
+        public CaptionAudioChunk Enqueue(byte[] wav, DateTime capturedAt)
+        {
+            CaptionAudioChunk dropped = pending.Count >= pendingLimit ? pending.Dequeue() : null;
+            pending.Enqueue(new CaptionAudioChunk { Wav = wav, CapturedAt = capturedAt });
+            return dropped;
+        }
+
+        public CaptionAudioChunk TakeNext()
+        {
+            CaptionAudioChunk next = retry;
+            retry = null;
+            if (next == null && pending.Count > 0) next = pending.Dequeue();
+            if (next != null) next.Attempts++;
+            return next;
+        }
+
+        public bool HoldForRetry(CaptionAudioChunk failed)
+        {
+            if (failed == null || failed.Attempts >= 2 || retry != null) return false;
+            retry = failed;
+            return true;
+        }
+
+        public void Clear()
+        {
+            pending.Clear();
+            retry = null;
+        }
+    }
+
     internal sealed class CaptionEntry
     {
         public DateTime timestamp { get; set; }
         public string text { get; set; }
+        public string raw_text { get; set; }
+        public bool is_gap { get; set; }
+        public string session_key { get; set; }
+        public string session_label { get; set; }
+    }
+
+    internal sealed class CaptionHistoryArchive
+    {
+        private const int MaxDailyEntries = 20000;
+        private readonly string root;
+        private readonly JavaScriptSerializer serializer = new JavaScriptSerializer();
+        private string currentFile;
+        private DateTime currentStart;
+        private string currentLabel;
+
+        public CaptionHistoryArchive(string directory)
+        {
+            root = directory;
+        }
+
+        public static string DefaultDirectory
+        {
+            get { return Path.Combine(Environment.GetFolderPath(
+                Environment.SpecialFolder.ApplicationData), "RealtimeDictionary", "caption-history"); }
+        }
+
+        public void BeginSession(DateTime startedAt, string sourceLabel)
+        {
+            currentStart = startedAt;
+            currentLabel = String.IsNullOrWhiteSpace(sourceLabel) ? "会议字幕" : sourceLabel.Trim();
+            string name = startedAt.ToString("yyyyMMdd-HHmmss-fffffff") + "-" +
+                Guid.NewGuid().ToString("N") + ".jsonl";
+            currentFile = Path.Combine(root, startedAt.ToString("yyyy-MM-dd"), name);
+        }
+
+        public bool Append(CaptionEntry entry, bool replaceLast = false)
+        {
+            if (entry == null || String.IsNullOrWhiteSpace(entry.text)) return false;
+            if (currentFile == null) BeginSession(entry.timestamp, "会议字幕");
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(currentFile));
+                var record = new Dictionary<string, object> {
+                    { "kind", entry.is_gap ? "gap" : (replaceLast ? "replace_last" : "line") },
+                    { "timestamp", entry.timestamp.ToString("o") },
+                    { "text", entry.text },
+                    { "session_started", currentStart.ToString("o") },
+                    { "source", currentLabel }
+                };
+                if (!entry.is_gap && !String.IsNullOrWhiteSpace(entry.raw_text) &&
+                    !String.Equals(entry.raw_text, entry.text, StringComparison.Ordinal))
+                    record["raw_text"] = entry.raw_text;
+                File.AppendAllText(currentFile, serializer.Serialize(record) + Environment.NewLine,
+                    new UTF8Encoding(false));
+                entry.session_key = Path.GetFileNameWithoutExtension(currentFile);
+                entry.session_label = currentStart.ToString("HH:mm") + " · " + currentLabel;
+                return true;
+            }
+            catch { return false; }
+        }
+
+        public List<CaptionEntry> LoadDate(DateTime date)
+        {
+            var result = new List<CaptionEntry>();
+            string directory = Path.Combine(root, date.ToString("yyyy-MM-dd"));
+            if (!Directory.Exists(directory)) return result;
+            string[] files;
+            try { files = Directory.GetFiles(directory, "*.jsonl"); }
+            catch { return result; }
+            Array.Sort(files, StringComparer.Ordinal);
+            foreach (string file in files)
+            {
+                var session = new List<CaptionEntry>();
+                try
+                {
+                    if (new FileInfo(file).Length > 20 * 1024 * 1024) continue;
+                    foreach (string line in File.ReadLines(file, Encoding.UTF8))
+                    {
+                        if (line.Length == 0 || line.Length > 10000) continue;
+                        try
+                        {
+                            var record = serializer.Deserialize<Dictionary<string, object>>(line);
+                            if (record == null || !record.ContainsKey("kind") ||
+                                !record.ContainsKey("timestamp") || !record.ContainsKey("text")) continue;
+                            string text = record["text"] as string;
+                            DateTime stamp;
+                            if (String.IsNullOrWhiteSpace(text) || text.Length > 2000 ||
+                                !DateTime.TryParse(record["timestamp"] as string, out stamp)) continue;
+                            string started = record.ContainsKey("session_started")
+                                ? record["session_started"] as string : null;
+                            DateTime start;
+                            if (!DateTime.TryParse(started, out start)) start = stamp;
+                            string source = record.ContainsKey("source")
+                                ? record["source"] as string : null;
+                            string kind = record["kind"] as string;
+                            if (kind != "line" && kind != "replace_last" && kind != "gap") continue;
+                            string rawText = record.ContainsKey("raw_text")
+                                ? record["raw_text"] as string : null;
+                            if (rawText != null && rawText.Length > 2000) rawText = null;
+                            var entry = new CaptionEntry { timestamp = stamp, text = text,
+                                is_gap = kind == "gap",
+                                raw_text = kind == "gap" ? null : rawText,
+                                session_key = Path.GetFileNameWithoutExtension(file),
+                                session_label = start.ToString("HH:mm") + " · " +
+                                    (String.IsNullOrWhiteSpace(source) ? "会议字幕" : source) };
+                            if (kind == "replace_last" && session.Count > 0 &&
+                                !session[session.Count - 1].is_gap)
+                                session[session.Count - 1] = entry;
+                            else
+                                session.Add(entry);
+                        }
+                        catch { /* Skip one damaged line and keep later captions. */ }
+                    }
+                }
+                catch { /* One unreadable session must not hide other days or sessions. */ }
+                result.AddRange(session.OrderBy(entry => entry.timestamp));
+                if (result.Count > MaxDailyEntries)
+                    result.RemoveRange(0, result.Count - MaxDailyEntries);
+            }
+            return result;
+        }
+    }
+
+    internal sealed class CaptionSpeechSegment
+    {
+        public string Text { get; set; }
+        public int Offset { get; set; }
     }
 
     internal sealed class CaptionOcrLine
@@ -3496,14 +3962,37 @@ namespace SemanticOverlay.NativeHost
     internal sealed class CaptionLyricForm : Form
     {
         private static readonly Color Chroma = Color.Black;
+        private const int MinAudioWidth = 340;
+        private const int MinAudioHeight = 135;
+        private readonly string layoutPath;
         private string previousLine = String.Empty;
         private string currentLine = String.Empty;
         private int sourceTop = -1;
+        private bool audioBox;
+        private int currentSourceOffset;
+        private int audioWidth = 720;
+        private int audioHeight = 170;
+        private double audioX = 1;
+        private double audioY = 1;
+        private bool userLayout;
+        private NativeRect audioTarget;
+        private bool draggingAudio;
+        private bool resizingAudio;
+        private bool audioMoved;
+        private Point mouseStart;
+        private Rectangle boundsStart;
+
+        public event Action HistoryRequested;
 
         public void SetSourceTop(int relativeTop) { sourceTop = relativeTop; }
 
-        public CaptionLyricForm()
+        public CaptionLyricForm() : this(Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "RealtimeDictionary", "caption-layout.json")) { }
+
+        internal CaptionLyricForm(string savedLayoutPath)
         {
+            layoutPath = savedLayoutPath;
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.Manual;
@@ -3512,6 +4001,7 @@ namespace SemanticOverlay.NativeHost
             TransparencyKey = Chroma;
             DoubleBuffered = true;
             AutoScaleMode = AutoScaleMode.None;
+            LoadAudioLayout();
         }
 
         protected override bool ShowWithoutActivation
@@ -3524,14 +4014,34 @@ namespace SemanticOverlay.NativeHost
             get
             {
                 CreateParams parameters = base.CreateParams;
-                parameters.ExStyle |= NativeMethods.WsExTransparent |
-                                      NativeMethods.WsExToolWindow |
+                parameters.ExStyle |= NativeMethods.WsExToolWindow |
                                       NativeMethods.WsExNoActivate;
+                if (!audioBox) parameters.ExStyle |= NativeMethods.WsExTransparent;
                 return parameters;
             }
         }
 
         public void ShowLines(string previous, string current, NativeRect target)
+        {
+            bool changedMode = audioBox;
+            audioBox = false;
+            if (changedMode && IsHandleCreated) RecreateHandle();
+            currentSourceOffset = 0;
+            UpdateLines(previous, current, target);
+        }
+
+        public void ShowAudioLines(string previous, string current, int sourceOffset, NativeRect target)
+        {
+            if (!audioBox)
+            {
+                audioBox = true;
+                if (IsHandleCreated) RecreateHandle();
+            }
+            currentSourceOffset = sourceOffset;
+            UpdateLines(previous, current, target);
+        }
+
+        private void UpdateLines(string previous, string current, NativeRect target)
         {
             string normalizedPrevious = (previous ?? String.Empty).Trim();
             string normalizedCurrent = (current ?? String.Empty).Trim();
@@ -3554,6 +4064,34 @@ namespace SemanticOverlay.NativeHost
 
         public void PositionFor(NativeRect target)
         {
+            if (audioBox)
+            {
+                Rectangle targetBounds = new Rectangle(target.Left, target.Top,
+                    Math.Max(1, target.Width), Math.Max(1, target.Height));
+                Rectangle monitor = Screen.FromRectangle(targetBounds).WorkingArea;
+                Rectangle visible = Rectangle.Intersect(targetBounds, monitor);
+                if (visible.Width < MinAudioWidth + 24 ||
+                    visible.Height < MinAudioHeight + 72)
+                    visible = monitor;
+                audioTarget = new NativeRect { Left = visible.Left, Top = visible.Top,
+                    Right = visible.Right, Bottom = visible.Bottom };
+                int maxWidth = Math.Max(180, visible.Width - 24);
+                int maxHeight = Math.Max(110, visible.Height - 72);
+                int defaultWidth = Math.Min(720, Math.Max(MinAudioWidth, visible.Width * 52 / 100));
+                int cardWidth = Math.Min(maxWidth, userLayout ? audioWidth : defaultWidth);
+                int cardHeight = Math.Min(maxHeight, userLayout ? audioHeight : 170);
+                int availableX = Math.Max(0, visible.Width - cardWidth - 16);
+                int availableY = Math.Max(0, visible.Height - cardHeight - 56);
+                int cardX = userLayout ? visible.Left + 8 + (int)Math.Round(audioX * availableX)
+                    : visible.Right - cardWidth - 20;
+                int cardY = userLayout ? visible.Top + 48 + (int)Math.Round(audioY * availableY)
+                    : visible.Bottom - cardHeight - 105;
+                Bounds = new Rectangle(
+                    Math.Max(visible.Left + 8, Math.Min(cardX, visible.Right - cardWidth - 8)),
+                    Math.Max(visible.Top + 48, Math.Min(cardY, visible.Bottom - cardHeight - 8)),
+                    cardWidth, cardHeight);
+                return;
+            }
             int width = Math.Max(420, Math.Min(1100, target.Width * 82 / 100));
             int height = 112;
             int x = target.Left + (target.Width - width) / 2;
@@ -3567,17 +4105,150 @@ namespace SemanticOverlay.NativeHost
             Bounds = new Rectangle(x, y, width, height);
         }
 
+        private static double ClampFraction(double value)
+        {
+            return Double.IsNaN(value) || Double.IsInfinity(value) ? 0 :
+                Math.Max(0, Math.Min(1, value));
+        }
+
+        private void LoadAudioLayout()
+        {
+            if (String.IsNullOrEmpty(layoutPath) || !File.Exists(layoutPath)) return;
+            try
+            {
+                var values = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(
+                    File.ReadAllText(layoutPath, Encoding.UTF8));
+                if (values == null || !values.ContainsKey("width") || !values.ContainsKey("height") ||
+                    !values.ContainsKey("x") || !values.ContainsKey("y")) return;
+                int width = Convert.ToInt32(values["width"]);
+                int height = Convert.ToInt32(values["height"]);
+                double x = Convert.ToDouble(values["x"]);
+                double y = Convert.ToDouble(values["y"]);
+                if (width < MinAudioWidth || width > 1200 || height < MinAudioHeight || height > 420)
+                    return;
+                audioWidth = width;
+                audioHeight = height;
+                audioX = ClampFraction(x);
+                audioY = ClampFraction(y);
+                userLayout = true;
+            }
+            catch { /* Corrupt layout never prevents captions; default remains usable. */ }
+        }
+
+        private void SaveAudioLayout()
+        {
+            if (String.IsNullOrEmpty(layoutPath)) return;
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(layoutPath));
+                var values = new Dictionary<string, object> {
+                    { "version", 1 }, { "width", audioWidth }, { "height", audioHeight },
+                    { "x", audioX }, { "y", audioY }
+                };
+                File.WriteAllText(layoutPath, new JavaScriptSerializer().Serialize(values),
+                    new UTF8Encoding(false));
+            }
+            catch { /* Keep the current in-memory placement if disk is unavailable. */ }
+        }
+
+        private void SetAudioBounds(Rectangle desired)
+        {
+            int width = Math.Max(Math.Min(MinAudioWidth, audioTarget.Width - 24),
+                Math.Min(desired.Width, Math.Max(180, audioTarget.Width - 24)));
+            int height = Math.Max(Math.Min(MinAudioHeight, audioTarget.Height - 72),
+                Math.Min(desired.Height, Math.Max(110, audioTarget.Height - 72)));
+            int leftMin = audioTarget.Left + 8;
+            int topMin = audioTarget.Top + 48;
+            int leftMax = Math.Max(leftMin, audioTarget.Right - width - 8);
+            int topMax = Math.Max(topMin, audioTarget.Bottom - height - 8);
+            int left = Math.Max(leftMin, Math.Min(desired.Left, leftMax));
+            int top = Math.Max(topMin, Math.Min(desired.Top, topMax));
+            Bounds = new Rectangle(left, top, width, height);
+            audioWidth = width;
+            audioHeight = height;
+            audioX = leftMax == leftMin ? 0 : ClampFraction((double)(left - leftMin) / (leftMax - leftMin));
+            audioY = topMax == topMin ? 0 : ClampFraction((double)(top - topMin) / (topMax - topMin));
+            userLayout = true;
+            Invalidate();
+        }
+
+        protected override void OnMouseDown(MouseEventArgs args)
+        {
+            base.OnMouseDown(args);
+            if (!audioBox || args.Button != MouseButtons.Left) return;
+            if (args.Y < 30 && args.X >= Width - 92)
+            {
+                if (HistoryRequested != null) HistoryRequested();
+                return;
+            }
+            resizingAudio = args.X >= Width - 28 && args.Y >= Height - 28;
+            draggingAudio = !resizingAudio && args.Y < 32;
+            if (!draggingAudio && !resizingAudio) return;
+            audioMoved = false;
+            mouseStart = Cursor.Position;
+            boundsStart = Bounds;
+            Capture = true;
+        }
+
+        protected override void OnMouseMove(MouseEventArgs args)
+        {
+            base.OnMouseMove(args);
+            if (!audioBox) return;
+            if (!draggingAudio && !resizingAudio)
+            {
+                Cursor = args.X >= Width - 28 && args.Y >= Height - 28
+                    ? Cursors.SizeNWSE : args.Y < 32 && args.X < Width - 92
+                    ? Cursors.SizeAll : Cursors.Default;
+                return;
+            }
+            Point cursor = Cursor.Position;
+            int dx = cursor.X - mouseStart.X;
+            int dy = cursor.Y - mouseStart.Y;
+            if (Math.Abs(dx) < 2 && Math.Abs(dy) < 2) return;
+            Rectangle desired = resizingAudio
+                ? new Rectangle(boundsStart.Left, boundsStart.Top,
+                    boundsStart.Width + dx, boundsStart.Height + dy)
+                : new Rectangle(boundsStart.Left + dx, boundsStart.Top + dy,
+                    boundsStart.Width, boundsStart.Height);
+            SetAudioBounds(desired);
+            audioMoved = true;
+        }
+
+        protected override void OnMouseUp(MouseEventArgs args)
+        {
+            base.OnMouseUp(args);
+            if (!draggingAudio && !resizingAudio) return;
+            draggingAudio = resizingAudio = false;
+            Capture = false;
+            if (audioMoved) SaveAudioLayout();
+        }
+
+        private Rectangle AudioCurrentBounds()
+        {
+            int top = String.IsNullOrEmpty(previousLine) ? 38 : 38 + (Height - 46) / 2;
+            return new Rectangle(15, top, Math.Max(1, Width - 30), Math.Max(1, Height - top - 8));
+        }
+
+        private float AudioFontSize()
+        {
+            return Math.Max(18f, Math.Min(29f, Math.Min(Width / 32f, Height / 7f)));
+        }
+
         public bool TryGetCurrentRange(int start, int length, out Rectangle screen)
         {
             screen = Rectangle.Empty;
+            if (audioBox) start -= currentSourceOffset;
             if (start < 0 || length <= 0 || start + length > currentLine.Length || !Visible) return false;
-            Rectangle bounds = new Rectangle(8, 48, Math.Max(1, Width - 16), 57);
+            Rectangle bounds = audioBox
+                ? AudioCurrentBounds()
+                : new Rectangle(8, 48, Math.Max(1, Width - 16), 57);
             using (Graphics graphics = CreateGraphics())
-            using (Font font = new Font("Microsoft YaHei UI", 25f, FontStyle.Regular, GraphicsUnit.Pixel))
+            using (Font font = new Font("Microsoft YaHei UI", audioBox ? AudioFontSize() : 25f,
+                       FontStyle.Regular, GraphicsUnit.Pixel))
             using (StringFormat format = new StringFormat())
             {
-                format.Alignment = StringAlignment.Center;
-                format.LineAlignment = StringAlignment.Center;
+                format.Alignment = audioBox ? StringAlignment.Near : StringAlignment.Center;
+                format.LineAlignment = audioBox ? StringAlignment.Near : StringAlignment.Center;
                 format.Trimming = StringTrimming.EllipsisCharacter;
                 format.SetMeasurableCharacterRanges(new[] { new CharacterRange(start, length) });
                 Region[] regions = graphics.MeasureCharacterRanges(currentLine, font, bounds, format);
@@ -3596,6 +4267,38 @@ namespace SemanticOverlay.NativeHost
         {
             args.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             args.Graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+            if (audioBox)
+            {
+                using (GraphicsPath card = new GraphicsPath())
+                using (Brush background = new SolidBrush(Color.FromArgb(224, 25, 30, 39)))
+                using (Brush heading = new SolidBrush(Color.FromArgb(175, 215, 225, 238)))
+                using (Brush older = new SolidBrush(Color.FromArgb(195, 225, 230, 237)))
+                using (Brush newest = new SolidBrush(Color.White))
+                using (Font headingFont = new Font("Microsoft YaHei UI", 11f, FontStyle.Regular,
+                           GraphicsUnit.Pixel))
+                using (Font lineFont = new Font("Microsoft YaHei UI", AudioFontSize(), FontStyle.Regular,
+                           GraphicsUnit.Pixel))
+                using (StringFormat format = new StringFormat())
+                {
+                    card.AddRectangle(new Rectangle(0, 0, Width - 1, Height - 1));
+                    args.Graphics.FillPath(background, card);
+                    format.Trimming = StringTrimming.EllipsisCharacter;
+                    args.Graphics.DrawString("实时字幕 · 拖动标题移动 / 右下角缩放", headingFont, heading,
+                        new RectangleF(14, 8, Width - 114, 20), format);
+                    args.Graphics.DrawString("记录 ›", headingFont, newest,
+                        new RectangleF(Width - 88, 8, 80, 20), format);
+                    args.Graphics.DrawString(previousLine, lineFont, older,
+                        new RectangleF(14, 34, Width - 28,
+                            String.IsNullOrEmpty(previousLine) ? 0 : (Height - 46) / 2), format);
+                    args.Graphics.DrawString(currentLine, lineFont, newest,
+                        AudioCurrentBounds(), format);
+                    args.Graphics.DrawLine(Pens.LightGray, Width - 20, Height - 8,
+                        Width - 8, Height - 20);
+                    args.Graphics.DrawLine(Pens.LightGray, Width - 13, Height - 8,
+                        Width - 8, Height - 13);
+                }
+                return;
+            }
             Rectangle previousBounds = new Rectangle(8, 6, Math.Max(1, Width - 16), 42);
             Rectangle currentBounds = new Rectangle(8, 48, Math.Max(1, Width - 16), 57);
             DrawOutlinedText(args.Graphics, previousLine, previousBounds, 18f,
@@ -3644,18 +4347,24 @@ namespace SemanticOverlay.NativeHost
     internal sealed class CaptionHistoryForm : Form
     {
         public Func<string, string, LookupResponse> Lookup;
+        public Func<string, CaptionTranslationResponse> Translate;
         public Func<string, AnalyzeResponse> Analyze;
+        public Func<DateTime, List<CaptionEntry>> ArchiveDateRequested;
         public event Action<HighlightItem> EditTaskRequested;
         private readonly Button taskButton = new Button();
         private int taskVersion;
         private readonly FlowLayoutPanel explanationPanel = new FlowLayoutPanel();
         private readonly LinkLabel explanation = new LinkLabel();
         private readonly Button lookupButton = new Button();
+        private readonly Button translateButton = new Button();
         private readonly Button backButton = new Button();
         private readonly List<LookupResponse> history = new List<LookupResponse>();
         private LookupResponse current;
         private int lookupVersion;
+        private int translationVersion;
         private readonly RichTextBox transcript;
+        private readonly DateTimePicker archiveDatePicker = new DateTimePicker();
+        private readonly Label notice = new Label();
         private readonly Button copyButton;
         private readonly Button clearButton;
         private readonly Button exportButton;
@@ -3663,18 +4372,40 @@ namespace SemanticOverlay.NativeHost
 
         public CaptionHistoryForm()
         {
-            Text = "本次字幕记录";
+            Text = "字幕记录 · 按日期回看";
             StartPosition = FormStartPosition.CenterScreen;
             Size = new Size(760, 520);
             MinimumSize = new Size(520, 340);
             Font = new Font("Microsoft YaHei UI", 10f);
             ShowInTaskbar = true;
 
-            Label notice = new Label();
             notice.Dock = DockStyle.Top;
             notice.Height = 42;
             notice.Padding = new Padding(10, 10, 10, 4);
-            notice.Text = "选词查解释，选中会议安排可提取日程。最多保留 5000 条，退出前请导出。";
+            notice.Text = "字幕按录制日期自动保存在本机；选词查解释或按需翻译。";
+
+            FlowLayoutPanel dateBar = new FlowLayoutPanel();
+            dateBar.Dock = DockStyle.Top;
+            dateBar.Height = 43;
+            dateBar.Padding = new Padding(9, 7, 0, 0);
+            dateBar.WrapContents = false;
+            dateBar.Controls.Add(new Label { Text = "录制日期", AutoSize = true,
+                Margin = new Padding(0, 5, 8, 0) });
+            archiveDatePicker.Format = DateTimePickerFormat.Short;
+            archiveDatePicker.Width = 138;
+            archiveDatePicker.MaxDate = DateTime.Today;
+            archiveDatePicker.Value = DateTime.Today;
+            archiveDatePicker.ValueChanged += delegate { RefreshArchiveDate(); };
+            dateBar.Controls.Add(archiveDatePicker);
+            Button previousDay = new Button { Text = "前一天", AutoSize = true };
+            Button nextDay = new Button { Text = "后一天", AutoSize = true };
+            previousDay.Click += delegate { archiveDatePicker.Value = archiveDatePicker.Value.Date.AddDays(-1); };
+            nextDay.Click += delegate {
+                if (archiveDatePicker.Value.Date < DateTime.Today)
+                    archiveDatePicker.Value = archiveDatePicker.Value.Date.AddDays(1);
+            };
+            dateBar.Controls.Add(previousDay);
+            dateBar.Controls.Add(nextDay);
 
             transcript = new RichTextBox();
             transcript.Dock = DockStyle.Fill;
@@ -3701,6 +4432,9 @@ namespace SemanticOverlay.NativeHost
                 current = null;
                 await LookupTerm(term, context);
             };
+            translateButton.Text = "翻译当前句/选中段";
+            translateButton.AutoSize = true;
+            translateButton.Click += async delegate { await TranslateCurrentCaption(); };
             explanationPanel.Dock = DockStyle.Bottom;
             explanationPanel.Height = 160;
             explanationPanel.AutoScroll = true;
@@ -3732,7 +4466,7 @@ namespace SemanticOverlay.NativeHost
             };
             VisibleChanged += delegate
             {
-                if (!Visible) { lookupVersion++; taskVersion++; }
+                if (!Visible) { lookupVersion++; translationVersion++; taskVersion++; }
             };
             taskButton.Text = "从所选内容设置提醒";
             taskButton.AutoSize = true;
@@ -3743,6 +4477,7 @@ namespace SemanticOverlay.NativeHost
                 if (String.IsNullOrWhiteSpace(source)) return;
                 int version = ++taskVersion;
                 lookupVersion++;
+                translationVersion++;
                 taskButton.Enabled = false;
                 explanation.Links.Clear();
                 explanation.Text = "正在识别这句话的日程…";
@@ -3780,12 +4515,12 @@ namespace SemanticOverlay.NativeHost
 
             FlowLayoutPanel buttons = new FlowLayoutPanel();
             buttons.Dock = DockStyle.Bottom;
-            buttons.Height = 90;
+            buttons.Height = 112;
             buttons.FlowDirection = FlowDirection.RightToLeft;
             buttons.Padding = new Padding(8);
 
             Button closeButton = new Button { Text = "关闭", AutoSize = true };
-            clearButton = new Button { Text = "清空记录", AutoSize = true };
+            clearButton = new Button { Text = "清空本次显示", AutoSize = true };
             copyButton = new Button { Text = "复制全部", AutoSize = true };
             exportButton = new Button { Text = "导出文本…", AutoSize = true };
             exportButton.Click += delegate
@@ -3828,6 +4563,7 @@ namespace SemanticOverlay.NativeHost
             buttons.Controls.Add(copyButton);
             buttons.Controls.Add(exportButton);
             buttons.Controls.Add(lookupButton);
+            buttons.Controls.Add(translateButton);
             buttons.Controls.Add(backButton);
             buttons.Controls.Add(taskButton);
 
@@ -3835,6 +4571,7 @@ namespace SemanticOverlay.NativeHost
             Controls.Add(explanationPanel);
             Controls.Add(buttons);
             Controls.Add(notice);
+            Controls.Add(dateBar);
             FormClosing += delegate(object sender, FormClosingEventArgs args)
             {
                 if (args.CloseReason == CloseReason.UserClosing)
@@ -3843,6 +4580,61 @@ namespace SemanticOverlay.NativeHost
                     Hide();
                 }
             };
+        }
+
+        public void Present(List<CaptionEntry> entries)
+        {
+            clearButton.Visible = true;
+            SetEntries(entries);
+            PresentVisible();
+        }
+
+        public void PresentArchive()
+        {
+            // Clearing the bounded in-memory list cannot clear persisted days;
+            // hide that legacy action while browsing the saved archive.
+            clearButton.Visible = false;
+            if (archiveDatePicker.MaxDate.Date < DateTime.Today)
+                archiveDatePicker.MaxDate = DateTime.Today;
+            if (!Visible && archiveDatePicker.Value.Date != DateTime.Today)
+                archiveDatePicker.Value = DateTime.Today;
+            RefreshArchiveDate(true);
+            PresentVisible();
+        }
+
+        public void RefreshArchiveDate(bool evenWhenHidden = false)
+        {
+            if (ArchiveDateRequested == null || (!evenWhenHidden && !Visible)) return;
+            Text = "字幕记录 · " + archiveDatePicker.Value.ToString("yyyy-MM-dd");
+            try
+            {
+                SetEntries(ArchiveDateRequested(archiveDatePicker.Value.Date));
+            }
+            catch
+            {
+                notice.Text = "这一天的字幕记录暂时无法读取；本次内存中的字幕仍可使用。";
+            }
+        }
+
+        private void PresentVisible()
+        {
+            if (WindowState == FormWindowState.Minimized)
+                WindowState = FormWindowState.Normal;
+            if (!Visible)
+            {
+                Rectangle area = Screen.FromPoint(Cursor.Position).WorkingArea;
+                Location = new Point(area.Left + Math.Max(0, (area.Width - Width) / 2),
+                    area.Top + Math.Max(0, (area.Height - Height) / 2));
+                Show();
+            }
+            // The tray closes after its Click event. The caller defers this
+            // presentation so the menu cannot immediately hide the new window.
+            TopMost = true;
+            NativeMethods.SetWindowPos(Handle, NativeMethods.HwndTopMost,
+                Left, Top, Width, Height, NativeMethods.SwpShowWindow);
+            BringToFront();
+            Activate();
+            NativeMethods.SetForegroundWindow(Handle);
         }
 
         private string SelectedContext(int limit)
@@ -3858,9 +4650,66 @@ namespace SemanticOverlay.NativeHost
                 @"(?m)^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] ", "");
         }
 
+        private string TranslationSource()
+        {
+            string selected = transcript.SelectedText.Trim();
+            string source = selected;
+            if (source.Length == 0)
+            {
+                string value = transcript.Text;
+                int position = Math.Min(transcript.SelectionStart, value.Length);
+                int from = position == 0 ? 0 : value.LastIndexOf('\n', position - 1) + 1;
+                int to = value.IndexOf('\n', position);
+                if (to < 0) to = value.Length;
+                source = value.Substring(from, to - from);
+            }
+            return System.Text.RegularExpressions.Regex.Replace(source,
+                @"(?m)^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] ", "").Trim();
+        }
+
+        private async Task TranslateCurrentCaption()
+        {
+            string source = TranslationSource();
+            if (source.Length == 0 || source.Length > 1000)
+            {
+                explanation.Links.Clear();
+                explanation.Text = "请选取不超过 1000 个字符的一条或一段字幕再翻译。";
+                return;
+            }
+            int version = ++translationVersion;
+            lookupVersion++;
+            taskVersion++;
+            history.Clear();
+            current = null;
+            backButton.Enabled = false;
+            translateButton.Enabled = false;
+            explanation.Links.Clear();
+            explanation.Text = "正在翻译所选字幕…";
+            try
+            {
+                if (Translate == null) throw new InvalidOperationException();
+                CaptionTranslationResponse response = await Task.Factory.StartNew(() => Translate(source));
+                if (version != translationVersion || !Visible || IsDisposed) return;
+                explanation.Text = response == null || String.IsNullOrWhiteSpace(response.translation)
+                    ? "暂时没有可靠译文，请稍后重试。"
+                    : "AI 译文（请核对）：\n" + response.translation;
+            }
+            catch (Exception)
+            {
+                if (version == translationVersion && Visible && !IsDisposed)
+                    explanation.Text = "翻译失败，请检查模型服务后重试。原文仍保留在上方。";
+            }
+            finally
+            {
+                if (!IsDisposed && version == translationVersion)
+                    translateButton.Enabled = transcript.TextLength > 0;
+            }
+        }
+
         private async Task LookupTerm(string term, string context)
         {
             taskVersion++;
+            translationVersion++;
             int version = ++lookupVersion;
             explanation.Links.Clear();
             explanation.Text = "正在解释“" + term + "”…";
@@ -3900,9 +4749,16 @@ namespace SemanticOverlay.NativeHost
 
         public void SetEntries(List<CaptionEntry> entries)
         {
+            if (entries == null) entries = new List<CaptionEntry>();
+            int gapCount = entries.Count(entry => entry != null && entry.is_gap);
+            notice.Text = entries.Count == 0
+                ? "这一天暂无已保存的字幕。录制成功的字幕会自动归档在本机。"
+                : "共 " + (entries.Count - gapCount) + " 条字幕、" + gapCount +
+                    " 处缺口；向上滚动可看更早的场次。选词查解释或按需翻译。";
             if (entries.Count == 0)
             {
                 lookupVersion++;
+                translationVersion++;
                 taskVersion++;
                 history.Clear();
                 current = null;
@@ -3911,21 +4767,62 @@ namespace SemanticOverlay.NativeHost
                 backButton.Enabled = false;
             }
             StringBuilder builder = new StringBuilder();
-            foreach (CaptionEntry entry in entries)
+            string shownSession = null;
+            foreach (CaptionEntry entry in entries.OrderBy(item => item.timestamp))
             {
+                if (!String.IsNullOrEmpty(entry.session_key) &&
+                    !String.Equals(shownSession, entry.session_key, StringComparison.Ordinal))
+                {
+                    if (builder.Length > 0) builder.AppendLine().AppendLine();
+                    builder.Append("【").Append(entry.session_label ?? "会议字幕").Append("】");
+                    shownSession = entry.session_key;
+                }
                 if (builder.Length > 0)
                     builder.AppendLine();
+                if (entry.is_gap) builder.Append("⚠ ");
                 builder.Append('[');
                 builder.Append(entry.timestamp.ToString("yyyy-MM-dd HH:mm:ss"));
                 builder.Append("] ");
                 builder.Append(entry.text);
+                if (!entry.is_gap && !String.IsNullOrWhiteSpace(entry.raw_text) &&
+                    !String.Equals(entry.raw_text, entry.text, StringComparison.Ordinal))
+                    builder.AppendLine().Append("    ↳ 原始识别：").Append(entry.raw_text);
             }
             string updated = builder.ToString();
             copyButton.Enabled = clearButton.Enabled = exportButton.Enabled = updated.Length > 0;
+            translateButton.Enabled = entries.Count > gapCount;
             if (updated == transcript.Text) return;
-            transcript.Text = updated;
-            transcript.SelectionStart = transcript.TextLength;
-            transcript.ScrollToCaret();
+            string previous = transcript.Text;
+            bool preserveReading = Visible && transcript.IsHandleCreated && previous.Length > 0;
+            int selectionStart = transcript.SelectionStart;
+            int selectionLength = transcript.SelectionLength;
+            int firstVisible = preserveReading
+                ? NativeMethods.SendMessage(transcript.Handle,
+                    NativeMethods.EmGetFirstVisibleLine, IntPtr.Zero, IntPtr.Zero).ToInt32()
+                : 0;
+            int bottomChar = preserveReading ? transcript.GetCharIndexFromPosition(
+                new Point(2, Math.Max(2, transcript.ClientSize.Height - 3))) : 0;
+            bool followBottom = !preserveReading || (selectionLength == 0 &&
+                transcript.GetLineFromCharIndex(bottomChar) >=
+                transcript.GetLineFromCharIndex(previous.Length) - 1);
+            if (updated.StartsWith(previous, StringComparison.Ordinal))
+                transcript.AppendText(updated.Substring(previous.Length));
+            else
+                transcript.Text = updated;
+            if (followBottom)
+            {
+                transcript.Select(transcript.TextLength, 0);
+                transcript.ScrollToCaret();
+            }
+            else
+            {
+                int start = Math.Min(selectionStart, transcript.TextLength);
+                transcript.Select(start, Math.Min(selectionLength, transcript.TextLength - start));
+                int nowFirst = NativeMethods.SendMessage(transcript.Handle,
+                    NativeMethods.EmGetFirstVisibleLine, IntPtr.Zero, IntPtr.Zero).ToInt32();
+                NativeMethods.SendMessage(transcript.Handle, NativeMethods.EmLineScroll,
+                    IntPtr.Zero, new IntPtr(firstVisible - nowFirst));
+            }
             copyButton.Enabled = transcript.TextLength > 0;
             clearButton.Enabled = transcript.TextLength > 0;
             exportButton.Enabled = transcript.TextLength > 0;
@@ -5769,6 +6666,115 @@ namespace SemanticOverlay.NativeHost
         }
     }
 
+    internal sealed class CaptionConsentForm : Form
+    {
+        private readonly CheckBox remember = new CheckBox {
+            Text = "以后启动会议字幕不再询问", AutoSize = true,
+            Location = new Point(18, 138) };
+
+        public bool RememberApproval { get { return remember.Checked; } }
+
+        public CaptionConsentForm()
+        {
+            Text = "开始会议语音字幕";
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            StartPosition = FormStartPosition.CenterScreen;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            TopMost = true;
+            ClientSize = new Size(500, 210);
+            Font = new Font("Microsoft YaHei UI", 9);
+            Label notice = new Label { Location = new Point(18, 18), Size = new Size(465, 110),
+                Text = "程序将采集所选音源正在播放的语音片段，并发送到硅基流动生成原文字幕。\r\n\r\n" +
+                    "音源可能回退到全系统声音；不会采集麦克风，也不会自动保存录音。" };
+            Button start = new Button { Text = "开始字幕", DialogResult = DialogResult.OK,
+                Location = new Point(304, 174), Size = new Size(90, 28) };
+            Button cancel = new Button { Text = "取消", DialogResult = DialogResult.Cancel,
+                Location = new Point(404, 174), Size = new Size(78, 28) };
+            Controls.Add(notice);
+            Controls.Add(remember);
+            Controls.Add(start);
+            Controls.Add(cancel);
+            AcceptButton = start;
+            CancelButton = cancel;
+        }
+    }
+
+    internal sealed class CaptionStatusForm : Form
+    {
+        private readonly Label label = new Label { Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleCenter };
+        private readonly System.Windows.Forms.Timer dismissTimer = new System.Windows.Forms.Timer();
+
+        public CaptionStatusForm()
+        {
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.Manual;
+            TopMost = true;
+            BackColor = Color.FromArgb(232, 246, 255);
+            ClientSize = new Size(190, 32);
+            label.ForeColor = Color.FromArgb(20, 74, 125);
+            label.Font = new Font(SystemFonts.MessageBoxFont.FontFamily, 9.0f);
+            Controls.Add(label);
+            dismissTimer.Tick += delegate { dismissTimer.Stop(); Hide(); };
+        }
+
+        protected override bool ShowWithoutActivation { get { return true; } }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams value = base.CreateParams;
+                value.ExStyle |= NativeMethods.WsExTransparent |
+                                 NativeMethods.WsExToolWindow |
+                                 NativeMethods.WsExNoActivate;
+                return value;
+            }
+        }
+
+        public void PositionFor(NativeRect target)
+        {
+            Rectangle bounds = new Rectangle(target.Left, target.Top, target.Width, target.Height);
+            Rectangle working = Screen.FromRectangle(bounds).WorkingArea;
+            Location = new Point(
+                Math.Max(working.Left + 8, Math.Min(target.Left + 16, working.Right - Width - 8)),
+                Math.Max(working.Top + 8, Math.Min(target.Top + 16, working.Bottom - Height - 8)));
+        }
+
+        public void ShowState(string message, NativeRect target)
+        {
+            dismissTimer.Stop();
+            label.Text = message ?? String.Empty;
+            PositionFor(target);
+            if (!Visible) NativeMethods.ShowWindow(Handle, NativeMethods.SwShowNoActivate);
+            NativeMethods.SetWindowPos(Handle, NativeMethods.HwndTopMost,
+                Left, Top, Width, Height,
+                NativeMethods.SwpNoActivate | NativeMethods.SwpShowWindow);
+        }
+
+        public void ShowTemporary(string message, NativeRect target, int milliseconds)
+        {
+            ShowState(message, target);
+            dismissTimer.Interval = Math.Max(250, milliseconds);
+            dismissTimer.Start();
+        }
+
+        protected override void OnPaint(PaintEventArgs args)
+        {
+            base.OnPaint(args);
+            using (Pen pen = new Pen(Color.FromArgb(71, 151, 204)))
+                args.Graphics.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) dismissTimer.Dispose();
+            base.Dispose(disposing);
+        }
+    }
+
     internal sealed class StatusForm : Form
     {
         private readonly Label label;
@@ -6227,6 +7233,7 @@ namespace SemanticOverlay.NativeHost
     internal sealed class SelectionAnalysisForm : Form
     {
         private readonly ServiceManager services;
+        private readonly Action<HighlightItem, Form> openReminderEditor;
         private readonly Label heading = new Label {
             Text = "这句话的意思", Dock = DockStyle.Fill, Font = new Font("Microsoft YaHei UI", 12, FontStyle.Bold),
             TextAlign = ContentAlignment.MiddleLeft };
@@ -6238,21 +7245,31 @@ namespace SemanticOverlay.NativeHost
             ForeColor = Color.DimGray, TextAlign = ContentAlignment.MiddleLeft };
         private readonly TextBox body = new TextBox { Multiline = true, ReadOnly = true,
             ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill, BackColor = Color.White };
-        private readonly Label sentenceTitle = new Label { Text = "原句（可点击术语）",
+        private readonly Label sentenceTitle = new Label { Text = "原句（可点击或选取词语）",
             Dock = DockStyle.Fill, Font = new Font("Microsoft YaHei UI", 9, FontStyle.Bold),
             TextAlign = ContentAlignment.MiddleLeft };
-        private readonly LinkLabel sentence = new LinkLabel { Dock = DockStyle.Fill,
-            AutoSize = false, LinkBehavior = LinkBehavior.HoverUnderline,
-            LinkColor = Color.FromArgb(20, 92, 190), ActiveLinkColor = Color.FromArgb(180, 70, 20),
-            Padding = new Padding(4), BackColor = Color.FromArgb(246, 249, 253) };
+        private readonly RichTextBox sentence = new RichTextBox { Dock = DockStyle.Fill,
+            ReadOnly = true, DetectUrls = false, HideSelection = false,
+            BorderStyle = BorderStyle.None, ScrollBars = RichTextBoxScrollBars.Vertical,
+            BackColor = Color.FromArgb(246, 249, 253) };
+        private readonly Button explainSelected = new Button { Text = "解释选中词语",
+            AutoSize = true, Height = 30, Enabled = false, Margin = new Padding(3) };
+        private readonly List<Tuple<int, int, SelectionTerm>> linkedTerms =
+            new List<Tuple<int, int, SelectionTerm>>();
+        private readonly Font termLinkFont;
         private readonly FlowLayoutPanel terms = new FlowLayoutPanel { Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.LeftToRight, WrapContents = true, AutoScroll = true };
-        private readonly Label termHeading = new Label { Text = "词语注释",
+        private readonly Label termHeading = new Label { Text = "知识点 · 点击查看",
             Dock = DockStyle.Fill, Font = new Font("Microsoft YaHei UI", 9, FontStyle.Bold),
             TextAlign = ContentAlignment.MiddleLeft };
         private readonly TextBox termBody = new TextBox { Multiline = true, ReadOnly = true,
             ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill, BackColor = Color.White,
             Text = "点击上方高亮词语查看它在这句话里的含义。" };
+        private readonly Label taskHeading = new Label { Text = "工作与日程 · 待确认",
+            Dock = DockStyle.Fill, Font = new Font("Microsoft YaHei UI", 9, FontStyle.Bold),
+            ForeColor = Color.FromArgb(20, 92, 190), TextAlign = ContentAlignment.MiddleLeft };
+        private readonly FlowLayoutPanel tasks = new FlowLayoutPanel { Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight, WrapContents = true, AutoScroll = true };
         private readonly LinkLabel editSource = new LinkLabel {
             Text = "识别有误？展开并修改原文", Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleLeft, LinkBehavior = LinkBehavior.HoverUnderline };
@@ -6268,26 +7285,31 @@ namespace SemanticOverlay.NativeHost
         private string textSource = "ocr";
         private string initialText = String.Empty;
 
-        internal SelectionAnalysisForm(ServiceManager service)
+        internal SelectionAnalysisForm(ServiceManager service,
+            Action<HighlightItem, Form> reminderEditor)
         {
             services = service;
+            openReminderEditor = reminderEditor;
             Text = "消息解释";
             Size = new Size(620, 690);
-            MinimumSize = new Size(540, 620);
+            MinimumSize = new Size(540, 670);
             TopMost = true;
             Font = new Font("Microsoft YaHei UI", 9);
+            termLinkFont = new Font(sentence.Font, FontStyle.Underline);
 
             layout = new TableLayoutPanel {
-                Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 12, Padding = new Padding(12) };
+                Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 14, Padding = new Padding(12) };
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 140));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 115));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 100));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 70));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 82));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 54));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 66));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 68));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 0));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 0));
@@ -6303,19 +7325,30 @@ namespace SemanticOverlay.NativeHost
             layout.Controls.Add(terms, 0, 5);
             layout.Controls.Add(termHeading, 0, 6);
             layout.Controls.Add(termBody, 0, 7);
-            layout.Controls.Add(editSource, 0, 8);
-            layout.Controls.Add(source, 0, 9);
-            layout.Controls.Add(sourceNotice, 0, 10);
-            layout.Controls.Add(actions, 0, 11);
+            layout.Controls.Add(taskHeading, 0, 8);
+            layout.Controls.Add(tasks, 0, 9);
+            layout.Controls.Add(editSource, 0, 10);
+            layout.Controls.Add(source, 0, 11);
+            layout.Controls.Add(sourceNotice, 0, 12);
+            layout.Controls.Add(actions, 0, 13);
             Controls.Add(layout);
 
-            analyze.Click += async delegate { await RunAnalysis(); };
+            analyze.Click += async delegate { await RunAnalysis(true); };
             editSource.LinkClicked += delegate { SetSourceEditorVisible(!sourceEditorVisible); };
-            sentence.LinkClicked += async delegate(object sender, LinkLabelLinkClickedEventArgs args)
-            {
-                SelectionTerm item = args.Link.LinkData as SelectionTerm;
+            sentence.SelectionChanged += delegate {
+                explainSelected.Enabled = !String.IsNullOrWhiteSpace(sentence.SelectedText);
+            };
+            sentence.MouseUp += async delegate(object sender, MouseEventArgs args) {
+                if (args.Button != MouseButtons.Left || sentence.SelectionLength != 0) return;
+                SelectionTerm item = LinkedTermAt(sentence.GetCharIndexFromPosition(args.Location));
                 if (item != null) await ShowTerm(item);
             };
+            sentence.KeyDown += async delegate(object sender, KeyEventArgs args) {
+                if (!args.Control || args.KeyCode != Keys.Enter) return;
+                args.SuppressKeyPress = true;
+                await ExplainSelectedTerm();
+            };
+            explainSelected.Click += async delegate { await ExplainSelectedTerm(); };
             source.TextChanged += delegate
             {
                 if (settingText) return;
@@ -6324,14 +7357,16 @@ namespace SemanticOverlay.NativeHost
                 passageExplanation = String.Empty;
                 body.Clear();
                 sentence.Text = source.Text;
-                sentence.Links.Clear();
+                linkedTerms.Clear();
                 terms.Controls.Clear();
-                termHeading.Text = "词语注释";
+                explainSelected.Enabled = false;
+                tasks.Controls.Clear();
+                termHeading.Text = "知识点 · 点击查看";
                 termBody.Text = "重新解释后可查看词语注释。";
                 analyze.Text = "确认并解释";
                 status.Text = "文字已修改，确认后才会发送。";
             };
-            FormClosed += delegate { generation++; termGeneration++; };
+            FormClosed += delegate { generation++; termGeneration++; termLinkFont.Dispose(); };
         }
 
         internal void OpenText(string text, bool exactSelection, string textSource,
@@ -6349,9 +7384,11 @@ namespace SemanticOverlay.NativeHost
             passageExplanation = String.Empty;
             body.Clear();
             sentence.Text = String.Empty;
-            sentence.Links.Clear();
+            linkedTerms.Clear();
             terms.Controls.Clear();
-            termHeading.Text = "词语注释";
+            explainSelected.Enabled = false;
+            tasks.Controls.Clear();
+            termHeading.Text = "知识点 · 点击查看";
             termBody.Text = "点击上方高亮词语查看它在这句话里的含义。";
             int request = ++generation;
             termGeneration++;
@@ -6362,6 +7399,29 @@ namespace SemanticOverlay.NativeHost
             settingText = false;
             Show();
             Activate();
+            // On some QQ foreground transitions WinForms reports Visible while the
+            // native window loses WS_VISIBLE. Keep the initial presentation honest.
+            int visibilityChecks = 0;
+            System.Windows.Forms.Timer visibilityTimer = new System.Windows.Forms.Timer { Interval = 250 };
+            visibilityTimer.Tick += delegate
+            {
+                visibilityChecks++;
+                if (!IsDisposed && WindowState != FormWindowState.Minimized &&
+                    !NativeMethods.IsWindowVisible(Handle))
+                {
+                    NativeMethods.ShowWindow(Handle, NativeMethods.SwShowNoActivate);
+                    NativeMethods.SetWindowPos(Handle, NativeMethods.HwndTopMost,
+                        Left, Top, Width, Height,
+                        NativeMethods.SwpNoActivate | NativeMethods.SwpShowWindow);
+                    services.Log("Selection panel native visibility restored");
+                }
+                if (IsDisposed || visibilityChecks >= 6)
+                {
+                    visibilityTimer.Stop();
+                    visibilityTimer.Dispose();
+                }
+            };
+            visibilityTimer.Start();
             if (value.Length == 0)
             {
                 sourceNotice.Text = "没有读到所选文字，请重新拖选。";
@@ -6385,7 +7445,7 @@ namespace SemanticOverlay.NativeHost
                 analyze.Text = "重新解释";
                 BeginInvoke(new Action(async delegate
                 {
-                    if (!IsDisposed && request == generation) await RunAnalysis();
+                    if (!IsDisposed && request == generation) await RunAnalysis(false);
                 }));
             }
             else
@@ -6400,7 +7460,7 @@ namespace SemanticOverlay.NativeHost
                 (textSource ?? "unknown") + ", " + sourceApp + ")");
         }
 
-        private async Task RunAnalysis()
+        private async Task RunAnalysis(bool forceRefresh)
         {
             string value = source.Text.Trim();
             if (value.Length == 0)
@@ -6419,10 +7479,12 @@ namespace SemanticOverlay.NativeHost
             passageExplanation = String.Empty;
             analyze.Enabled = false;
             terms.Controls.Clear();
+            tasks.Controls.Clear();
             sentence.Text = value;
-            sentence.Links.Clear();
+            linkedTerms.Clear();
+            explainSelected.Enabled = false;
             sentenceTitle.Text = "原句";
-            termHeading.Text = "词语注释";
+            termHeading.Text = "知识点 · 点击查看";
             termBody.Text = "正在等待整句分析…";
             body.Text = "正在理解这段话…";
             status.Text = "只分析当前消息";
@@ -6433,7 +7495,7 @@ namespace SemanticOverlay.NativeHost
                 {
                     services.EnsureRunning();
                     bool allowCorrection = textSource == "bubble_ocr" || textSource == "ocr";
-                    return services.AnalyzeSelection(value, allowCorrection);
+                    return services.AnalyzeSelection(value, allowCorrection, forceRefresh);
                 });
                 if (IsDisposed || request != generation) return;
                 watch.Stop();
@@ -6444,12 +7506,14 @@ namespace SemanticOverlay.NativeHost
                     ? "暂时没有可靠的整段解释，请重试。" : passageExplanation;
                 sentence.Text = passageText;
                 sentenceTitle.Text = response != null && response.ocr_corrected
-                    ? "原句（已校正，可点击术语）" : "原句（可点击术语）";
+                    ? "原句（已校正，可选取词语）" : "原句（可选取词语）";
                 status.Text = (response != null && response.analysis_mode == "model"
                     ? "AI 整段解释" : "本地状态") + " · " +
                     (watch.ElapsedMilliseconds / 1000.0).ToString("0.0") + " 秒";
                 analyze.Text = response != null && response.can_retry ? "重新解释" : "再次检查";
                 RenderTermsSafely(response == null ? null : response.terms);
+                RenderTasks(response == null ? null : response.actions,
+                    response == null ? null : response.action_status);
                 services.RecordSelectionMetric(
                     sourceApp, textSource,
                     response == null ? "empty" : response.analysis_mode,
@@ -6482,13 +7546,18 @@ namespace SemanticOverlay.NativeHost
         private void RenderTerms(List<SelectionTerm> items)
         {
             terms.Controls.Clear();
-            sentence.Links.Clear();
+            terms.Controls.Add(explainSelected);
+            linkedTerms.Clear();
+            sentence.SelectAll();
+            sentence.SelectionColor = Color.Black;
+            sentence.SelectionFont = sentence.Font;
+            sentence.DeselectAll();
             if (items == null || items.Count == 0)
             {
-                terms.Controls.Add(new Label { Text = "这段话没有必要单独拆出的术语。",
+                terms.Controls.Add(new Label { Text = "没标出想查的词？在原句中拖选后点左侧按钮。",
                     AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 9, 3, 3) });
-                termHeading.Text = "词语注释";
-                termBody.Text = "这句话没有需要单独解释的术语。";
+                termHeading.Text = "知识点 · 按需解释";
+                termBody.Text = "选取原句中的任意词语，再点“解释选中词语”。";
                 return;
             }
             var unique = new List<SelectionTerm>();
@@ -6517,26 +7586,32 @@ namespace SemanticOverlay.NativeHost
                 terms.Controls.Add(button);
             }
             var linkedRanges = new List<Tuple<int, int>>();
+            string displayed = sentence.Text;
             foreach (SelectionTerm item in unique.OrderByDescending(value => value.text.Length))
             {
                 int start = 0;
-                while (start < passageText.Length)
+                while (start < displayed.Length)
                 {
-                    int found = passageText.IndexOf(item.text, start, StringComparison.Ordinal);
+                    int found = displayed.IndexOf(item.text, start, StringComparison.Ordinal);
                     if (found < 0) break;
                     int end = found + item.text.Length;
                     bool overlaps = linkedRanges.Any(range =>
                         found < range.Item2 && end > range.Item1);
                     if (!overlaps)
                     {
-                        sentence.Links.Add(found, item.text.Length, item);
+                        sentence.Select(found, item.text.Length);
+                        sentence.SelectionColor = Color.FromArgb(20, 92, 190);
+                        sentence.SelectionFont = termLinkFont;
+                        linkedTerms.Add(Tuple.Create(found, end, item));
                         linkedRanges.Add(Tuple.Create(found, end));
                     }
                     start = found + item.text.Length;
                 }
             }
-            termHeading.Text = "词语注释";
-            termBody.Text = "点击原句中的蓝色词语或下方词语按钮查看注释。";
+            sentence.DeselectAll();
+            explainSelected.Enabled = false;
+            termHeading.Text = "知识点 · 点击查看";
+            termBody.Text = "点击蓝色词语，或拖选未标出的词语后点“解释选中词语”。";
         }
 
         private void RenderTermsSafely(List<SelectionTerm> items)
@@ -6544,23 +7619,96 @@ namespace SemanticOverlay.NativeHost
             try { RenderTerms(items); }
             catch (Exception error)
             {
-                sentence.Links.Clear();
+                linkedTerms.Clear();
                 terms.Controls.Clear();
+                terms.Controls.Add(explainSelected);
                 terms.Controls.Add(new Label {
-                    Text = "术语暂时无法显示，整句解释仍可查看。",
+                    Text = "术语暂时无法标出，仍可拖选原句查词。",
                     AutoSize = true, ForeColor = Color.DimGray,
                     Margin = new Padding(3, 9, 3, 3)
                 });
-                termHeading.Text = "词语注释";
-                termBody.Text = "术语区域显示失败，可重新解释。";
+                termHeading.Text = "知识点 · 按需解释";
+                termBody.Text = "选取原句中的词语，再点“解释选中词语”。";
                 services.Log("Selection term rendering failed: " + error.GetType().Name);
             }
+        }
+
+        private SelectionTerm LinkedTermAt(int index)
+        {
+            foreach (Tuple<int, int, SelectionTerm> range in linkedTerms)
+                if (index >= range.Item1 && index < range.Item2) return range.Item3;
+            return null;
+        }
+
+        private string GetSelectedLookupTerm()
+        {
+            return sentence.SelectedText.Trim();
+        }
+
+        private async Task ExplainSelectedTerm()
+        {
+            string selected = GetSelectedLookupTerm();
+            if (String.IsNullOrWhiteSpace(selected)) return;
+            if (selected.Length > 200)
+            {
+                termBody.Text = "请只选取要解释的词语，最多 200 个字符。";
+                return;
+            }
+            await ShowTerm(new SelectionTerm { text = selected });
+        }
+
+        private void RenderTasks(List<AnalysisEntity> items, string actionStatus)
+        {
+            tasks.Controls.Clear();
+            if (items == null || items.Count == 0)
+            {
+                string message = String.Equals(actionStatus, "example_excluded",
+                    StringComparison.Ordinal)
+                    ? "这句是在举例，未加入日程。请点击包含真实时间安排的消息。"
+                    : "这条消息没有明确的日程安排。";
+                tasks.Controls.Add(new Label { Text = message, AutoSize = true,
+                    MaximumSize = new Size(530, 52), ForeColor = Color.DimGray,
+                    Margin = new Padding(3, 9, 3, 3) });
+                return;
+            }
+            int resultGeneration = generation;
+            foreach (AnalysisEntity item in items.Take(3))
+            {
+                if (item == null || String.IsNullOrWhiteSpace(item.text) ||
+                    String.IsNullOrWhiteSpace(item.title) || item.start < 0 ||
+                    item.end > passageText.Length || item.end <= item.start ||
+                    !String.Equals(passageText.Substring(item.start, item.end - item.start),
+                        item.text, StringComparison.Ordinal)) continue;
+                AnalysisEntity candidate = item;
+                var row = new FlowLayoutPanel { AutoSize = true, WrapContents = false,
+                    Margin = new Padding(1), BackColor = Color.FromArgb(239, 247, 255) };
+                row.Controls.Add(new Label { Text = item.title + " · " + item.text,
+                    AutoSize = true, MaximumSize = new Size(390, 40),
+                    Margin = new Padding(5, 7, 4, 3) });
+                Button add = new Button { Text = "添加日程", AutoSize = true,
+                    Height = 29, Margin = new Padding(3) };
+                add.Click += delegate
+                {
+                    if (resultGeneration != generation || openReminderEditor == null) return;
+                    openReminderEditor(new HighlightItem {
+                        term = candidate.text, context = passageText, kind = "task",
+                        time_text = candidate.time_text, title = candidate.title,
+                        start_iso = candidate.start_iso, end_iso = candidate.end_iso,
+                        utc_offset = candidate.utc_offset, needs_confirmation = true
+                    }, this);
+                };
+                row.Controls.Add(add);
+                tasks.Controls.Add(row);
+            }
+            if (tasks.Controls.Count == 0)
+                tasks.Controls.Add(new Label { Text = "日程候选未通过原句核对。",
+                    AutoSize = true, ForeColor = Color.DimGray });
         }
 
         private async Task ShowTerm(SelectionTerm item)
         {
             int request = ++termGeneration;
-            termHeading.Text = "词语注释 · " + item.text;
+            termHeading.Text = "知识点 · " + item.text;
             if (!String.IsNullOrWhiteSpace(item.explanation))
             {
                 termBody.Text = item.explanation;
@@ -6590,14 +7738,14 @@ namespace SemanticOverlay.NativeHost
             sourceEditorVisible = visible;
             source.Visible = visible;
             sourceNotice.Visible = visible;
-            layout.RowStyles[9].Height = visible ? 100 : 0;
-            layout.RowStyles[10].Height = visible ? 38 : 0;
+            layout.RowStyles[11].Height = visible ? 100 : 0;
+            layout.RowStyles[12].Height = visible ? 38 : 0;
             editSource.Text = visible
                 ? "收起原文编辑" : "识别有误？展开并修改原文";
             if (visible)
             {
                 int bottom = Screen.FromControl(this).WorkingArea.Bottom;
-                Height = Math.Min(820, Math.Max(690, bottom - Top - 12));
+                Height = Math.Min(860, Math.Max(690, bottom - Top - 12));
             }
             else if (Height > 690)
                 Height = 690;
@@ -7251,6 +8399,7 @@ RenderCompletedLookup:
         public bool AutoLearnFamiliarTerms { get; private set; }
         public bool SelectionToolbarEnabled { get; private set; }
         public bool ExperimentalFeaturesEnabled { get; private set; }
+        public bool CaptionPromptEnabled { get; private set; }
         public int IgnoredTermCount { get { return ignoredTerms.Count; } }
         public int AutoSuppressedTermCount { get { return familiarity.SuppressedCount; } }
 
@@ -7306,6 +8455,8 @@ RenderCompletedLookup:
             SelectionToolbarEnabled = !preferences.TryGetValue("selection_toolbar", out value) || value != "false";
             ExperimentalFeaturesEnabled = preferences.TryGetValue("experimental_features", out value) &&
                 String.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
+            CaptionPromptEnabled = !preferences.TryGetValue("caption_prompt_enabled", out value) ||
+                !String.Equals(value, "false", StringComparison.OrdinalIgnoreCase);
             if (!ExperimentalFeaturesEnabled && WorkMode == "caption" &&
                 WorkModeOverrideForDiagnostics != "caption")
                 WorkMode = "conversation";
@@ -7398,6 +8549,14 @@ RenderCompletedLookup:
             preferences["experimental_features"] = enabled ? "true" : "false";
             SavePreferences();
             Log("Experimental features " + (enabled ? "enabled" : "disabled"));
+        }
+
+        public void SetCaptionPromptEnabled(bool enabled)
+        {
+            CaptionPromptEnabled = enabled;
+            preferences["caption_prompt_enabled"] = enabled ? "true" : "false";
+            SavePreferences();
+            Log("Caption startup prompt " + (enabled ? "enabled" : "disabled"));
         }
 
         public void ClearFamiliarTerms()
@@ -7569,7 +8728,7 @@ RenderCompletedLookup:
             }
         }
 
-        public string Capture(NativeRect rect)
+        public string Capture(NativeRect rect, float ocrScale = 1f)
         {
             string directory = Path.Combine(Path.GetTempPath(), "RealtimeDictionary");
             Directory.CreateDirectory(directory);
@@ -7584,7 +8743,23 @@ RenderCompletedLookup:
                     0,
                     new Size(rect.Width, rect.Height),
                     CopyPixelOperation.SourceCopy);
-                bitmap.Save(path, ImageFormat.Png);
+                if (ocrScale <= 1f)
+                {
+                    bitmap.Save(path, ImageFormat.Png);
+                }
+                else
+                {
+                    int width = (int)Math.Round(rect.Width * ocrScale);
+                    int height = (int)Math.Round(rect.Height * ocrScale);
+                    using (Bitmap enlarged = new Bitmap(width, height, PixelFormat.Format32bppArgb))
+                    using (Graphics upscaler = Graphics.FromImage(enlarged))
+                    {
+                        upscaler.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                        upscaler.DrawImage(bitmap, new Rectangle(0, 0, width, height),
+                            new Rectangle(0, 0, bitmap.Width, bitmap.Height), GraphicsUnit.Pixel);
+                        enlarged.Save(path, ImageFormat.Png);
+                    }
+                }
             }
             return path;
         }
@@ -7707,7 +8882,10 @@ RenderCompletedLookup:
             bool validUri = Uri.TryCreate(endpoint, UriKind.Absolute, out endpointUri);
             bool localHttp = validUri && endpointUri.Scheme == Uri.UriSchemeHttp &&
                 (endpointUri.Host == "127.0.0.1" || endpointUri.Host == "localhost");
-            if (!validUri || (endpointUri.Scheme != Uri.UriSchemeHttps && !localHttp))
+            if (!validUri || string.IsNullOrWhiteSpace(endpointUri.Host) ||
+                endpointUri.UserInfo.Length != 0 || endpointUri.Query.Length != 0 ||
+                endpointUri.Fragment.Length != 0 ||
+                (endpointUri.Scheme != Uri.UriSchemeHttps && !localHttp))
                 throw new ArgumentException("模型服务地址必须是 HTTPS，或本机地址。", "baseUrl");
             if (modelId.Length == 0 || modelId.Length > 160)
                 throw new ArgumentException("模型名称不能为空。", "model");
@@ -7859,13 +9037,18 @@ RenderCompletedLookup:
             return LookupCore(term, context, false, null, true);
         }
 
-        public SelectionAnalysisResponse AnalyzeSelection(string text, bool allowOcrCorrection)
+        public SelectionAnalysisResponse AnalyzeSelection(string text, bool allowOcrCorrection,
+            bool refresh)
         {
             Dictionary<string, string> payload = new Dictionary<string, string>();
             payload["text"] = text;
             payload["allow_ocr_correction"] = allowOcrCorrection ? "true" : "false";
-            return PostJson<SelectionAnalysisResponse>(
+            payload["refresh"] = refresh ? "true" : "false";
+            SelectionAnalysisResponse result = PostJson<SelectionAnalysisResponse>(
                 "http://127.0.0.1:8877/selection/analyze", payload, 22000);
+            if (result != null && result.actions != null)
+                UnicodeSpans.Convert(result.display_text ?? text, result.actions);
+            return result;
         }
 
         private LookupResponse LookupCore(
@@ -7956,6 +9139,14 @@ RenderCompletedLookup:
                 UnicodeSpans.Convert(text, result.actions);
             }
             return result;
+        }
+
+        public CaptionTranslationResponse TranslateCaption(string text)
+        {
+            EnsureRunning();
+            return PostJson<CaptionTranslationResponse>(
+                "http://127.0.0.1:8877/caption/translate",
+                new Dictionary<string, string> { { "text", text } }, 18000);
         }
 
         public AudioTranscriptionResponse TranscribeAudio(byte[] wav)
@@ -8117,8 +9308,10 @@ RenderCompletedLookup:
 
         public string ReadSelectionRegion(Rectangle region)
         {
+            // The chat client's small antialiased text loses Chinese strokes at native size.
+            // Scale only bounded message OCR; conversation scans retain pixel coordinates.
             string path = Capture(new NativeRect { Left = region.Left, Top = region.Top,
-                Right = region.Right, Bottom = region.Bottom });
+                Right = region.Right, Bottom = region.Bottom }, 1.7f);
             try
             {
                 List<OcrWord> words = ReadWindowsOcrWords(path);
@@ -8714,6 +9907,11 @@ RenderCompletedLookup:
         public string error { get; set; }
     }
 
+    internal sealed class CaptionTranslationResponse
+    {
+        public string translation { get; set; }
+    }
+
     internal sealed class SelectionTerm
     {
         public string text { get; set; }
@@ -8728,6 +9926,8 @@ RenderCompletedLookup:
         public bool ocr_corrected { get; set; }
         public string explanation { get; set; }
         public List<SelectionTerm> terms { get; set; }
+        public List<AnalysisEntity> actions { get; set; }
+        public string action_status { get; set; }
         public string analysis_mode { get; set; }
         public bool can_retry { get; set; }
         public int duration_ms { get; set; }
@@ -8794,6 +9994,8 @@ RenderCompletedLookup:
     {
         public bool ok { get; set; }
         public string text { get; set; }
+        public string raw_text { get; set; }
+        public int term_corrections { get; set; }
         public string model { get; set; }
         public string error { get; set; }
         public bool retryable { get; set; }
@@ -8981,6 +10183,11 @@ RenderCompletedLookup:
 
     internal static class NativeMethods
     {
+        public const int EmGetFirstVisibleLine = 0x00CE;
+        public const int EmLineScroll = 0x00B6;
+        [DllImport("user32.dll")]
+        public static extern IntPtr SendMessage(IntPtr hwnd, int message,
+            IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll", SetLastError = true)]
         internal static extern bool SetWindowDisplayAffinity(IntPtr hwnd, uint affinity);
         public const int WmHotkey = 0x0312;
@@ -9035,6 +10242,8 @@ RenderCompletedLookup:
         public static extern bool GetWindowRect(IntPtr hwnd, out NativeRect rect);
         [DllImport("user32.dll")]
         public static extern bool IsWindow(IntPtr hwnd);
+        [DllImport("user32.dll")]
+        public static extern bool IsWindowVisible(IntPtr hwnd);
         [DllImport("user32.dll")]
         public static extern bool IsIconic(IntPtr hwnd);
         [DllImport("user32.dll")]

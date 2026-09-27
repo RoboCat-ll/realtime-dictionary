@@ -20,6 +20,16 @@
 - One passage-analysis request returns the passage explanation and zero to five useful
   terms. A term must occur verbatim in the submitted passage; do not force a term count
   and do not render invented or fragmentary terms.
+- Keep the clicked-message model response limited to fields the service actually uses.
+  Schedule candidates remain source-grounded local extraction; do not ask the model to
+  generate duplicate schedule fields. For OCR input, request corrected full text only
+  when a small repair is needed; unchanged or accessibility-exact text must not be
+  echoed back in the model response. Reuse only successful exact-message explanations
+  in a short-lived, bounded process-memory cache; never persist chat text or cache a
+  failure, and a user edit must use the edited text as its cache identity. The
+  explicit `重新解释` action bypasses the cache and asks the model again.
+- The explanation describes the message's meaning, not the OCR or correction workflow.
+  A short ordinary message may need only one sentence; do not pad it with speculation.
 - Full-window OCR/highlighting is an explicit experimental compatibility feature. It
   must not be the default tray action, hotkey action, or product promise.
 - The user experience is a background Windows utility, not a visible desktop app.
@@ -48,6 +58,15 @@
   must always show which source is actually active. Known-incompatible clients
   may start in compatibility mode rather than presenting a false isolated state.
   Microphone capture remains out of scope and default-off.
+- Starting live captions must disclose that captured speech is sent to the
+  configured speech provider. The user may explicitly remember approval and
+  suppress repeat prompts, with a tray option to restore the prompt. A visible
+  compact nonactivating status near the bound window must distinguish startup,
+  listening, transcription and failure; it must hide when the target is not in
+  the foreground and must not imply a transcript has arrived before one does.
+- Repeating `Ctrl+Alt+K` on the same active caption target must reveal the
+  current status instead of restarting capture or repeating consent. To restart
+  that target, the user explicitly stops with `Ctrl+Alt+G` before starting again.
 - Silence is filtered locally and is never uploaded or turned into caption text.
   Speech is segmented into bounded WAV chunks. Segmentation keeps a short
   pre-roll so the first syllable is not lost, adapts its gate to the observed
@@ -56,18 +75,57 @@
   cancels queued work, ignores late responses and clears the current lyric.
 - Speech chunks may queue only within a small fixed bound. Preserve arrival
   order inside that bound; if it overflows, discard the oldest not-yet-started
-  chunk rather than allowing unbounded latency or memory growth.
+  chunk rather than allowing unbounded latency or memory growth. Retryable
+  provider cooldowns must retain and retry the failed chunk itself before later
+  queued speech, with a fixed per-chunk attempt limit. Newly captured chunks
+  may queue only within the same bound. If a chunk is finally lost by retry
+  exhaustion or queue overflow, append an explicit source-time gap marker to
+  the local session archive and show it in dated history; never imply a
+  complete transcript. Audio bytes remain in memory and are never archived.
+- Active caption status must report the actual audio source, whether capture
+  packets and speech-level input are arriving, and the age of the last
+  successful transcript. An isolated process with no audio must be described
+  as silent/missing input, not as a model timeout. Keep the small HUD concise
+  and provide the fuller state in the tray.
+- Keep the draggable audio-caption card inside the visible part of the bound
+  window and its monitor working area, including when that window extends
+  beyond a screen edge.
 - Empty, punctuation-only, tag-only, exact-repeat, and formatting-only ASR
   results never create lyric/history entries or trigger DeepSeek analysis.
+- Caption terminology repair may canonicalize only explicit, tested ASR
+  mishearings when nearby speech context supports the intended term. It must
+  not use open-ended LLM rewriting or fuzzy replacement of arbitrary words.
+  Preserve the original ASR text with a changed caption in dated local history
+  so users can audit the repair; leave uncertain phrases untouched.
 - Every active caption status must name the bound meeting window separately
   from the real audio source (`仅会议进程` or `全系统声音`);
   never imply that binding the overlay window isolates its audio.
 - Speech recognition is a distinct operation from text analysis.
   The current beta reuses an explicitly configured SiliconFlow endpoint/key for
-  transcription and explanations. TypeSafe Jev has its own validated configuration
+  transcription and explanations by default. A separately configured text
+  provider may serve clicked-message explanations and term lookups without
+  changing the SiliconFlow speech endpoint/key or background analysis route;
+  its endpoint, model, and credential must be saved as one validated, provider-
+  scoped set and must never silently fall back to another provider's key.
+  Choose the beta speech default from bounded
+  English-speech latency and accuracy checks, allow an explicit speech-model
+  override, and report the active model in health output. A file transcription
+  API is not a streaming latency guarantee. TypeSafe Jev has its own validated configuration
   entry and is used only for structured highlight judgments. Audio is sent
   only during an explicitly active meeting session, never saved automatically,
   and never written to logs.
+- API credentials are provider scoped: a DeepSeek or generic OpenAI environment
+  key must never override a saved SiliconFlow key for a SiliconFlow endpoint.
+  Explicit per-user settings saved through the app take precedence over ambient
+  endpoint, model and key environment variables. A saved key is usable only for
+  its normalized full endpoint identity; matching provider-specific environment
+  credentials fill missing keys only. A generic `OPENAI_API_KEY` may go to a
+  custom endpoint only when that endpoint is explicitly supplied by the same
+  environment configuration, never merely because it appears in a saved user
+  or project file. Apply the same boundary to a TypeSafe environment key.
+  Resolve the effective endpoint before
+  selecting a fallback credential. Health may name the credential source but
+  must never expose credential values, fingerprints or provider error bodies.
 - Starting the tray host or reading `/health` must never perform a billable
   model inference. A real validation call is allowed only when the user
   explicitly tests a new key or launches an explicitly marked live-model test.
@@ -93,25 +151,57 @@
 - Existing screen-caption OCR is compatibility-only diagnostics and must not be
   exposed as the live-caption input. Rapid transcription updates may refresh
   local terms immediately, but text-model refinement must be throttled.
-- Live-caption mode presents the recognized current line and previous committed
-  line as a desktop-lyric overlay: transparent background, no activation, and
-  mouse pass-through. It must never introduce an opaque caption rectangle.
+- Live audio captions present up to the two latest completed speech sentences
+  in a compact rolling box over the bound window. The box must be readable,
+  nonactivating, and confined to a bounded part of the window. Its header can
+  be dragged and its corner resized without taking foreground focus; keep the
+  position and size within the meeting window, persist explicit user layout
+  changes separately from model credentials, and restore them next session.
+  The initial position must clear common bottom playback controls. Existing
+  OCR lyric overlays remain mouse pass-through. The audio box must not cover
+  the full meeting picture or invent text while ASR
+  is pending or retrying. Existing screen-caption OCR retains the transparent
+  lyric presentation. Retain source-exact text in history and term lookup.
+- Explicitly opening subtitle history from the tray or caption box must make
+  its window visibly accessible above a topmost meeting player, including when
+  the history is empty; closing history must not clear the session transcript.
 - The lyric layer anchors above the recognized source caption where space permits,
   not at a fixed percentage that overlaps captions in resized windows. Never show
   the same text as both the previous and current line during partial revisions.
-- Caption history is session-memory only by default, bounded to the latest 5000
-  committed lines, and never written to disk automatically. Partial ASR updates
-  replace the pending line; a line is committed after a short stability delay or
-  replacement, so incremental fragments do not flood history or the model.
+- The user has explicitly requested dated, locally retained caption history.
+  Store committed transcript lines in per-session append-only UTF-8 records
+  under `%APPDATA%/RealtimeDictionary/caption-history/YYYY-MM-DD/`; the folder
+  date is the session start date. Never store audio, credentials, or model
+  responses there, and never upload archived lines without an explicit lookup,
+  translation or task action. The history window defaults to the current date,
+  offers a date picker for previous sessions, and keeps session boundaries and
+  line timestamps visible. Current in-memory history remains bounded to 5000
+  entries; archive browsing must not be replaced by incoming live updates.
+  A corrupt archive line must not prevent reading later valid lines. Do not
+  delete archived files when clearing the current on-screen session.
+  Partial ASR updates replace the pending line; a line is committed after a
+  short stability delay or replacement, so incremental fragments do not flood
+  history or the model.
+- While live captions append to history, preserve the reader's selected text and
+  scroll position when they are reviewing earlier lines. Follow new captions
+  only when the reader is already at the bottom and has no active selection.
+  Merely receiving or selecting captions must never trigger a translation call.
 - Users can explicitly export retained captions as UTF-8 text using a save dialog.
   Export shows full dates and times, reports failures, and never writes automatically.
 - Retained captions support explicit selected-text lookup with bounded sentence
   context, Chinese explanations, nested term links and back navigation even after
   the capture session ends. Hidden history windows must discard pending replies.
   Do not automatically send the whole transcript or query on every selection change.
+- Caption history may translate one explicitly selected passage or the current
+  caption line into Chinese on demand. Preserve the original transcript, reject
+  overlong selections instead of silently truncating them, and show translation
+  in a separate result area. Never bulk-send all retained captions implicitly.
 - Historical captions can explicitly request task extraction for the selected
   line and open the same confirmation editor. These actions work after capture
   stops. Clearing records invalidates pending lookups and task extractions.
+- A transient speech transport reset is retryable and keeps the active audio
+  capture running with bounded cooldown/queue behavior. Permanent provider
+  authentication or balance failures may stop capture and must say why.
 - History explanations must be scrollable, retain bounded context centered on
   the selection and ignore duplicate transcript refreshes while reading.
 - After a model lookup times out, return the local Chinese fallback immediately;
@@ -378,6 +468,9 @@
   adaptive audio segmentation, and the process-loopback activation bridge.
 - `native-host/windows_ocr.ps1`: thin bridge to the built-in Windows OCR engine.
 - `native-host/diagnostics/`: standalone visual targets used to verify follow behavior.
+- `media/`: public-facing demo media. Capture only synthetic test windows and
+  application overlays, never private chats, desktop background, credentials,
+  or real meeting audio. Keep GIFs small and label experimental behavior honestly.
 - `ocr_service.py`: fallback OCR service started only when Windows OCR fails.
 - `server.py`: term analysis and lookup service.
 - `outlook_calendar.py`: delegated Microsoft calendar login/check/create; tokens
@@ -415,10 +508,41 @@ PowerShell implementation behind it.
   Chinese omission when the same message makes the missing one-to-two-character
   word unambiguous; it must preserve every readable source fragment and never
   paraphrase. Accessibility-exact text is never rewritten.
+- The clicked-message panel's displayed sentence must remain selectable even
+  when analysis proposes no terms. Dragging a word or short phrase there offers
+  an explicit explain action using the current sentence as context; selecting
+  text alone never calls a model. Previously recognized terms retain their
+  visible emphasis and direct click-to-explain behavior. A missing highlight
+  must not strand the user or require copying the whole message.
 - Render accepted corrected text as the visible sentence and make each returned
   exact sentence term clickable in place. A term annotation must not hide the
   whole-message explanation. Keep raw OCR editable behind an explicit correction
   control; editing invalidates every pending result and requires a new request.
+- The clicked-message analysis returns knowledge terms and actionable schedule
+  candidates as separate collections from the same bounded request. A task is an
+  intended action tied to an explicit time expression, not the word `任务` or a
+  concept name by itself. Every candidate must retain an exact time span from the
+  accepted visible sentence; uncertain or example-only wording must not be shown
+  as a confirmed appointment. Show schedule candidates separately after the
+  whole-message meaning and term controls. Clicking `添加日程` opens the existing
+  editable reminder/calendar confirmation flow; never create anything on analysis
+  alone. Missing year, end time and UTC offset remain empty until confirmed.
+  Reject example framing such as `我打一个比方` even if the quoted sentence contains
+  a valid time and meeting verb. Preserve dotted month/day input such as `9.30
+  14:30` as the candidate's exact source phrase; `参加` plus a discussion event is
+  actionable. Never transfer a time from an example or neighboring message into
+  a real task. Calendar clarification may parse the dotted month/day, but may not
+  supply an unstated year, end time, or UTC offset.
+  When a timed example is excluded, the clicked-message panel must say it is an
+  example and direct the user to a message containing the actual arrangement;
+  do not show the generic no-task state as if task recognition failed. This
+  reason is display-only and never creates a calendar candidate.
+  A date and clock may be separated within one message clause by bounded event
+  wording such as `10月8号导员要开班会，到时候下午5点记得到`. Treat them as one
+  candidate only when the connector and actionable event are explicit and no
+  second date intervenes. Keep the entire date-to-clock span source-exact for
+  review, use a concise source-grounded title, and leave year/end/zone empty.
+  Do not join times across sentence boundaries, examples, or neighboring bubbles.
 - A model-proposed canonical lookup term may replace the editable query only
   after the local service verifies that it is a small OCR-like correction of
   the submitted text. Unrelated model renaming must be discarded.
@@ -461,7 +585,10 @@ PowerShell implementation behind it.
 
 ## Verification
 
-- Offline regression: `python -m unittest discover -s tests -v`
+- Offline regression: `python tests/run_offline.py`. The runner must isolate
+  `%APPDATA%` and provider credential environment variables before importing
+  application modules so tests cannot bill a live account or print a saved key
+  through a failing mock assertion.
 - Compile: `pwsh -File native-host/build.ps1`
 - Python syntax: `D:\Dev\anaconda\python.exe -m py_compile ocr_service.py server.py`
 - Service test: POST a passage to `/selection/analyze`, sample text to `/analyze`, and a term to `/lookup` with the token from `GET /session`; validate source-exact terms, entity offsets, and explanation output. Without the token all three endpoints must return 403, and a request with a foreign `Host` header must return 403.

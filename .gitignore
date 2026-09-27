@@ -17,6 +17,9 @@
 !/semantic-overlay/PRODUCT_SCOPE.md
 !/semantic-overlay/METRICS.md
 !/semantic-overlay/REAL_WORLD_TEST_PROTOCOL.md
+!/semantic-overlay/media/
+/semantic-overlay/media/*
+!/semantic-overlay/media/*.gif
 !/semantic-overlay/native-host/
 /semantic-overlay/native-host/*
 !/semantic-overlay/native-host/*.cs
@@ -32,6 +35,7 @@
 !/semantic-overlay/tests/
 /semantic-overlay/tests/*
 !/semantic-overlay/tests/test_*.py
+!/semantic-overlay/tests/run_offline.py
 !/semantic-overlay/tests/local_model_fixture.py
 !/semantic-overlay/tests/*.cjs
 !/semantic-overlay/vendor/

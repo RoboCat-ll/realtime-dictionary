@@ -59,8 +59,37 @@ class SpeechTests(unittest.TestCase):
             result = server.transcribe_audio(wav())
         self.assertEqual("你好 OneAPI", result["text"])
         request = opened.call_args.args[0]
-        self.assertIn(b'FunAudioLLM/SenseVoiceSmall', request.data)
+        self.assertIn(b'TeleAI/TeleSpeechASR', request.data)
         self.assertIn(b'speech.wav', request.data)
+
+    def test_transcription_repairs_only_context_supported_terms(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps({
+            "text": "我们明天下午和one api的同事举行book cam讨论会。"
+        }).encode()
+        with mock.patch.object(server, "API_KEY", "test-key"), \
+             mock.patch.object(server, "BASE_URL", "https://api.siliconflow.cn/v1"), \
+             mock.patch.object(server, "provider_urlopen", return_value=response):
+            result = server.transcribe_audio(wav())
+        self.assertEqual("我们明天下午和oneAPI的同事举行bootcamp讨论会。", result["text"])
+        self.assertEqual("我们明天下午和one api的同事举行book cam讨论会。",
+                         result["raw_text"])
+        self.assertEqual(2, result["term_corrections"])
+
+    def test_ambiguous_words_are_not_forced_into_terms(self):
+        source = "We need one API for the book cam device."
+        self.assertEqual((source, 0), server.repair_caption_terms(source))
+        self.assertEqual(("book cam 是摄像头型号。", 0),
+                         server.repair_caption_terms("book cam 是摄像头型号。"))
+
+    def test_speech_model_override_is_bounded(self):
+        with mock.patch.dict('os.environ', {"REALTIME_DICTIONARY_SPEECH_MODEL":
+                                            "FunAudioLLM/SenseVoiceSmall"}):
+            self.assertEqual("FunAudioLLM/SenseVoiceSmall", server.configured_speech_model())
+        with mock.patch.dict('os.environ', {"REALTIME_DICTIONARY_SPEECH_MODEL":
+                                            "unlisted/model"}):
+            with self.assertRaisesRegex(ValueError, "不支持"):
+                server.configured_speech_model()
 
     def test_silence_is_discarded_before_provider_request(self):
         with mock.patch.object(server, "API_KEY", "test-key"), \
@@ -110,3 +139,21 @@ class SpeechTests(unittest.TestCase):
                 server.transcribe_audio(wav())
         self.assertTrue(caught.exception.retryable)
         self.assertNotIn("private", str(caught.exception))
+
+    def test_reset_connection_is_retryable_without_stopping_capture(self):
+        with mock.patch.object(server, "API_KEY", "test-key"), \
+             mock.patch.object(server, "BASE_URL", "https://api.siliconflow.cn/v1"), \
+             mock.patch.object(server, "provider_urlopen",
+                               side_effect=ConnectionResetError("private peer detail")):
+            with self.assertRaisesRegex(server.SpeechProviderError, "正在重试") as caught:
+                server.transcribe_audio(wav())
+        self.assertTrue(caught.exception.retryable)
+        self.assertNotIn("private", str(caught.exception))
+
+    def test_provider_timeout_is_named_separately_from_network_failure(self):
+        with mock.patch.object(server, "API_KEY", "test-key"), \
+             mock.patch.object(server, "BASE_URL", "https://api.siliconflow.cn/v1"), \
+             mock.patch.object(server, "provider_urlopen", side_effect=TimeoutError()):
+            with self.assertRaisesRegex(server.SpeechProviderError, "超过25秒") as caught:
+                server.transcribe_audio(wav())
+        self.assertTrue(caught.exception.retryable)

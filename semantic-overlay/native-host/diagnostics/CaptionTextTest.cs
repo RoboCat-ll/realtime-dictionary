@@ -1,4 +1,8 @@
 using System;
+using System.Drawing;
+using System.IO;
+using System.Reflection;
+using System.Windows.Forms;
 
 namespace SemanticOverlay.NativeHost
 {
@@ -13,6 +17,121 @@ namespace SemanticOverlay.NativeHost
                 throw new InvalidOperationException("Formatting-only transcript changes were not normalized.");
             if (OverlayContext.NormalizeTranscriptIdentity("，。！？ …").Length != 0)
                 throw new InvalidOperationException("Punctuation-only transcript was accepted.");
+            var speech = OverlayContext.SplitCaptionSpeech(
+                "  First sentence. Second sentence! 这是第三句。 版本 3.5 仍正常");
+            if (speech.Count != 4 || speech[0].Text != "First sentence." ||
+                speech[1].Text != "Second sentence!" ||
+                speech[2].Text != "这是第三句。" ||
+                speech[3].Text != "版本 3.5 仍正常" ||
+                speech[1].Offset != 18 || speech[3].Offset != 42)
+                throw new InvalidOperationException("Speech segments or source offsets are incorrect.");
+            var backlog = new CaptionAudioBacklog(2);
+            DateTime started = new DateTime(2024, 2, 11, 10, 0, 0);
+            backlog.Enqueue(new byte[] { 1 }, started);
+            CaptionAudioChunk active = backlog.TakeNext();
+            backlog.Enqueue(new byte[] { 2 }, started.AddSeconds(1));
+            backlog.Enqueue(new byte[] { 3 }, started.AddSeconds(2));
+            CaptionAudioChunk overflow = backlog.Enqueue(new byte[] { 4 }, started.AddSeconds(3));
+            if (overflow == null || overflow.Wav[0] != 2 || backlog.PendingCount != 2 ||
+                !backlog.HoldForRetry(active))
+                throw new InvalidOperationException("Pending overflow or same-chunk retry was lost.");
+            CaptionAudioChunk retry = backlog.TakeNext();
+            if (!Object.ReferenceEquals(retry, active) || retry.Attempts != 2 ||
+                backlog.HoldForRetry(retry) || backlog.TakeNext().Wav[0] != 3)
+                throw new InvalidOperationException("Retry did not precede later speech or exceed its bound.");
+            using (var lyric = new CaptionLyricForm(String.Empty))
+            {
+                var target = new NativeRect { Left = 100, Top = 80, Right = 1380, Bottom = 800 };
+                lyric.ShowAudioLines("First sentence.", "Second sentence!", 18, target);
+                if (!NativeMethods.IsWindowVisible(lyric.Handle) ||
+                    lyric.Width < target.Width / 2 || lyric.Width > target.Width * 3 / 4 ||
+                    lyric.Height < 150 || lyric.Bottom > target.Bottom - 80)
+                    throw new InvalidOperationException("Live subtitle box is hidden or covers too much of the meeting.");
+                PropertyInfo style = typeof(CaptionLyricForm).GetProperty("CreateParams",
+                    BindingFlags.Instance | BindingFlags.NonPublic);
+                if ((((CreateParams)style.GetValue(lyric, null)).ExStyle &
+                     NativeMethods.WsExTransparent) != 0)
+                    throw new InvalidOperationException("Audio subtitle is still mouse transparent.");
+                bool historyRequested = false;
+                lyric.HistoryRequested += delegate { historyRequested = true; };
+                typeof(CaptionLyricForm).GetMethod("OnMouseDown",
+                    BindingFlags.Instance | BindingFlags.NonPublic).Invoke(lyric, new object[] {
+                        new MouseEventArgs(MouseButtons.Left, 1, lyric.Width - 20, 10, 0) });
+                if (!historyRequested)
+                    throw new InvalidOperationException("Caption history affordance did not respond.");
+                MethodInfo mouseDown = typeof(CaptionLyricForm).GetMethod("OnMouseDown",
+                    BindingFlags.Instance | BindingFlags.NonPublic);
+                MethodInfo mouseMove = typeof(CaptionLyricForm).GetMethod("OnMouseMove",
+                    BindingFlags.Instance | BindingFlags.NonPublic);
+                MethodInfo mouseUp = typeof(CaptionLyricForm).GetMethod("OnMouseUp",
+                    BindingFlags.Instance | BindingFlags.NonPublic);
+                FieldInfo mouseStart = typeof(CaptionLyricForm).GetField("mouseStart",
+                    BindingFlags.Instance | BindingFlags.NonPublic);
+                Rectangle beforeDrag = lyric.Bounds;
+                mouseDown.Invoke(lyric, new object[] { new MouseEventArgs(MouseButtons.Left, 1, 40, 10, 0) });
+                mouseStart.SetValue(lyric, new Point(Cursor.Position.X + 55, Cursor.Position.Y + 35));
+                mouseMove.Invoke(lyric, new object[] { new MouseEventArgs(MouseButtons.Left, 1, 40, 10, 0) });
+                mouseUp.Invoke(lyric, new object[] { new MouseEventArgs(MouseButtons.Left, 1, 40, 10, 0) });
+                if (lyric.Location == beforeDrag.Location)
+                    throw new InvalidOperationException("Audio subtitle header drag did not move the box.");
+                Rectangle beforeResize = lyric.Bounds;
+                mouseDown.Invoke(lyric, new object[] { new MouseEventArgs(MouseButtons.Left, 1,
+                    lyric.Width - 10, lyric.Height - 10, 0) });
+                mouseStart.SetValue(lyric, new Point(Cursor.Position.X - 60, Cursor.Position.Y - 35));
+                mouseMove.Invoke(lyric, new object[] { new MouseEventArgs(MouseButtons.Left, 1,
+                    lyric.Width - 10, lyric.Height - 10, 0) });
+                mouseUp.Invoke(lyric, new object[] { new MouseEventArgs(MouseButtons.Left, 1,
+                    lyric.Width - 10, lyric.Height - 10, 0) });
+                if (lyric.Width <= beforeResize.Width || lyric.Height <= beforeResize.Height)
+                    throw new InvalidOperationException("Audio subtitle corner drag did not resize the box.");
+                typeof(CaptionLyricForm).GetMethod("SetAudioBounds",
+                    BindingFlags.Instance | BindingFlags.NonPublic).Invoke(lyric, new object[] {
+                        new Rectangle(target.Left + 100, target.Top + 130, 800, 240) });
+                Rectangle positioned = lyric.Bounds;
+                lyric.PositionFor(target);
+                if (Math.Abs(lyric.Left - positioned.Left) > 1 ||
+                    Math.Abs(lyric.Top - positioned.Top) > 1 ||
+                    lyric.Size != positioned.Size)
+                    throw new InvalidOperationException("User subtitle layout was overwritten by tracking.");
+                System.Drawing.Rectangle word;
+                if (!lyric.TryGetCurrentRange(18, 6, out word) ||
+                    lyric.TryGetCurrentRange(0, 5, out word))
+                    throw new InvalidOperationException("Boxed caption term coordinates lost the source offset.");
+                string preview = Environment.GetEnvironmentVariable("CAPTION_UI_PREVIEW_PATH");
+                if (!String.IsNullOrWhiteSpace(preview))
+                {
+                    using (var bitmap = new System.Drawing.Bitmap(lyric.Width, lyric.Height))
+                    {
+                        lyric.DrawToBitmap(bitmap, new System.Drawing.Rectangle(0, 0, bitmap.Width, bitmap.Height));
+                        bitmap.Save(preview, System.Drawing.Imaging.ImageFormat.Png);
+                    }
+                }
+                lyric.ShowLines("older", "current", target);
+                if ((((CreateParams)style.GetValue(lyric, null)).ExStyle &
+                     NativeMethods.WsExTransparent) == 0)
+                    throw new InvalidOperationException("OCR lyric lost mouse pass-through.");
+            }
+            string layoutFixture = Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
+                "caption-layout-test.json");
+            var layoutTarget = new NativeRect { Left = 50, Top = 60, Right = 1450, Bottom = 900 };
+            Rectangle savedBounds;
+            using (var lyric = new CaptionLyricForm(layoutFixture))
+            {
+                lyric.ShowAudioLines("First.", "Second.", 7, layoutTarget);
+                typeof(CaptionLyricForm).GetMethod("SetAudioBounds",
+                    BindingFlags.Instance | BindingFlags.NonPublic).Invoke(lyric, new object[] {
+                        new Rectangle(240, 220, 850, 250) });
+                savedBounds = lyric.Bounds;
+                typeof(CaptionLyricForm).GetMethod("SaveAudioLayout",
+                    BindingFlags.Instance | BindingFlags.NonPublic).Invoke(lyric, null);
+            }
+            using (var lyric = new CaptionLyricForm(layoutFixture))
+            {
+                lyric.ShowAudioLines("First.", "Second.", 7, layoutTarget);
+                if (Math.Abs(lyric.Left - savedBounds.Left) > 1 ||
+                    Math.Abs(lyric.Top - savedBounds.Top) > 1 || lyric.Size != savedBounds.Size)
+                    throw new InvalidOperationException("Saved subtitle position or size was not restored.");
+            }
             if (!OverlayContext.IsChatProcessName("ChatGPT") ||
                 !OverlayContext.IsChatProcessName("WeChat") ||
                 OverlayContext.IsChatProcessName("explorer"))

@@ -1,6 +1,8 @@
 import os
+import io
 import json
 import re
+import subprocess
 import sys
 import threading
 import tempfile
@@ -18,14 +20,216 @@ import server
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_saved_text_provider_is_isolated_from_speech_provider(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_dir = os.path.join(directory, "RealtimeDictionary")
+            os.makedirs(config_dir)
+            with open(os.path.join(config_dir, "config.json"), "w", encoding="utf-8") as stream:
+                json.dump({"base_url": "https://api.siliconflow.cn/v1",
+                           "model": "speech-model", "api_key": "speech-key",
+                           "text_base_url": "https://api.deepseek.com/",
+                           "text_model": "deepseek-flash", "text_api_key": "text-key"}, stream)
+            with mock.patch.dict(os.environ, {"APPDATA": directory,
+                                              "DEEPSEEK_API_KEY": "unrelated-key"}, clear=True):
+                config = server.load_config()
+        self.assertEqual("speech-key", config["api_key"])
+        self.assertEqual("https://api.siliconflow.cn/v1", config["base_url"])
+        self.assertEqual("text-key", config["text_api_key"])
+        self.assertEqual("https://api.deepseek.com", config["text_base_url"])
+        self.assertEqual("saved_user", config["text_credential_source"])
+
+    def test_incomplete_text_provider_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_dir = os.path.join(directory, "RealtimeDictionary")
+            os.makedirs(config_dir)
+            with open(os.path.join(config_dir, "config.json"), "w", encoding="utf-8") as stream:
+                json.dump({"base_url": "https://api.siliconflow.cn/v1",
+                           "api_key": "speech-key",
+                           "text_base_url": "https://api.deepseek.com",
+                           "text_model": "deepseek-flash"}, stream)
+            with mock.patch.dict(os.environ, {"APPDATA": directory}, clear=True):
+                config = server.load_config()
+        self.assertEqual("speech-key", config["api_key"])
+        self.assertTrue(config["text_config_invalid"])
+        self.assertEqual("", config["text_api_key"])
+
+    def test_explicit_text_request_never_uses_speech_endpoint_or_key(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = (
+            b'{"choices":[{"message":{"content":"ok"}}]}')
+        with mock.patch.object(server, "provider_urlopen", return_value=response) as send, \
+                mock.patch.object(server, "BASE_URL", "https://api.siliconflow.cn/v1"), \
+                mock.patch.object(server, "API_KEY", "speech-key"), \
+                mock.patch.object(server, "TEXT_BASE_URL", "https://api.deepseek.com"), \
+                mock.patch.object(server, "TEXT_API_KEY", "text-key"), \
+                mock.patch.object(server, "CFG", {"text_config_invalid": False,
+                                                  "text_api_key": "text-key"}):
+            result = server.call_llm([{"role": "user", "content": "test"}],
+                                     model="deepseek-flash",
+                                     provider="text")
+        request = send.call_args.args[0]
+        self.assertEqual("ok", result)
+        self.assertEqual("https://api.deepseek.com/chat/completions", request.full_url)
+        self.assertEqual("Bearer text-key", request.get_header("Authorization"))
+        self.assertEqual("deepseek-flash", json.loads(request.data)["model"])
+
+    def test_incomplete_text_provider_cannot_inherit_speech_key(self):
+        with mock.patch.object(server, "CFG", {"text_config_invalid": True,
+                                                "text_api_key": ""}), \
+                mock.patch.object(server, "API_KEY", "speech-key"), \
+                mock.patch.object(server, "call_llm_with_deadline") as send:
+            result = server.analyze_selection("请解释 bootcamp")
+        self.assertEqual("local_unavailable", result["analysis_mode"])
+        send.assert_not_called()
+
+    def test_siliconflow_saved_key_is_not_overridden_by_deepseek_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_dir = os.path.join(directory, "RealtimeDictionary")
+            os.makedirs(config_dir)
+            with open(os.path.join(config_dir, "config.json"), "w", encoding="utf-8") as stream:
+                json.dump({"base_url": "https://api.siliconflow.cn/v1",
+                           "api_key": "saved-siliconflow-key"}, stream)
+            with mock.patch.dict(os.environ, {
+                "APPDATA": directory,
+                "DEEPSEEK_API_KEY": "unrelated-deepseek-key",
+                "OPENAI_API_KEY": "unrelated-openai-key",
+            }, clear=True):
+                self.assertEqual("saved-siliconflow-key", server.load_config()["api_key"])
+                os.environ["SILICONFLOW_API_KEY"] = "explicit-siliconflow-key"
+                self.assertEqual("saved-siliconflow-key", server.load_config()["api_key"])
+                self.assertEqual("saved_user", server.load_config()["credential_source"])
+
+    def test_provider_key_follows_effective_endpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_dir = os.path.join(directory, "RealtimeDictionary")
+            os.makedirs(config_dir)
+            with open(os.path.join(config_dir, "config.json"), "w", encoding="utf-8") as stream:
+                json.dump({"base_url": "https://api.siliconflow.cn/v1",
+                           "api_key": "saved-siliconflow-key"}, stream)
+            with mock.patch.dict(os.environ, {
+                "APPDATA": directory,
+                "OPENAI_BASE_URL": "https://api.deepseek.com/v1",
+                "DEEPSEEK_API_KEY": "matching-deepseek-key",
+                "SILICONFLOW_API_KEY": "unrelated-siliconflow-key",
+            }, clear=True):
+                config = server.load_config()
+                self.assertEqual("saved-siliconflow-key", config["api_key"])
+                self.assertEqual("https://api.siliconflow.cn/v1", config["base_url"])
+            with mock.patch.dict(os.environ, {
+                "APPDATA": directory,
+                "OPENAI_BASE_URL": "https://other.example/v1",
+                "DEEPSEEK_API_KEY": "unrelated-deepseek-key",
+            }, clear=True):
+                self.assertEqual("saved-siliconflow-key", server.load_config()["api_key"])
+
     def test_environment_endpoint_and_model_override_config_files(self):
-        with mock.patch.dict(os.environ, {
-            "OPENAI_BASE_URL": "https://api.siliconflow.cn/v1/",
-            "OPENAI_MODEL": "deepseek-ai/DeepSeek-V4-Flash",
-        }, clear=False):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {
+                "APPDATA": directory,
+                "OPENAI_BASE_URL": "https://api.siliconflow.cn/v1/",
+                "OPENAI_MODEL": "deepseek-ai/DeepSeek-V4-Flash",
+                "SILICONFLOW_API_KEY": "env-key",
+            }, clear=True):
             config = server.load_config()
         self.assertEqual("https://api.siliconflow.cn/v1", config["base_url"])
         self.assertEqual("deepseek-ai/DeepSeek-V4-Flash", config["model"])
+        self.assertEqual("env-key", config["api_key"])
+
+    def test_user_settings_win_over_ambient_endpoint_model_and_provider_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_dir = os.path.join(directory, "RealtimeDictionary")
+            os.makedirs(config_dir)
+            with open(os.path.join(config_dir, "config.json"), "w", encoding="utf-8") as stream:
+                json.dump({"base_url": "https://api.siliconflow.cn/v1/",
+                           "model": "saved-model", "api_key": "saved-key"}, stream)
+            with mock.patch.dict(os.environ, {
+                    "APPDATA": directory, "OPENAI_BASE_URL": "https://api.deepseek.com/v1",
+                    "OPENAI_MODEL": "ambient-model", "DEEPSEEK_API_KEY": "ambient-deepseek",
+                    "REALTIME_DICTIONARY_ANALYSIS_MODEL": "ambient-analysis",
+                    "SILICONFLOW_API_KEY": "ambient-siliconflow"}, clear=True):
+                config = server.load_config()
+        self.assertEqual("saved-model", config["model"])
+        self.assertEqual("", config["analysis_model"])
+        self.assertEqual("saved-key", config["api_key"])
+        self.assertEqual("saved_user", config["credential_source"])
+
+    def test_process_bootstrap_ignores_stale_specialized_model_overrides(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_dir = os.path.join(directory, "RealtimeDictionary")
+            os.makedirs(config_dir)
+            with open(os.path.join(config_dir, "config.json"), "w", encoding="utf-8") as stream:
+                json.dump({"base_url": "https://api.siliconflow.cn/v1",
+                           "model": "saved-model", "api_key": "saved-key"}, stream)
+            env = os.environ.copy()
+            env.update({"APPDATA": directory, "OPENAI_BASE_URL": "https://api.deepseek.com/v1",
+                        "OPENAI_MODEL": "ambient-model", "DEEPSEEK_API_KEY": "ambient-key",
+                        "REALTIME_DICTIONARY_LOOKUP_MODEL": "ambient-lookup",
+                        "REALTIME_DICTIONARY_SELECTION_MODEL": "ambient-selection",
+                        "REALTIME_DICTIONARY_ANALYSIS_MODEL": "ambient-analysis"})
+            output = subprocess.check_output([sys.executable, "-c",
+                "import json,server; print(json.dumps([server.BASE_URL, server.MODEL, "
+                "server.LOOKUP_MODEL, server.SELECTION_MODEL, server.ANALYSIS_MODEL, "
+                "server.CFG['credential_source']]))"],
+                cwd=PROJECT_ROOT, env=env, text=True)
+        self.assertEqual(["https://api.siliconflow.cn/v1", "saved-model",
+                     "Qwen/Qwen3.5-35B-A3B", "Qwen/Qwen2.5-7B-Instruct",
+                          "Qwen/Qwen3.5-35B-A3B", "saved_user"], json.loads(output))
+
+    def test_saved_key_is_rejected_if_project_endpoint_path_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "config.json")
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump({"base_url": "https://api.siliconflow.cn/v1",
+                           "api_key": "saved-key"}, stream)
+            with mock.patch.object(server, "HERE", directory), mock.patch.dict(os.environ, {
+                    "APPDATA": directory, "OPENAI_BASE_URL": "https://api.siliconflow.cn/v2",
+                    "SILICONFLOW_API_KEY": "env-key"}, clear=True):
+                config = server.load_config()
+        self.assertEqual("env-key", config["api_key"])
+        self.assertEqual("saved_key_endpoint_mismatch", config["configuration_warning"])
+        self.assertEqual("environment:SILICONFLOW_API_KEY", config["credential_source"])
+
+    def test_generic_environment_key_requires_explicit_environment_endpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_dir = os.path.join(directory, "RealtimeDictionary")
+            os.makedirs(config_dir)
+            with open(os.path.join(config_dir, "config.json"), "w", encoding="utf-8") as stream:
+                json.dump({"base_url": "https://custom.example/v1", "model": "custom-model"}, stream)
+            with mock.patch.dict(os.environ, {
+                    "APPDATA": directory, "OPENAI_API_KEY": "ambient-openai-key"}, clear=True):
+                self.assertEqual("", server.load_config()["api_key"])
+            with mock.patch.dict(os.environ, {
+                    "APPDATA": directory, "OPENAI_API_KEY": "ambient-openai-key",
+                    "OPENAI_BASE_URL": "https://custom.example/v1"}, clear=True):
+                self.assertEqual("", server.load_config()["api_key"])
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {
+                "APPDATA": directory, "OPENAI_API_KEY": "ambient-openai-key",
+                "OPENAI_BASE_URL": "https://custom.example/v1"}, clear=True):
+            config = server.load_config()
+        self.assertEqual("ambient-openai-key", config["api_key"])
+        self.assertEqual("environment:OPENAI_API_KEY", config["credential_source"])
+
+    def test_invalid_user_config_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_dir = os.path.join(directory, "RealtimeDictionary")
+            os.makedirs(config_dir)
+            with open(os.path.join(config_dir, "config.json"), "w", encoding="utf-8") as stream:
+                stream.write("{broken")
+            with mock.patch.dict(os.environ, {
+                    "APPDATA": directory, "SILICONFLOW_API_KEY": "ambient-key",
+                    "TYPESAFE_API_KEY": "ambient-typesafe"}, clear=True):
+                config = server.load_config()
+        self.assertEqual("", config["api_key"])
+        self.assertEqual("", config["typesafe_api_key"])
+        self.assertEqual("invalid_user_config", config["configuration_warning"])
+
+    def test_endpoint_identity_rejects_embedded_credentials_and_invalid_urls(self):
+        self.assertEqual(server.credential_endpoint_identity("https://api.siliconflow.cn/v1"),
+                         server.credential_endpoint_identity("https://API.SILICONFLOW.CN:443/v1/"))
+        for endpoint in ("https://user:secret@api.siliconflow.cn/v1",
+                         "https://api.siliconflow.cn/v1?key=secret",
+                         "http://api.siliconflow.cn/v1", "https://api.siliconflow.cn:bad/v1"):
+            with self.subTest(endpoint=endpoint):
+                self.assertIsNone(server.credential_endpoint_identity(endpoint))
 
     def test_typesafe_settings_load_from_user_config(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -43,7 +247,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual("https://example.typesafe.test", config["typesafe_base_url"])
         self.assertEqual("jev-fixture", config["typesafe_model"])
 
-    def test_typesafe_environment_overrides_user_config(self):
+    def test_typesafe_user_config_overrides_environment(self):
         with tempfile.TemporaryDirectory() as directory:
             config_dir = os.path.join(directory, "RealtimeDictionary")
             os.makedirs(config_dir)
@@ -52,11 +256,26 @@ class ConfigurationTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {
                 "APPDATA": directory,
                 "TYPESAFE_API_KEY": "environment-key",
+                "TYPESAFE_BASE_URL": "https://ambient.invalid",
                 "TYPESAFE_MODEL": "environment-model",
             }, clear=True):
                 config = server.load_config()
-        self.assertEqual("environment-key", config["typesafe_api_key"])
-        self.assertEqual("environment-model", config["typesafe_model"])
+        self.assertEqual("file-key", config["typesafe_api_key"])
+        self.assertEqual(server.DEFAULT_TYPESAFE_BASE_URL, config["typesafe_base_url"])
+        self.assertEqual("file-model", config["typesafe_model"])
+        self.assertEqual("saved_user", config["typesafe_credential_source"])
+
+    def test_typesafe_key_is_not_sent_to_custom_saved_endpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_dir = os.path.join(directory, "RealtimeDictionary")
+            os.makedirs(config_dir)
+            with open(os.path.join(config_dir, "config.json"), "w", encoding="utf-8") as stream:
+                json.dump({"typesafe_base_url": "https://custom.example"}, stream)
+            with mock.patch.dict(os.environ, {
+                    "APPDATA": directory, "TYPESAFE_API_KEY": "ambient-key",
+                    "TYPESAFE_BASE_URL": "https://custom.example"}, clear=True):
+                config = server.load_config()
+        self.assertEqual("", config["typesafe_api_key"])
 
     def test_typesafe_validation_requires_noul_probability(self):
         class Response:
@@ -95,8 +314,35 @@ class ConfigurationTests(unittest.TestCase):
         self.assertIn("analysis_provider", result)
         self.assertIn("explanation_model", result)
         self.assertEqual(server.SELECTION_MODEL, result["selection_model"])
+        self.assertEqual(server.CFG["credential_source"], result["credential_source"])
+        self.assertEqual(server.CFG["configuration_warning"], result["configuration_warning"])
         self.assertNotIn("api_key", result)
         self.assertNotIn("token", result)
+
+    def test_health_redacts_invalid_endpoint(self):
+        http = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        worker = threading.Thread(target=http.serve_forever, daemon=True)
+        worker.start()
+        try:
+            with mock.patch.object(server, "PORT", http.server_address[1]), \
+                    mock.patch.object(server, "BASE_URL", "https://user:private@invalid.example/v1"):
+                with urlopen("http://127.0.0.1:%d/health" % http.server_address[1], timeout=3) as response:
+                    raw = response.read().decode("utf-8")
+        finally:
+            http.shutdown()
+            http.server_close()
+        self.assertNotIn("private", raw)
+        self.assertEqual("<invalid>", json.loads(raw)["base_url"])
+
+    def test_provider_http_failure_does_not_include_response_body(self):
+        failure = HTTPError("https://api.siliconflow.cn/v1", 401, "denied", {},
+                            io.BytesIO(b"private provider message"))
+        with mock.patch.object(server, "API_KEY", "fixture-key"), \
+                mock.patch.object(server, "provider_urlopen", side_effect=failure):
+            with self.assertRaises(RuntimeError) as caught:
+                server.call_llm([{"role": "user", "content": "fixture"}])
+        self.assertEqual("API 错误 401", str(caught.exception))
+        self.assertNotIn("private", str(caught.exception))
 
 
 class LocalAnalysisTests(unittest.TestCase):
@@ -385,6 +631,57 @@ class OffsetCorrectionTests(unittest.TestCase):
 
 
 class SelectionAnalysisTests(unittest.TestCase):
+    def setUp(self):
+        with server.ANALYZE_CACHE_LOCK:
+            server.ANALYZE_CACHE.clear()
+
+    def test_selection_prompt_omits_duplicate_schedule_and_unchanged_source(self):
+        self.assertNotIn('"actions"', server.SELECTION_PROMPT)
+        self.assertIn("corrected_text 必须为空字符串", server.SELECTION_PROMPT)
+
+    def test_successful_selection_is_reused_but_edit_is_not(self):
+        generated = json.dumps({"explanation": "这里在讨论训练营。", "terms": []},
+                               ensure_ascii=False)
+        with mock.patch.object(server, "API_KEY", "test-key"), \
+                mock.patch.object(server, "call_llm_with_deadline",
+                                  return_value=generated) as send:
+            first = server.analyze_selection("讨论 bootcamp")
+            first["explanation"] = "changed by caller"
+            second = server.analyze_selection("讨论 bootcamp")
+            edited = server.analyze_selection("讨论新的 bootcamp")
+        self.assertEqual(2, send.call_count)
+        self.assertEqual("这里在讨论训练营。", second["explanation"])
+        self.assertTrue(second["analysis_cached"])
+        self.assertFalse(edited.get("analysis_cached", False))
+
+    def test_failed_selection_is_not_cached(self):
+        generated = json.dumps({"explanation": "这里在讨论训练营。", "terms": []},
+                               ensure_ascii=False)
+        with mock.patch.object(server, "API_KEY", "test-key"), \
+                mock.patch.object(server, "call_llm_with_deadline",
+                                  side_effect=[TimeoutError("slow"), generated]) as send:
+            failed = server.analyze_selection("请解释这个 bootcamp")
+            recovered = server.analyze_selection("请解释这个 bootcamp")
+        self.assertEqual("local_fallback", failed["analysis_mode"])
+        self.assertEqual("model", recovered["analysis_mode"])
+        self.assertEqual(2, send.call_count)
+
+    def test_explicit_selection_refresh_bypasses_cache(self):
+        first_reply = json.dumps({"explanation": "第一种解释。", "terms": []},
+                                 ensure_ascii=False)
+        second_reply = json.dumps({"explanation": "第二种解释。", "terms": []},
+                                  ensure_ascii=False)
+        with mock.patch.object(server, "API_KEY", "test-key"), \
+                mock.patch.object(server, "call_llm_with_deadline",
+                                  side_effect=[first_reply, second_reply]) as send:
+            first = server.analyze_selection("解释 bootcamp")
+            refreshed = server.analyze_selection("解释 bootcamp", refresh=True)
+            cached = server.analyze_selection("解释 bootcamp")
+        self.assertEqual(2, send.call_count)
+        self.assertNotEqual(first["explanation"], refreshed["explanation"])
+        self.assertEqual(refreshed["explanation"], cached["explanation"])
+        self.assertTrue(cached["analysis_cached"])
+
     def test_selection_terms_must_be_exact_complete_source_terms(self):
         source = "我们用 Bootcamp 学习 oneAPI，随后休息。"
         generated = json.dumps({
@@ -425,11 +722,18 @@ class SelectionAnalysisTests(unittest.TestCase):
         source = "和。neapi同事约一个b。。tcamp，然后说 one a pi 2026/09/"
         repaired, changed = server.repair_selection_ocr_locally(source)
         self.assertTrue(changed)
-        self.assertEqual("和。oneAPI同事约一个bootcamp，然后说 oneAPI", repaired)
+        self.assertEqual("和oneAPI同事约一个bootcamp，然后说 oneAPI", repaired)
         ordinary, changed = server.repair_selection_ocr_locally(
             "we use ordinary words in this sentence")
         self.assertFalse(changed)
         self.assertEqual("we use ordinary words in this sentence", ordinary)
+
+        unrelated, changed = server.repair_selection_ocr_locally("他说。oneAPI 是另一个项目")
+        self.assertFalse(changed)
+        self.assertEqual("他说。oneAPI 是另一个项目", unrelated)
+        uncorrected, changed = server.repair_selection_ocr_locally("我和。ordinary words")
+        self.assertFalse(changed)
+        self.assertEqual("我和。ordinary words", uncorrected)
 
     def test_selection_local_ocr_repair_restores_uniquely_repeated_category_label(self):
         source = ("或者说任务或者时间安排，这句话要能自动被识别成/ "
@@ -453,6 +757,11 @@ class SelectionAnalysisTests(unittest.TestCase):
         self.assertFalse(changed)
         self.assertIn("/", unrelated)
 
+        split_glyph, changed = server.repair_selection_ocr_locally(
+            "要能被识另刂成任务，然后 oneAPI 是知识点")
+        self.assertTrue(changed)
+        self.assertIn("识别成任务", split_glyph)
+
     def test_selection_ocr_correction_rejects_paraphrase_and_exact_text_rewrite(self):
         source = "我们9月3号下午开会讨论 oneAPI"
         generated = json.dumps({
@@ -470,6 +779,24 @@ class SelectionAnalysisTests(unittest.TestCase):
         self.assertEqual(source, ocr["display_text"])
         self.assertFalse(exact["ocr_corrected"])
         self.assertEqual(source, exact["display_text"])
+
+    def test_selection_ambiguous_oneapi_colleague_does_not_invent_product_identity(self):
+        source = "我和 oneAPI 的同事约一个 bootcamp 讨论会"
+        generated = json.dumps({
+            "explanation": "约同事讨论。",
+            "terms": [{"text": "oneAPI", "explanation": "某厂商的 API 开发工具包。"}],
+        }, ensure_ascii=False)
+        result = server.extract_selection_json(generated, source)
+        self.assertEqual("oneAPI", result["terms"][0]["text"])
+        self.assertIn("原句没有说明", result["terms"][0]["explanation"])
+        self.assertNotIn("开发工具包", result["terms"][0]["explanation"])
+        local_oneapi = next(item for item in server.selection_local_terms(source)
+                            if item["text"].casefold() == "oneapi")
+        self.assertIn("原句没有说明", local_oneapi["explanation"])
+
+        clear_context = "oneAPI 是这个项目使用的 API 开发工具包"
+        result = server.extract_selection_json(generated, clear_context)
+        self.assertEqual("某厂商的 API 开发工具包。", result["terms"][0]["explanation"])
 
     def test_selection_ocr_correction_restores_only_tiny_context_unique_chinese_omission(self):
         source = "或者说任务或者时间安排，这句话要能自动被识别成/ oneAPI是知识点"
@@ -516,6 +843,168 @@ class SelectionAnalysisTests(unittest.TestCase):
         self.assertEqual("model", result["analysis_mode"])
         self.assertEqual(["GitHub"], [item["text"] for item in result["terms"]])
 
+    def test_explicit_oo_in_object_oriented_context_remains_clickable(self):
+        source = "你说的 OO 其实就是面向对象，class、继承、多态那套。"
+        generated = json.dumps({"explanation": "这里的 OO 指面向对象。",
+                                "terms": [{"text": "class", "explanation": "类。"}]},
+                               ensure_ascii=False)
+        with mock.patch.object(server, "API_KEY", "test-key"), \
+                mock.patch.object(server, "call_llm_with_deadline",
+                                  return_value=generated):
+            result = server.analyze_selection(source)
+        terms = {item["text"]: item["explanation"] for item in result["terms"]}
+        self.assertIn("OO", terms)
+        self.assertIn("面向对象", terms["OO"])
+
+    def test_selection_separates_knowledge_terms_and_confirmable_schedule(self):
+        source = "我们9月3号下午14:00和oneAPI的同事约一个bootcamp讨论会"
+        generated = json.dumps({
+            "explanation": "约同事开一场讨论会。",
+            "terms": [{"text": "oneAPI", "explanation": "语境中的名称。"},
+                      {"text": "bootcamp", "explanation": "集中讨论活动。"}],
+            "actions": [{"text": "9月3号下午14:00",
+                         "title": "与 oneAPI 同事进行 bootcamp 讨论会"}],
+        }, ensure_ascii=False)
+        with mock.patch.object(server, "API_KEY", "test-key"), \
+                mock.patch.object(server, "call_llm_with_deadline",
+                                  return_value=generated) as call:
+            result = server.analyze_selection(source)
+        self.assertEqual(1, call.call_count)
+        self.assertEqual(["oneAPI", "bootcamp"],
+                         [item["text"] for item in result["terms"]])
+        self.assertEqual(1, len(result["actions"]))
+        action = result["actions"][0]
+        self.assertEqual(action["text"], result["display_text"][action["start"]:action["end"]])
+        self.assertEqual("与oneAPI的同事约一个bootcamp讨论会", action["title"])
+        self.assertTrue(action["needs_confirmation"])
+        self.assertEqual(("", "", ""),
+                         (action["start_iso"], action["end_iso"], action["utc_offset"]))
+
+    def test_selection_rejects_unsupported_or_example_task(self):
+        source = "oneAPI是知识点，任务也是一个词。比如我们9月3号下午14:00约开会。"
+        generated = json.dumps({
+            "explanation": "这句话举例区分知识点与任务。", "terms": [],
+            "actions": [{"text": "9月3号下午14:00", "title": "开会"}],
+        }, ensure_ascii=False)
+        result = server.extract_selection_json(generated, source)
+        self.assertEqual([], result["actions"])
+        self.assertEqual("example_excluded",
+                         server.selection_action_status(source, result["actions"]))
+        unsupported = server.selection_actions(
+            "明天提交报告", [{"text": "明天", "title": "提交报告"}])
+        self.assertEqual([], unsupported)
+
+    def test_qq_example_is_not_work_but_dotted_real_meeting_is(self):
+        example = ("或者说任务，或者时间安排。我打一个比方“我们9月3号下午14:00"
+                   "和oneAPI的同事约一个bootcamp讨论会啊”这句话要能自动被识别成任务，"
+                   "然后oneAPI是知识点，bootcamp是知识点")
+        generated = json.dumps({
+            "explanation": "说话人在举例说明任务与知识点的区别。",
+            "terms": [],
+            "actions": [{"text": "9月3号下午14:00", "title": "与同事约讨论会"}],
+        }, ensure_ascii=False)
+        self.assertEqual([], server.extract_selection_json(generated, example)["actions"])
+        self.assertEqual([], server.selection_actions(example))
+        self.assertEqual("example_excluded",
+                         server.selection_action_status(example, []))
+        with mock.patch.object(server, "API_KEY", "test-key"), \
+                mock.patch.object(server, "call_llm_with_deadline",
+                                  return_value=generated):
+            self.assertEqual("example_excluded",
+                             server.analyze_selection(example)["action_status"])
+
+        real = "9.30 14:30 参加 Bootcamp 的讨论会"
+        action = server.selection_actions(real, [])[0]
+        self.assertEqual("9.30 14:30", action["text"])
+        self.assertEqual(action["text"], real[action["start"]:action["end"]])
+        self.assertEqual("参加 Bootcamp 的讨论会", action["title"])
+        self.assertEqual("candidate", server.selection_action_status(real, [action]))
+        self.assertEqual(("", "", ""),
+                         (action["start_iso"], action["end_iso"], action["utc_offset"]))
+
+        combined = example + "。" + real
+        self.assertEqual(["9.30 14:30"],
+                         [item["text"] for item in server.selection_actions(combined)])
+
+    def test_selection_local_fallback_keeps_only_explicit_schedule(self):
+        with mock.patch.object(server, "selected_text_key", return_value=""):
+            result = server.analyze_selection("明天下午14:00和同事开会")
+            self.assertEqual(1, len(result["actions"]))
+            self.assertEqual("明天下午14:00", result["actions"][0]["text"])
+            no_task = server.analyze_selection("任务和oneAPI是知识点")
+        self.assertEqual([], no_task["actions"])
+
+    def test_selection_keeps_exact_schedule_when_model_omits_actions(self):
+        source = "我们10月3号下午14:00和同事约一个讨论会"
+        generated = json.dumps({"explanation": "约同事讨论。", "terms": [],
+                                "actions": []}, ensure_ascii=False)
+        result = server.extract_selection_json(generated, source)
+        self.assertEqual(1, len(result["actions"]))
+        action = result["actions"][0]
+        self.assertEqual(action["text"], source[action["start"]:action["end"]])
+        self.assertEqual("", action["start_iso"])
+
+    def test_spaced_dates_and_tonight_are_candidates_without_admitting_examples(self):
+        meeting = "2026 年 9 月 30 日 14:30 参加 Bootcamp 讨论会，提前准备三个问题。"
+        customer = "2026 年 9 月 28 日 10:00 跟客户对齐需求，你准备一下 demo。"
+        deadline = "2026 年 10 月 2 日 17:00 前交周报，别忘了。"
+        tonight = "今晚八点腾讯会议，链接我等下发群里。"
+        for source in (meeting, customer, deadline, tonight):
+            with self.subTest(source=source):
+                actions = server.selection_actions(source)
+                self.assertEqual(1, len(actions))
+                self.assertEqual("candidate", server.selection_action_status(source, actions))
+                self.assertEqual(actions[0]["text"],
+                                 source[actions[0]["start"]:actions[0]["end"]])
+                self.assertTrue(actions[0]["needs_confirmation"])
+
+        self.assertEqual("参加 Bootcamp 讨论会",
+                         server.selection_actions(meeting)[0]["title"])
+        self.assertEqual("跟客户对齐需求",
+                         server.selection_actions(customer)[0]["title"])
+        self.assertEqual("交周报",
+                         server.selection_actions(deadline)[0]["title"])
+        self.assertEqual("腾讯会议",
+                         server.selection_actions(tonight)[0]["title"])
+
+        example = ('打个比方，"2026 年 9 月 30 日 14:30 参加 Bootcamp '
+                   '讨论会"只是示例，不需要加入日程。')
+        self.assertEqual([], server.selection_actions(example))
+        self.assertEqual("example_excluded",
+                         server.selection_action_status(example, []))
+        self.assertEqual([], server.selection_actions("周三之前把方案初稿发我"))
+        self.assertEqual([], server.selection_actions("9月30日\n14:30参加讨论会"))
+
+    def test_separated_meeting_date_and_clock_is_one_confirmable_task(self):
+        source = "10月8号导员要开班会，到时候下午5点记得到"
+        generated = json.dumps({"explanation": "导员安排班会，提醒参加。",
+                                "terms": [], "actions": []}, ensure_ascii=False)
+        with mock.patch.object(server, "API_KEY", "test-key"), \
+                mock.patch.object(server, "call_llm_with_deadline",
+                                  return_value=generated):
+            result = server.analyze_selection(source)
+        self.assertEqual("candidate", result["action_status"])
+        self.assertEqual(1, len(result["actions"]))
+        action = result["actions"][0]
+        self.assertEqual("10月8号导员要开班会，到时候下午5点", action["text"])
+        self.assertEqual(action["text"], source[action["start"]:action["end"]])
+        self.assertEqual("参加班会", action["title"])
+        self.assertEqual(("", "", ""),
+                         (action["start_iso"], action["end_iso"], action["utc_offset"]))
+
+    def test_separated_times_do_not_cross_example_sentence_or_second_date(self):
+        example = "我打一个比方：10月8号导员要开班会，到时候下午5点记得到"
+        self.assertEqual([], server.selection_actions(example))
+        self.assertEqual("example_excluded",
+                         server.selection_action_status(example, []))
+        separate = "10月8号导员要开班会。下午5点记得到"
+        self.assertEqual([], server.selection_actions(separate))
+        unrelated = "10月8号开班会，到时候10月9号下午5点另约讨论"
+        self.assertEqual(["10月9号下午5点"],
+                         [item["text"] for item in server.selection_actions(unrelated)])
+        no_connector = "10月8号导员要开班会，下午5点新闻更新"
+        self.assertEqual([], server.selection_actions(no_connector))
+
     def test_selection_timeout_discloses_timeout_instead_of_generic_unavailable(self):
         with mock.patch.object(server, "API_KEY", "test-key"), \
                 mock.patch.object(server, "call_llm_with_deadline",
@@ -526,7 +1015,7 @@ class SelectionAnalysisTests(unittest.TestCase):
         self.assertEqual("模型请求超时", result["notice"])
 
     def test_selection_without_model_is_honest_and_offline(self):
-        with mock.patch.object(server, "API_KEY", ""), \
+        with mock.patch.object(server, "selected_text_key", return_value=""), \
                 mock.patch.object(server, "call_llm_with_deadline") as call:
             result = server.analyze_selection("使用 bootcamp 学习")
         call.assert_not_called()
@@ -539,6 +1028,30 @@ class SelectionAnalysisTests(unittest.TestCase):
             "oneAPI 可以统一工具链，后面再次提到 oneAPI 和 bootcamp")
         self.assertEqual(["oneAPI", "bootcamp"],
                          [item["text"] for item in terms])
+
+    def test_pmf_fallback_uses_product_context_without_guessing_other_contexts(self):
+        source = "这轮投放先停，PMF 还没验证。"
+        with mock.patch.object(server, "API_KEY", "test-key"), \
+                mock.patch.object(server, "call_llm_with_deadline",
+                                  side_effect=TimeoutError("slow")):
+            result = server.analyze_selection(source)
+        self.assertEqual("local_fallback", result["analysis_mode"])
+        self.assertEqual(source, result["display_text"])
+        self.assertEqual(["PMF"], [item["text"] for item in result["terms"]])
+        self.assertIn("产品市场匹配", result["terms"][0]["explanation"])
+        self.assertEqual([], server.selection_local_terms("财报中的 PMF 指标待确认"))
+
+    def test_pmf_model_misexpansion_is_guarded_in_passage_and_term(self):
+        source = "没到 PMF 之前别放大投放。"
+        generated = json.dumps({
+            "explanation": "PMF 是产品管理负责人，建议扩大投放。",
+            "terms": [{"text": "PMF", "explanation": "产品管理框架。"}],
+        }, ensure_ascii=False)
+        result = server.extract_selection_json(generated, source)
+        self.assertNotIn("产品管理负责人", result["explanation"])
+        self.assertIn("产品市场匹配", result["explanation"])
+        self.assertEqual(["PMF"], [item["text"] for item in result["terms"]])
+        self.assertIn("产品市场匹配", result["terms"][0]["explanation"])
 
     def test_selection_http_requires_token_and_rejects_oversize_text(self):
         http = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
@@ -756,13 +1269,16 @@ class LookupContextTests(unittest.TestCase):
             self.assertEqual(15, timeout)
             return Response()
 
+        timing = {}
         with mock.patch.object(server, "API_KEY", "test-key"), \
                 mock.patch.object(server, "BASE_URL", "https://api.deepseek.com"), \
                 mock.patch.object(server, "provider_urlopen", side_effect=open_request):
-            server.call_llm([{"role": "user", "content": "RAG"}])
+            server.call_llm([{"role": "user", "content": "RAG"}], timing=timing)
         self.assertEqual({"type": "disabled"}, captured["thinking"])
         self.assertEqual(600, captured["max_tokens"])
         self.assertEqual({"type": "json_object"}, captured["response_format"])
+        self.assertEqual("complete", timing["phase"])
+        self.assertLessEqual(timing["headers_ms"], timing["read_ms"])
 
     def test_siliconflow_uses_its_no_thinking_parameter(self):
         payload = {}

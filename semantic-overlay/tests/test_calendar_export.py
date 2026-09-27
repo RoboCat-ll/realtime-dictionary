@@ -19,6 +19,35 @@ class CalendarExportTests(unittest.TestCase):
         self.assertEqual('', result['start'])
         self.assertTrue(any('哪一年' in item for item in result['missing']))
 
+    def test_dotted_meeting_date_retains_explicit_day_and_requires_year(self):
+        result = clarify_calendar({'time_text': '9.30 14:30', 'supplement': ''})
+        self.assertEqual('', result['start'])
+        self.assertTrue(any('哪一年' in item for item in result['missing']))
+        self.assertFalse(any('几月几日' in item for item in result['missing']))
+        self.assertFalse(any('几点开始' in item for item in result['missing']))
+        completed = clarify_calendar({
+            'time_text': '9.30 14:30',
+            'supplement': '2027年，持续1小时，北京时间'})
+        self.assertEqual('2027-09-30T14:30', completed['start'])
+        self.assertEqual('2027-09-30T15:30', completed['end'])
+        self.assertEqual('+08:00', completed['utc_offset'])
+        corrected = clarify_calendar({
+            'time_text': '9月3号下午14:00',
+            'supplement': '改为2027年9.30 14:30，持续1小时，北京时间'})
+        self.assertEqual('2027-09-30T14:30', corrected['start'])
+
+    def test_split_meeting_phrase_clarifies_without_inventing_year_or_length(self):
+        phrase = '10月8号导员要开班会，到时候下午5点'
+        unresolved = clarify_calendar({'time_text': phrase, 'supplement': ''})
+        self.assertEqual('', unresolved['start'])
+        self.assertTrue(any('哪一年' in item for item in unresolved['missing']))
+        self.assertFalse(any('几点开始' in item for item in unresolved['missing']))
+        completed = clarify_calendar({
+            'time_text': phrase,
+            'supplement': '2027年，持续1小时，北京时间'})
+        self.assertEqual('2027-10-08T17:00', completed['start'])
+        self.assertEqual('2027-10-08T18:00', completed['end'])
+
     def test_boss_sentence_explicit_year_duration_zone(self):
         result = clarify_calendar({'time_text': '9月3号下午14:00',
                                    'supplement': '2027年，持续1小时，北京时间'})

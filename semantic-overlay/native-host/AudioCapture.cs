@@ -35,6 +35,9 @@ namespace SemanticOverlay.NativeHost
         private int voicedSamples;
         private int attackSamples;
         private double noiseFloor = 0.0010;
+        private long lastPacketTicks;
+        private long lastVoiceTicks;
+        private int recentLevelBars;
         private bool active;
         private bool disposed;
 
@@ -42,6 +45,17 @@ namespace SemanticOverlay.NativeHost
         public event Action<string> Failed;
 
         public bool IsProcessIsolated { get; private set; }
+        public DateTime LastPacketUtc
+        {
+            get { long ticks = Interlocked.Read(ref lastPacketTicks);
+                return ticks == 0 ? DateTime.MinValue : new DateTime(ticks, DateTimeKind.Utc); }
+        }
+        public DateTime LastVoiceUtc
+        {
+            get { long ticks = Interlocked.Read(ref lastVoiceTicks);
+                return ticks == 0 ? DateTime.MinValue : new DateTime(ticks, DateTimeKind.Utc); }
+        }
+        public int RecentLevelBars { get { return Volatile.Read(ref recentLevelBars); } }
 
         public SystemAudioCaptionCapture(uint? processId)
         {
@@ -169,6 +183,11 @@ namespace SemanticOverlay.NativeHost
                 if (disposed) return null;
                 double threshold = Math.Max(MinimumVoiceThreshold, noiseFloor * NoiseMultiplier);
                 bool speech = rms >= threshold && peak >= threshold * 1.55;
+                long nowTicks = DateTime.UtcNow.Ticks;
+                Interlocked.Exchange(ref lastPacketTicks, nowTicks);
+                Volatile.Write(ref recentLevelBars,
+                    Math.Max(0, Math.Min(4, (int)Math.Round(rms * 70))));
+                if (speech) Interlocked.Exchange(ref lastVoiceTicks, nowTicks);
                 bool startedNow = false;
                 if (!active)
                 {

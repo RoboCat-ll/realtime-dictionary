@@ -16,6 +16,14 @@
 
 产品范围、指标和真实验收分别见 [PRODUCT_SCOPE.md](semantic-overlay/PRODUCT_SCOPE.md)、[METRICS.md](semantic-overlay/METRICS.md) 与 [REAL_WORLD_TEST_PROTOCOL.md](semantic-overlay/REAL_WORLD_TEST_PROTOCOL.md)。
 
+## 效果演示
+
+主流程是 `Ctrl+Alt+K` → 单击微信或 QQ 的一条消息 → 阅读整句解释 → 按需点术语查看注释。下图展示独立的**会议字幕实验功能**：程序从合成语音测试窗口接收音频，在悬浮框里逐句显示英文字幕，并修正 `oneAPI`、`bootcamp` 等术语。
+
+![合成语音会议字幕演示](semantic-overlay/media/meeting-captions.gif)
+
+动图剪去了等待片段，仅演示界面效果，不能用来衡量延迟或证明真实会议的长时间稳定性。
+
 ## 从源码运行
 
 需要 Windows x64、系统 .NET Framework C# 编译器、Windows PowerShell（Windows OCR 桥接）及 Python 3.10+。Windows 需安装所用语言的 OCR 组件。会议进程音频隔离能力取决于 Windows 版本和目标应用。

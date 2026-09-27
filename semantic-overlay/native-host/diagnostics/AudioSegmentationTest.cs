@@ -24,6 +24,9 @@ namespace SemanticOverlay.NativeHost
                 byte[] completed = null;
                 for (int index = 0; index < 35; index++)
                     completed = capture.ProcessMonoSamples(Frame(4200, index)) ?? completed;
+                if (capture.LastPacketUtc == DateTime.MinValue ||
+                    capture.LastVoiceUtc == DateTime.MinValue || capture.RecentLevelBars == 0)
+                    throw new InvalidOperationException("Live audio activity was not exposed to status.");
                 for (int index = 0; index < 40; index++)
                     completed = capture.ProcessMonoSamples(Frame(0, 0)) ?? completed;
                 if (completed == null || completed.Length < 16000)

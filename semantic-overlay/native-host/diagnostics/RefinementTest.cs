@@ -18,6 +18,9 @@ namespace SemanticOverlay.NativeHost
         static void Set(object o, string n, object v) { o.GetType().GetField(n, Flags).SetValue(o, v); }
         static T Get<T>(object o, string n) { return (T)o.GetType().GetField(n, Flags).GetValue(o); }
         static void Call(object o, string n, params object[] a) { o.GetType().GetMethod(n, Flags).Invoke(o, a); }
+        static T CallResult<T>(object o, string n, params object[] a) {
+            return (T)o.GetType().GetMethod(n, Flags).Invoke(o, a);
+        }
         static void Assert(bool ok, string message) { if (!ok) throw new Exception(message); }
         static void Pump(Func<bool> done)
         {
@@ -59,6 +62,40 @@ namespace SemanticOverlay.NativeHost
                 !OverlayContext.IsMessageClickArmed(armNow, DateTime.MinValue),
                 "One-shot message click arming did not honor its deadline");
             Console.WriteLine("message-click-one-shot-deadline-ok");
+            IntPtr captionTarget = new IntPtr(23);
+            Assert(OverlayContext.ShouldReuseCaptionSession(true, captionTarget, captionTarget) &&
+                !OverlayContext.ShouldReuseCaptionSession(false, captionTarget, captionTarget) &&
+                !OverlayContext.ShouldReuseCaptionSession(true, captionTarget, new IntPtr(24)) &&
+                !OverlayContext.ShouldReuseCaptionSession(true, IntPtr.Zero, IntPtr.Zero),
+                "Repeated caption hotkey would restart an active target or block switching targets");
+            Console.WriteLine("caption-repeat-hotkey-reuses-active-target-ok");
+            using (var consent = new CaptionConsentForm())
+            {
+                Assert(!consent.RememberApproval,
+                    "Meeting audio prompt suppression was selected without user choice");
+                Get<CheckBox>(consent, "remember").Checked = true;
+                Assert(consent.RememberApproval,
+                    "Meeting audio prompt did not expose a remember-my-choice option");
+            }
+            using (var captionStatus = new CaptionStatusForm())
+            {
+                IntPtr foregroundBefore = NativeMethods.GetForegroundWindow();
+                Rectangle working = Screen.PrimaryScreen.WorkingArea;
+                captionStatus.ShowState("字幕：正在连接音源…", new NativeRect {
+                    Left = working.Left + 50, Top = working.Top + 50,
+                    Right = working.Left + 650, Bottom = working.Top + 450 });
+                Assert(NativeMethods.IsWindowVisible(captionStatus.Handle) &&
+                    Get<Label>(captionStatus, "label").Text.Contains("连接音源") &&
+                    NativeMethods.GetForegroundWindow() == foregroundBefore,
+                    "Caption startup indicator was hidden or activated itself");
+                captionStatus.ShowState("字幕：正在收音 · 等待发言", new NativeRect {
+                    Left = working.Left + 50, Top = working.Top + 50,
+                    Right = working.Left + 650, Bottom = working.Top + 450 });
+                Assert(Get<Label>(captionStatus, "label").Text.Contains("正在收音"),
+                    "Caption indicator did not distinguish listening from startup");
+                captionStatus.Hide();
+            }
+            Console.WriteLine("caption-consent-remember-and-nonactivating-status-ok");
             Assert(OverlayContext.IsModelAnalysisMode("jev") &&
                 OverlayContext.IsModelAnalysisMode("llm") &&
                 OverlayContext.IsModelAnalysisMode("local_strong") &&
@@ -240,8 +277,10 @@ namespace SemanticOverlay.NativeHost
                     "Definition feedback actions were not shown for a completed explanation");
             }
             Console.WriteLine("definition-outcome-feedback-visible-ok");
+            HighlightItem offeredTask = null;
             using (var service = new ServiceManager())
-            using (var selection = new SelectionAnalysisForm(service))
+            using (var selection = new SelectionAnalysisForm(service,
+                delegate(HighlightItem item, Form owner) { offeredTask = item; }))
             {
                 selection.OpenText("OCR 识别的 bootcamp 段落", false, "ocr", "qq");
                 Application.DoEvents();
@@ -250,7 +289,8 @@ namespace SemanticOverlay.NativeHost
                 Button analyze = Get<Button>(selection, "analyze");
                 Label sourceNotice = Get<Label>(selection, "sourceNotice");
                 Label heading = Get<Label>(selection, "heading");
-                LinkLabel sentence = Get<LinkLabel>(selection, "sentence");
+                RichTextBox sentence = Get<RichTextBox>(selection, "sentence");
+                Button explainSelected = Get<Button>(selection, "explainSelected");
                 Assert(source.Text.Contains("bootcamp") && body.Text.Length == 0 &&
                     analyze.Enabled && analyze.Text == "确认并解释" &&
                     sourceNotice.Text.Contains("先校对") && source.Visible &&
@@ -264,17 +304,56 @@ namespace SemanticOverlay.NativeHost
                     new SelectionTerm { text = "oneAPI", explanation = "重复项。" },
                 });
                 FlowLayoutPanel termControls = Get<FlowLayoutPanel>(selection, "terms");
-                Assert(sentence.Links.Count == 3 && termControls.Controls.Count == 3 &&
-                    body.Text.Length == 0,
+                Assert(Get<List<Tuple<int, int, SelectionTerm>>>(selection, "linkedTerms").Count == 3 &&
+                    termControls.Controls.Count == 4 && body.Text.Length == 0 &&
+                    CallResult<SelectionTerm>(selection, "LinkedTermAt",
+                        sentence.Text.IndexOf("bootcamp", StringComparison.Ordinal)).text == "bootcamp",
                     "Repeated clickable terms overlapped, duplicated buttons, or hid the whole-message explanation");
+                Point linkedPoint = sentence.GetPositionFromCharIndex(
+                    sentence.Text.IndexOf("bootcamp", StringComparison.Ordinal));
+                Call(sentence, "OnMouseUp", new MouseEventArgs(MouseButtons.Left, 1,
+                    linkedPoint.X + 2, linkedPoint.Y + 2, 0));
+                Assert(Get<TextBox>(selection, "termBody").Text == "集中训练。",
+                    "A highlighted term no longer opened its inline explanation on click");
                 Call(selection, "ShowTerm", new SelectionTerm {
                     text = "oneAPI", explanation = "统一编程体系。" });
                 Assert(Get<TextBox>(selection, "termBody").Text == "统一编程体系。" &&
                     body.Text.Length == 0,
                     "Term annotation replaced the whole-message explanation");
+                string missedSentence = "10月8号导员要开班会，到时候下午5点记得到";
+                Set(selection, "passageText", missedSentence);
+                sentence.Text = missedSentence;
+                Call(selection, "RenderTerms", new List<SelectionTerm>());
+                int missedStart = sentence.Text.IndexOf("班会", StringComparison.Ordinal);
+                sentence.Select(missedStart, 2);
+                Assert(explainSelected.Enabled &&
+                    CallResult<string>(selection, "GetSelectedLookupTerm") == "班会" &&
+                    Get<List<Tuple<int, int, SelectionTerm>>>(selection, "linkedTerms").Count == 0 &&
+                    body.Text.Length == 0,
+                    "An unhighlighted term could not be selected for explicit lookup");
+                string taskSentence = "明天下午14:00和同事开会，讨论 oneAPI";
+                Set(selection, "passageText", taskSentence);
+                Call(selection, "RenderTasks", new List<AnalysisEntity> { new AnalysisEntity {
+                    text = "明天下午14:00", start = 0, end = 9,
+                    time_text = "明天下午14:00", title = "与同事开会", needs_confirmation = true
+                } }, "candidate");
+                FlowLayoutPanel taskControls = Get<FlowLayoutPanel>(selection, "tasks");
+                Assert(taskControls.Controls.Count == 1 && offeredTask == null,
+                    "Task candidate was not separated or was created before clicking");
+                FlowLayoutPanel taskRow = (FlowLayoutPanel)taskControls.Controls[0];
+                ((Button)taskRow.Controls[1]).PerformClick();
+                Assert(offeredTask != null && offeredTask.title == "与同事开会" &&
+                    offeredTask.needs_confirmation && offeredTask.start_iso == null,
+                    "Add schedule did not open the confirmation path with unresolved fields");
+                offeredTask = null;
+                Call(selection, "RenderTasks", new List<AnalysisEntity>(), "example_excluded");
+                Assert(taskControls.Controls.Count == 1 &&
+                    ((Label)taskControls.Controls[0]).Text.Contains("举例") &&
+                    offeredTask == null,
+                    "An excluded example did not show a reason-specific empty state");
             }
             using (var service = new ServiceManager())
-            using (var oversized = new SelectionAnalysisForm(service))
+            using (var oversized = new SelectionAnalysisForm(service, null))
             {
                 oversized.OpenText(new string('a', 1001), false, "ocr", "qq");
                 Application.DoEvents();

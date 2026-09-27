@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Reflection;
 using System.Windows.Forms;
 namespace SemanticOverlay.NativeHost {
@@ -17,7 +18,21 @@ namespace SemanticOverlay.NativeHost {
                 if (form.Left!=left+60 || form.Top!=top+40) throw new Exception("Lyric did not follow window movement");
                 form.Close();
             }
-            Console.WriteLine("PASS caption layout: no duplicate, no source overlap, follows target movement");
+            using (CaptionLyricForm form = new CaptionLyricForm(Path.Combine(
+                Path.GetTempPath(), "caption-layout-test-" + Guid.NewGuid().ToString("N") + ".json"))) {
+                System.Drawing.Rectangle area = Screen.PrimaryScreen.WorkingArea;
+                NativeRect target = new NativeRect {
+                    Left = area.Left + 100, Top = area.Bottom - 350,
+                    Right = area.Left + Math.Min(900, area.Width - 100),
+                    Bottom = area.Bottom + 500
+                };
+                form.ShowAudioLines("first line", "second line", 0, target);
+                if (form.Left < area.Left || form.Right > area.Right ||
+                    form.Top < area.Top || form.Bottom > area.Bottom)
+                    throw new Exception("Audio card extended beyond the visible monitor");
+                form.Close();
+            }
+            Console.WriteLine("PASS caption layout: no duplicate, follows target, audio card stays on screen");
         }
     }
 }
