@@ -22,11 +22,11 @@ namespace SemanticOverlay.NativeHost
             return (T)o.GetType().GetMethod(n, Flags).Invoke(o, a);
         }
         static void Assert(bool ok, string message) { if (!ok) throw new Exception(message); }
-        static void Pump(Func<bool> done)
+        static void Pump(Func<bool> done, string failure = "UI callback did not complete within six seconds")
         {
             DateTime deadline = DateTime.UtcNow.AddSeconds(6);
             while (!done() && DateTime.UtcNow < deadline) { Application.DoEvents(); Thread.Sleep(10); }
-            Assert(done(), "UI callback did not complete within six seconds");
+            Assert(done(), failure);
         }
         static ScanResponse Result(string term)
         {
@@ -45,6 +45,8 @@ namespace SemanticOverlay.NativeHost
         private static int Run()
         {
             ServiceManager.DisableUsageMetricsForDiagnostics = true;
+            // 诊断用真实偏好文件：用户保存的浮框尺寸会影响布局断言，必须旁路恢复逻辑
+            ServiceManager.DisableFloatSizeRestoreForDiagnostics = true;
             NativeMethods.SetProcessDPIAware();
             Application.EnableVisualStyles();
             string unicodeText = "😀😀 Ctrl+Alt+G";
@@ -96,23 +98,31 @@ namespace SemanticOverlay.NativeHost
                 captionStatus.Hide();
             }
             Console.WriteLine("caption-consent-remember-and-nonactivating-status-ok");
-            Assert(OverlayContext.IsModelAnalysisMode("jev") &&
+            Assert(!OverlayContext.IsModelAnalysisMode("jev") &&
                 OverlayContext.IsModelAnalysisMode("llm") &&
                 OverlayContext.IsModelAnalysisMode("local_strong") &&
                 !OverlayContext.IsModelAnalysisMode("local_fallback"),
-                "Jev or fallback analysis mode was classified incorrectly");
-            Console.WriteLine("jev-model-mode-classification-ok");
+                "Retired or fallback analysis mode was classified incorrectly");
+            Console.WriteLine("model-mode-classification-ok");
             Assert(ServiceManager.IsCompatibleHealth(new ServiceHealth {
                     ok = true,
                     product_id = ServiceManager.ExpectedProductId,
+                    app_version = ServiceManager.ClientVersion,
                     protocol_version = ServiceManager.SupportedProtocolVersion }) &&
                 !ServiceManager.IsCompatibleHealth(new ServiceHealth {
                     ok = true,
                     product_id = ServiceManager.ExpectedProductId,
+                    app_version = ServiceManager.ClientVersion,
                     protocol_version = ServiceManager.SupportedProtocolVersion - 1 }) &&
                 !ServiceManager.IsCompatibleHealth(new ServiceHealth {
                     ok = true,
                     product_id = "another-local-service",
+                    app_version = ServiceManager.ClientVersion,
+                    protocol_version = ServiceManager.SupportedProtocolVersion }) &&
+                !ServiceManager.IsCompatibleHealth(new ServiceHealth {
+                    ok = true,
+                    product_id = ServiceManager.ExpectedProductId,
+                    app_version = ServiceManager.ClientVersion + ".incompatible",
                     protocol_version = ServiceManager.SupportedProtocolVersion }),
                 "Backend identity/protocol handshake accepted an incompatible service");
             Console.WriteLine("backend-identity-protocol-handshake-ok");
@@ -153,6 +163,9 @@ namespace SemanticOverlay.NativeHost
             Type automationElement = automationClient.GetType(
                 "System.Windows.Automation.AutomationElement");
             Type automationPoint = MessageTextReader.ResolvePointType(automationElement);
+            Type automationWalker = automationClient.GetType("System.Windows.Automation.TreeWalker");
+            Assert(MessageTextReader.ResolveControlViewWalker(automationWalker) != null,
+                "ControlViewWalker public field could not be resolved");
             Assert(automationPoint != null && automationPoint.FullName == "System.Windows.Point",
                 "One-click accessibility could not resolve the UI Automation point type");
             Console.WriteLine("one-click-message-accessibility-and-whole-bubble-fallback-ok");
@@ -205,7 +218,7 @@ namespace SemanticOverlay.NativeHost
                 321, false, false, true);
             metrics.RecordSelection("qq", "ocr", "model", 456, true, true, 2);
             metrics.RecordFeedback("active_lookup", "wechat", "useful");
-            metrics.RecordHighlights("qq", 9, "jev");
+            metrics.RecordHighlights("qq", 9, "llm");
             string metricsText = File.ReadAllText(metricsPath);
             Assert(metricsText.Contains("\"text_source\":\"clipboard\"") &&
                 metricsText.Contains("\"source_app\":\"wechat\"") &&
@@ -313,7 +326,7 @@ namespace SemanticOverlay.NativeHost
                 });
                 FlowLayoutPanel termControls = Get<FlowLayoutPanel>(selection, "terms");
                 Assert(Get<List<Tuple<int, int, SelectionTerm>>>(selection, "linkedTerms").Count == 3 &&
-                    termControls.Controls.Count == 4 && body.Text.Length == 0 &&
+                    termControls.Controls.Count == 1 && body.Text.Length == 0 &&
                     CallResult<SelectionTerm>(selection, "LinkedTermAt",
                         sentence.Text.IndexOf("bootcamp", StringComparison.Ordinal)).text == "bootcamp",
                     "Repeated clickable terms overlapped, duplicated buttons, or hid the whole-message explanation");
@@ -388,13 +401,14 @@ namespace SemanticOverlay.NativeHost
                     selectionTarget.Show();
                     NativeMethods.SetForegroundWindow(selectionTarget.Handle);
                     selectionTarget.Activate(); selectedText.Focus();
-                    Pump(() => NativeMethods.GetForegroundWindow() == selectionTarget.Handle && selectedText.Focused);
+                    Pump(() => NativeMethods.GetForegroundWindow() == selectionTarget.Handle && selectedText.Focused,
+                        "Synthetic accessibility target did not gain foreground focus");
                     selectedText.Select(6, 8); Application.DoEvents();
                     var selectionTask = System.Threading.Tasks.Task.Factory.StartNew(delegate {
                         return (string)typeof(ManualLookupForm).GetMethod("ReadSelection",
                             BindingFlags.Static | BindingFlags.NonPublic).Invoke(null, null);
                     });
-                    Pump(() => selectionTask.IsCompleted);
+                    Pump(() => selectionTask.IsCompleted, "Accessibility selection read did not complete");
                     Assert(selectionTask.Result == "bootcamp", "Accessibility selection could not read the selected word");
                     using (var toolbar = new SelectionActionForm())
                     {
@@ -544,7 +558,7 @@ namespace SemanticOverlay.NativeHost
                     Set(ctx, "progressiveHighlightGeneration", 10);
                     Set(ctx, "refineWords", new Func<List<OcrWord>, ScanResponse>(words => {
                         progressiveStarted.Set(); progressiveRelease.WaitOne(3000);
-                        return new ScanResponse { ok = true, analysis_mode = "jev",
+                        return new ScanResponse { ok = true, analysis_mode = "llm",
                             highlights = new List<HighlightItem> {
                                 new HighlightItem { term = "oneAPI", kind = "concept", context = "model",
                                     x = 30, y = 70, w = 80, h = 24 },

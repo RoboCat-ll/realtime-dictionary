@@ -36,10 +36,10 @@ while (-not $process.HasExited -and (Get-Date) -lt $deadline) {
 if (-not $installed) { throw 'Install completion was not observed; inspect installer window.' }
 if (-not $process.HasExited) { throw 'Installer did not close after success.' }
 $target = Join-Path $env:LOCALAPPDATA 'RealtimeDictionary\App'
-$manifest = Get-Content (Join-Path $target 'browser-extension\manifest.json') -Raw | ConvertFrom-Json
+$installedVersion = (Get-Content (Join-Path $target 'version.txt') -Raw).Trim()
 Start-Sleep -Seconds 2
 $hosts = @(Get-CimInstance Win32_Process -Filter "name='SemanticOverlay.exe'" | Where-Object {
     $_.ExecutablePath -eq (Join-Path $target 'native-host\bin\SemanticOverlay.exe')
 })
 if ($hosts.Count -ne 1) { throw 'Installed host count is not one.' }
-[pscustomobject]@{ installed=$true; version=$manifest.version; host_count=$hosts.Count; path=$target } | ConvertTo-Json
+[pscustomobject]@{ installed=$true; version=$installedVersion; host_count=$hosts.Count; path=$target } | ConvertTo-Json

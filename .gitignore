@@ -5,7 +5,6 @@
 !/LICENSE
 !/THIRD_PARTY_NOTICES.md
 !/semantic-overlay/
-!/browser-extension/
 /semantic-overlay/*
 !/semantic-overlay/*.py
 !/semantic-overlay/start.cmd
@@ -13,6 +12,7 @@
 !/semantic-overlay/configure-key.cmd
 !/semantic-overlay/configure-key.ps1
 !/semantic-overlay/package.ps1
+!/semantic-overlay/version.txt
 !/semantic-overlay/AGENTS.md
 !/semantic-overlay/PRODUCT_SCOPE.md
 !/semantic-overlay/METRICS.md
@@ -44,9 +44,3 @@
 /semantic-overlay/vendor/NAudio/*
 !/semantic-overlay/vendor/NAudio/NAudio.dll
 !/semantic-overlay/vendor/NAudio/LICENSE.txt
-/browser-extension/*
-!/browser-extension/*.js
-!/browser-extension/*.css
-!/browser-extension/*.html
-!/browser-extension/manifest.json
-!/browser-extension/AGENTS.md

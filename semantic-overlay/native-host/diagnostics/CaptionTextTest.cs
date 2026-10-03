@@ -25,6 +25,26 @@ namespace SemanticOverlay.NativeHost
                 speech[3].Text != "版本 3.5 仍正常" ||
                 speech[1].Offset != 18 || speech[3].Offset != 42)
                 throw new InvalidOperationException("Speech segments or source offsets are incorrect.");
+            // Baseline tolerance must not be a non-transitive sorting comparator.
+            var buildCaption = typeof(OverlayContext).GetMethod("BuildCaptionText",
+                BindingFlags.Static | BindingFlags.NonPublic);
+            var firstWord = new OcrWord { text = "one", x = 30, y = 0, w = 10, h = 20 };
+            var secondWord = new OcrWord { text = "two", x = 20, y = 6, w = 10, h = 20 };
+            var thirdWord = new OcrWord { text = "three", x = 10, y = 12, w = 10, h = 20 };
+            var variants = new[] { new[] { firstWord, secondWord, thirdWord },
+                new[] { firstWord, thirdWord, secondWord }, new[] { secondWord, firstWord, thirdWord },
+                new[] { secondWord, thirdWord, firstWord }, new[] { thirdWord, firstWord, secondWord },
+                new[] { thirdWord, secondWord, firstWord } };
+            string stable = null;
+            foreach (var variant in variants)
+            {
+                object[] input = new object[] { new System.Collections.Generic.List<OcrWord>(variant), null };
+                string rendered = (string)buildCaption.Invoke(null, input);
+                if (stable == null) stable = rendered;
+                if (rendered != stable || rendered.Length == 0 ||
+                    ((System.Collections.Generic.List<OcrWord>)input[1]).Count != 3)
+                    throw new InvalidOperationException("OCR baseline ordering depends on input permutation.");
+            }
             var backlog = new CaptionAudioBacklog(2);
             DateTime started = new DateTime(2024, 2, 11, 10, 0, 0);
             backlog.Enqueue(new byte[] { 1 }, started);

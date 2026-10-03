@@ -11,22 +11,24 @@ import json
 import os
 import sys
 import threading
+import secrets
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from PIL import Image, ImageGrab
 from paddleocr import PaddleOCR
+import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PORT = 8878
 ANALYZE_URL = "http://127.0.0.1:8877/analyze"
-SCAN_IMAGE = os.path.join(HERE, "_native_scan.png")
 MAX_OCR_WIDTH = 1280
 MAX_OCR_HEIGHT = 800
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-sys.stderr = sys.stdout
+if __name__ == "__main__":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = sys.stdout
 
 _ocr = None
 _ocr_lock = threading.Lock()
@@ -63,11 +65,20 @@ def post_json(url, payload, timeout=70):
     request = urllib.request.Request(
         url,
         data=data,
-        headers={"Content-Type": "application/json; charset=utf-8"},
+        headers={"Content-Type": "application/json; charset=utf-8",
+                 "X-RealtimeDictionary-Token": session_token()},
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def session_token():
+    with urllib.request.urlopen("http://127.0.0.1:8877/session", timeout=2) as response:
+        session = json.loads(response.read().decode("utf-8"))
+    if session.get("product_id") != "realtime-dictionary" or not session.get("token"):
+        raise ValueError("unrecognized local service")
+    return session["token"]
 
 
 def normalize_box(box):
@@ -145,8 +156,7 @@ def scan_region(x, y, width, height):
             )
         else:
             resized = image
-        resized.save(SCAN_IMAGE)
-        result = get_ocr().predict(SCAN_IMAGE)
+        result = get_ocr().predict(np.asarray(resized))
 
     page = result[0] if isinstance(result, list) else result
     raw_texts = list(page.get("rec_texts", []))
@@ -178,7 +188,7 @@ def scan_region(x, y, width, height):
             # service is restarting. Reuse the exact local rules from server.py.
             from server import local_analyze
             analysis = local_analyze(full_text)
-            log("Analyzer unavailable; used local rules: %s" % error)
+            log("Analyzer unavailable; used local rules: %s" % type(error).__name__)
     else:
         analysis = {"entities": []}
     highlights = match_entities(analysis.get("entities", []), texts, boxes)
@@ -212,12 +222,38 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "not found"}, 404)
 
     def do_POST(self):
+        # Drain a bounded body before rejecting the request. Closing a Windows
+        # socket with unread request bytes can reset it before the 403 is read.
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 4096:
+                self.send_json({"error": "invalid body size"}, 413)
+                return
+            self.connection.settimeout(2)
+            body = self.rfile.read(length)
+            if len(body) != length:
+                self.send_json({"error": "incomplete body"}, 400)
+                return
+        except (ValueError, OSError):
+            self.send_json({"error": "invalid body"}, 400)
+            return
+        host = self.headers.get("Host", "").lower()
+        if host not in ("127.0.0.1:8878", "localhost:8878") or self.headers.get("Origin"):
+            self.send_json({"error": "forbidden"}, 403)
+            return
+        try:
+            token = session_token()
+        except Exception:
+            self.send_json({"error": "local service unavailable"}, 503)
+            return
+        if not secrets.compare_digest(self.headers.get("X-RealtimeDictionary-Token", ""), token):
+            self.send_json({"error": "forbidden"}, 403)
+            return
         if self.path != "/scan":
             self.send_json({"error": "not found"}, 404)
             return
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            payload = json.loads(body.decode("utf-8"))
             result = scan_region(
                 int(payload["x"]),
                 int(payload["y"]),
@@ -226,8 +262,8 @@ class Handler(BaseHTTPRequestHandler):
             )
             self.send_json(result)
         except Exception as error:
-            log("Scan failed: %s" % error)
-            self.send_json({"ok": False, "error": str(error)}, 500)
+            log("Scan failed: %s" % type(error).__name__)
+            self.send_json({"ok": False, "error": "OCR 扫描失败，请检查本地服务。"}, 500)
 
     def log_message(self, _format, *_args):
         return

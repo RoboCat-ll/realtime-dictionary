@@ -22,12 +22,18 @@ function Stop-ProjectHost([object]$processInfo) {
     Start-Sleep -Milliseconds 250
 }
 
+function Test-ProjectBackendCommandLine([string]$CommandLine, [string]$ScriptPath) {
+    if (-not $CommandLine -or -not $ScriptPath) { return $false }
+    $escaped = [regex]::Escape([IO.Path]::GetFullPath($ScriptPath))
+    $pattern = '^\s*(?:"[^"]+"|\S+)\s+(?:-(?:u|B|E|I|s|S|O{1,2}|q|v)\s+)*(?:"' + $escaped + '"|' + $escaped + ')(?=\s|$)'
+    return [regex]::IsMatch($CommandLine, $pattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+}
+
 function Get-ProjectBackend {
     Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
         Where-Object {
             ($_.Name -eq "python.exe" -or $_.Name -eq "pythonw.exe") -and
-            $_.CommandLine -and $_.CommandLine.Contains($projectDir) -and
-            $_.CommandLine.Contains("server.py")
+            (Test-ProjectBackendCommandLine $_.CommandLine $serverSource)
         }
 }
 
@@ -38,9 +44,11 @@ function Stop-ProjectBackends {
     }
 }
 
+$nativeCodePaths = @(Get-ChildItem -LiteralPath $hostDir -Filter "*.cs" -File | ForEach-Object { $_.FullName })
 $latestNativeSource = @($source, $audioSource, $buildSource, $naudioSource,
+    (Join-Path $projectDir 'version.txt'),
     (Join-Path $hostDir 'ProcessLoopbackAudioClient.cs'), (Join-Path $hostDir 'LocalReminders.cs'),
-    (Join-Path $hostDir 'windows_ocr_worker.ps1'), (Join-Path $hostDir 'windows_ocr.ps1')) |
+    (Join-Path $hostDir 'windows_ocr_worker.ps1'), (Join-Path $hostDir 'windows_ocr.ps1')) + $nativeCodePaths |
     Where-Object { Test-Path -LiteralPath $_ } |
     ForEach-Object { (Get-Item -LiteralPath $_).LastWriteTime } |
     Sort-Object -Descending | Select-Object -First 1
@@ -50,7 +58,10 @@ $needsBuild = -not (Test-Path $exe) -or
 $running = @(Get-ProjectHost)
 foreach ($processInfo in $running) {
     $started = $processInfo.CreationDate
-    $latestSource = @($source, $serverSource, (Join-Path $projectDir 'calendar_export.py'), (Join-Path $projectDir 'outlook_calendar.py')) |
+    $latestSource = @($source, $serverSource, (Join-Path $projectDir 'calendar_export.py'), (Join-Path $projectDir 'outlook_calendar.py'),
+        (Join-Path $projectDir 'version.txt'), (Join-Path $projectDir 'provider_policy.py'),
+        (Join-Path $projectDir 'credential_store.py'), (Join-Path $projectDir 'provider_transport.py'),
+        (Join-Path $projectDir 'ocr_service.py'), (Join-Path $projectDir 'request_validation.py')) + $nativeCodePaths |
         Where-Object { Test-Path -LiteralPath $_ } |
         ForEach-Object { (Get-Item -LiteralPath $_).LastWriteTime } |
         Sort-Object -Descending | Select-Object -First 1

@@ -1,9 +1,14 @@
 param(
-    [string]$PayloadPath = (Join-Path (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)) "RealtimeDictionary-portable-v0.19.8.zip"),
-    [string]$OutputPath = (Join-Path (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)) "RealtimeDictionary-Setup-v0.19.8.exe")
+    [string]$PayloadPath = "",
+    [string]$OutputPath = ""
 )
 
 $ErrorActionPreference = "Stop"
+$projectRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+$versionFile = Join-Path $projectRoot 'version.txt'
+$productVersion = (Get-Content -LiteralPath $versionFile -Raw).Trim()
+if (-not $PayloadPath) { $PayloadPath = Join-Path $projectRoot "RealtimeDictionary-portable-v$productVersion.zip" }
+if (-not $OutputPath) { $OutputPath = Join-Path $projectRoot "RealtimeDictionary-Setup-v$productVersion.exe" }
 if (Test-Path -LiteralPath $OutputPath) { throw "Output already exists; select a new versioned path." }
 $installerDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $source = Join-Path $installerDir "Setup.cs"
@@ -23,6 +28,7 @@ $outputArg = "/out:$OutputPath"
 $compressionReference = "/reference:$(Join-Path $framework 'System.IO.Compression.dll')"
 $fileSystemReference = "/reference:$(Join-Path $framework 'System.IO.Compression.FileSystem.dll')"
 $resourceArg = "/resource:$PayloadPath,RealtimeDictionary.Payload.zip"
+$versionResource = "/resource:$versionFile,RealtimeDictionary.Version.txt"
 
 & $compiler /nologo /target:winexe /platform:x64 /optimize+ `
     $outputArg `
@@ -33,6 +39,7 @@ $resourceArg = "/resource:$PayloadPath,RealtimeDictionary.Payload.zip"
     $compressionReference `
     $fileSystemReference `
     $resourceArg `
+    $versionResource `
     "$source"
 
 if ($LASTEXITCODE -ne 0) {

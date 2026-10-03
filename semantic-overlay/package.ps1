@@ -1,15 +1,19 @@
 param(
-    [string]$OutputPath = (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "RealtimeDictionary-portable.zip"),
-    [string]$RuntimePath = ""
+    [string]$OutputPath = "",
+    [string]$RuntimePath = (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "runtime")
 )
 
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $projectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$versionFile = Join-Path $projectDir 'version.txt'
+$productVersion = (Get-Content -LiteralPath $versionFile -Raw).Trim()
+if (-not $OutputPath) { $OutputPath = Join-Path $projectDir "RealtimeDictionary-portable-v$productVersion.zip" }
 $nativeBin = Join-Path $projectDir "native-host\bin\SemanticOverlay.exe"
 $nativeSources = @(
     (Join-Path $projectDir "native-host\Program.cs"),
+    $versionFile,
     (Join-Path $projectDir "native-host\LocalReminders.cs"),
     (Join-Path $projectDir "native-host\AudioCapture.cs"),
     (Join-Path $projectDir "native-host\ProcessLoopbackAudioClient.cs"),
@@ -18,6 +22,8 @@ $nativeSources = @(
     (Join-Path $projectDir "native-host\windows_ocr_worker.ps1"),
     (Join-Path $projectDir "vendor\NAudio\NAudio.dll")
 )
+$nativeSources += @(Get-ChildItem -LiteralPath (Join-Path $projectDir "native-host") -Filter "*.cs" -File |
+    ForEach-Object { $_.FullName })
 $latestNativeSource = $nativeSources | Where-Object { Test-Path -LiteralPath $_ } |
     ForEach-Object { (Get-Item -LiteralPath $_).LastWriteTime } |
     Sort-Object -Descending | Select-Object -First 1
@@ -49,7 +55,8 @@ function Add-PackageFile([string]$Source, [string]$EntryName) {
 
 $usageGuideName = ([string][char]0x4F7F) + ([char]0x7528) + ([char]0x8BF4) + ([char]0x660E) + ".md"
 $rootFiles = @(
-    $usageGuideName, "server.py", "ocr_service.py", "calendar_export.py", "outlook_calendar.py",
+    $usageGuideName, "version.txt", "credential_store.py", "provider_policy.py", "provider_transport.py",
+    "server.py", "request_validation.py", "ocr_service.py", "calendar_export.py", "outlook_calendar.py",
     "start.cmd", "start.ps1", "OUTLOOK_SETUP.md"
 )
 foreach ($name in $rootFiles) {
@@ -60,11 +67,6 @@ Add-PackageFile (Join-Path $projectDir "native-host\bin\NAudio.dll") "native-hos
 Add-PackageFile (Join-Path $projectDir "vendor\NAudio\LICENSE.txt") "THIRD_PARTY_LICENSES/NAudio.txt"
 Add-PackageFile (Join-Path $projectDir "native-host\windows_ocr.ps1") "native-host/windows_ocr.ps1"
 Add-PackageFile (Join-Path $projectDir "native-host\windows_ocr_worker.ps1") "native-host/windows_ocr_worker.ps1"
-
-$extensionDir = Join-Path $projectDir "..\browser-extension"
-foreach ($name in @("manifest.json", "content.js", "styles.css", "background.js", "popup.html", "popup.js")) {
-    Add-PackageFile (Join-Path $extensionDir $name) ("browser-extension/" + $name)
-}
 
 if ($RuntimePath) {
     $runtimeRoot = [IO.Path]::GetFullPath($RuntimePath).TrimEnd('\', '/')

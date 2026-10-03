@@ -12,7 +12,13 @@ namespace RealtimeDictionary.Setup
     internal static class Program
     {
         internal const string ProductName = "实时字典";
-        internal const string Version = "0.19.8";
+        internal static readonly string Version = ReadVersion();
+
+        private static string ReadVersion()
+        {
+            using (Stream stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("RealtimeDictionary.Version.txt"))
+            using (StreamReader reader = new StreamReader(stream)) return reader.ReadToEnd().Trim();
+        }
 
         [STAThread]
         private static void Main(string[] args)
@@ -50,6 +56,7 @@ namespace RealtimeDictionary.Setup
 
         internal static void Install()
         {
+            if (!VerifyPayload()) throw new InvalidOperationException("安装包不完整或版本不一致。");
             string target = InstallDirectory;
             StopInstalledProcesses(target);
             EnsureNoOtherPortableHost(target);
@@ -66,6 +73,11 @@ namespace RealtimeDictionary.Setup
             string[] required = {
                 "start.cmd",
                 "server.py",
+                "version.txt",
+                "credential_store.py",
+                "provider_policy.py",
+                "provider_transport.py",
+                "request_validation.py",
                 "calendar_export.py",
                 "runtime/python.exe",
                 "native-host/bin/SemanticOverlay.exe",
@@ -84,6 +96,9 @@ namespace RealtimeDictionary.Setup
                 foreach (ZipArchiveEntry entry in archive.Entries)
                 {
                     string normalized = entry.FullName.Replace('\\', '/');
+                    if (normalized == "version.txt")
+                        using (StreamReader reader = new StreamReader(entry.Open()))
+                            if (reader.ReadToEnd().Trim() != Version) return false;
                     if (normalized.IndexOf("../", StringComparison.Ordinal) >= 0 ||
                         normalized.EndsWith("config.json", StringComparison.OrdinalIgnoreCase) ||
                         normalized.EndsWith(".log", StringComparison.OrdinalIgnoreCase))

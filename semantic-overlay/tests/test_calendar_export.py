@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime
 from unittest.mock import patch
 import sys
 from pathlib import Path
@@ -14,15 +15,18 @@ class CalendarExportTests(unittest.TestCase):
         self.assertEqual('2027-09-03T14:00', result['start'])
         self.assertEqual('2027-09-03T15:00', result['end'])
 
-    def test_boss_sentence_clarification_does_not_guess_year(self):
-        result = clarify_calendar({'time_text': '9月3号下午14:00', 'supplement': ''})
-        self.assertEqual('', result['start'])
-        self.assertTrue(any('哪一年' in item for item in result['missing']))
+    def test_past_month_day_defaults_to_next_year(self):
+        result = clarify_calendar({'time_text': '9月3号下午14:00', 'supplement': ''},
+                                  now=datetime(2026, 9, 30, 12))
+        self.assertEqual('2027-09-03T14:00', result['start'])
+        self.assertTrue(result['year_inferred'])
+        self.assertFalse(any('哪一年' in item for item in result['missing']))
 
-    def test_dotted_meeting_date_retains_explicit_day_and_requires_year(self):
-        result = clarify_calendar({'time_text': '9.30 14:30', 'supplement': ''})
-        self.assertEqual('', result['start'])
-        self.assertTrue(any('哪一年' in item for item in result['missing']))
+    def test_dotted_meeting_date_defaults_year_but_retains_explicit_day(self):
+        result = clarify_calendar({'time_text': '9.30 14:30', 'supplement': ''},
+                                  now=datetime(2026, 9, 30, 12))
+        self.assertEqual('2026-09-30T14:30', result['start'])
+        self.assertFalse(any('哪一年' in item for item in result['missing']))
         self.assertFalse(any('几月几日' in item for item in result['missing']))
         self.assertFalse(any('几点开始' in item for item in result['missing']))
         completed = clarify_calendar({
@@ -36,17 +40,57 @@ class CalendarExportTests(unittest.TestCase):
             'supplement': '改为2027年9.30 14:30，持续1小时，北京时间'})
         self.assertEqual('2027-09-30T14:30', corrected['start'])
 
-    def test_split_meeting_phrase_clarifies_without_inventing_year_or_length(self):
+    def test_split_meeting_phrase_defaults_year_without_inventing_length(self):
         phrase = '10月8号导员要开班会，到时候下午5点'
-        unresolved = clarify_calendar({'time_text': phrase, 'supplement': ''})
-        self.assertEqual('', unresolved['start'])
-        self.assertTrue(any('哪一年' in item for item in unresolved['missing']))
+        unresolved = clarify_calendar({'time_text': phrase, 'supplement': ''}, now=datetime(2026, 9, 30))
+        self.assertEqual('2026-10-08T17:00', unresolved['start'])
+        self.assertEqual('', unresolved['end'])
+        self.assertEqual('', unresolved['utc_offset'])
         self.assertFalse(any('几点开始' in item for item in unresolved['missing']))
         completed = clarify_calendar({
             'time_text': phrase,
             'supplement': '2027年，持续1小时，北京时间'})
         self.assertEqual('2027-10-08T17:00', completed['start'])
         self.assertEqual('2027-10-08T18:00', completed['end'])
+
+    def test_today_past_clock_stays_today_and_warns(self):
+        result = clarify_calendar({'time_text': '10月8号下午5点开会'}, now=datetime(2026, 10, 8, 18))
+        self.assertEqual('2026-10-08T17:00', result['start'])
+        self.assertIn('已过去', result['message'])
+
+    def test_future_and_year_boundary(self):
+        for phrase, now, expected in [
+            ('10月8号17:00', datetime(2026, 9, 30), '2026-10-08T17:00'),
+            ('10月8号17:00', datetime(2026, 10, 9), '2027-10-08T17:00'),
+            ('1月1号09:00', datetime(2026, 12, 31), '2027-01-01T09:00')]:
+            with self.subTest(phrase=phrase, now=now):
+                self.assertEqual(expected, clarify_calendar({'time_text': phrase}, now=now)['start'])
+
+    def test_explicit_relative_years_override_future_default(self):
+        for prefix, expected in [('2025年', 2025), ('去年', 2025), ('今年', 2026),
+                                 ('明年', 2027), ('前年', 2024), ('后年', 2028)]:
+            with self.subTest(prefix=prefix):
+                result = clarify_calendar({'time_text': prefix + '10月8号17:00'}, now=datetime(2026, 10, 9))
+                self.assertEqual(f'{expected}-10-08T17:00', result['start'])
+                self.assertFalse(result['year_inferred'])
+        corrected = clarify_calendar({'time_text': '2027年10月8号17:00', 'supplement': '改为今年'},
+                                     now=datetime(2026, 9, 30))
+        self.assertEqual('2026-10-08T17:00', corrected['start'])
+
+    def test_historical_date_does_not_become_future_default(self):
+        result = clarify_calendar({'time_text': '以前10月8号下午5点开过班会'}, now=datetime(2026, 9, 30))
+        self.assertEqual('', result['start'])
+        self.assertIn('历史安排', result['message'])
+
+    def test_leap_day_and_invalid_unqualified_date(self):
+        for reference, expected in [(datetime(2026, 1, 1), '2028-02-29T09:00'),
+                                    (datetime(2028, 2, 29, 12), '2028-02-29T09:00'),
+                                    (datetime(2028, 3, 1), '2032-02-29T09:00')]:
+            with self.subTest(reference=reference):
+                self.assertEqual(expected, clarify_calendar({'time_text': '2月29号09:00'}, now=reference)['start'])
+        for phrase in ['2月30号09:00', '13月1号09:00', '10月8号25:00']:
+            with self.subTest(phrase=phrase), self.assertRaises(ValueError):
+                clarify_calendar({'time_text': phrase}, now=datetime(2026, 1, 1))
 
     def test_boss_sentence_explicit_year_duration_zone(self):
         result = clarify_calendar({'time_text': '9月3号下午14:00',
@@ -181,8 +225,10 @@ class CalendarExportTests(unittest.TestCase):
                 with self.assertRaises(HTTPError) as caught:
                     request(self.payload())
                 self.assertEqual(403, caught.exception.code)
-                with request([], server.TOKEN) as response:
-                    self.assertFalse(json.load(response)['ok'])
+                with self.assertRaises(HTTPError) as invalid:
+                    request([], server.TOKEN)
+                self.assertEqual(400, invalid.exception.code)
+                self.assertIn('JSON', json.load(invalid.exception)['error'])
                 with request(self.payload(), server.TOKEN) as response:
                     self.assertTrue(json.load(response)['ok'])
                 check_body = self.payload(calendar_ics=export_calendar(self.payload())['ics'])
@@ -204,52 +250,6 @@ class CalendarExportTests(unittest.TestCase):
             http.server_close()
             thread.join()
 
-    def test_browser_ack_keeps_focused_tab_when_background_tab_replies_last(self):
-        import json
-        import server
-        from threading import Thread
-        from urllib.request import Request, urlopen
-
-        http = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
-        port = http.server_address[1]
-        thread = Thread(target=http.serve_forever, daemon=True)
-        thread.start()
-        server.BROWSER_ACKS.clear()
-        port_patch = patch.object(server, 'PORT', port)
-        port_patch.start()
-        try:
-            headers = {
-                'Content-Type': 'application/json',
-                'X-RealtimeDictionary-Token': server.TOKEN,
-            }
-
-            def post(path, data):
-                request = Request(
-                    f'http://127.0.0.1:{port}{path}',
-                    data=json.dumps(data).encode(), headers=headers)
-                with urlopen(request, timeout=3) as response:
-                    return json.load(response)
-
-            command = post('/browser/trigger', {})
-            generation = command['generation']
-            post('/browser/ack', {
-                'generation': generation, 'client': 'foreground', 'focused': True})
-            post('/browser/ack', {
-                'generation': generation, 'client': 'background', 'focused': False})
-            request = Request(
-                f'http://127.0.0.1:{port}/browser/ack-status?generation={generation}',
-                headers={'X-RealtimeDictionary-Token': server.TOKEN})
-            with urlopen(request, timeout=3) as response:
-                status = json.load(response)
-            self.assertTrue(status['acked'])
-            self.assertTrue(status['focused'])
-            self.assertEqual(2, len(server.BROWSER_ACKS[str(generation)]))
-        finally:
-            port_patch.stop()
-            http.shutdown()
-            http.server_close()
-            thread.join()
-            server.BROWSER_ACKS.clear()
 
 
 if __name__ == '__main__':

@@ -13,10 +13,6 @@ class AnalysisLatencyTests(unittest.TestCase):
         self.api_patch = mock.patch.object(server, 'API_KEY', '')
         self.api_patch.start()
         self.addCleanup(self.api_patch.stop)
-        # Offline tests must never inherit the user's persisted TypeSafe key.
-        self.typesafe_patch = mock.patch.object(server, 'TYPESAFE_API_KEY', '')
-        self.typesafe_patch.start()
-        self.addCleanup(self.typesafe_patch.stop)
         server.ANALYZE_CACHE.clear()
         server.MODEL_ANALYSIS_CALLS.clear()
         server.TERM_SELECTIONS.clear()
@@ -73,24 +69,6 @@ class AnalysisLatencyTests(unittest.TestCase):
         with mock.patch.object(server, 'API_KEY', 'fixture'), mock.patch.object(server, 'ANALYSIS_MODEL', 'second'):
             self.assertNotEqual(first, server.analysis_cache_key('RAG', 'standard'))
 
-    def test_jev_filters_candidates_and_preserves_actions(self):
-        text = 'RAG 与 ACID，明天下午14:00开会'
-        answers = {'candidate_0': {'type': 'noul', 'noul': 0.91}}
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            'model': 'jev-1.13.0', 'answers': answers
-        }).encode()
-        with mock.patch.object(server, 'TYPESAFE_API_KEY', 'fixture'), \
-             mock.patch.object(server.urllib.request, 'urlopen', return_value=response) as opened:
-            result = server.analyze(text, context_id='jev-test')
-        self.assertEqual('jev', result['analysis_mode'])
-        self.assertIn('RAG', [item['text'] for item in result['entities']])
-        self.assertTrue(result['actions'])
-        request = opened.call_args.args[0]
-        body = json.loads(request.data)
-        self.assertEqual('jev-latest', body['model'])
-        self.assertTrue(body['questions'])
-        self.assertTrue(request.get_header('Authorization').startswith('Bearer '))
 
     def test_sentence_discovery_without_candidates_prefers_single_generator(self):
         text = '通过低秩适配降低训练开销。'
@@ -98,10 +76,8 @@ class AnalysisLatencyTests(unittest.TestCase):
         reply = json.dumps({'entities': [{'text': term, 'type': 'concept',
                             'start': 2, 'end': 6}], 'actions': []})
         with mock.patch.object(server, 'API_KEY', 'fixture'), \
-             mock.patch.object(server, 'TYPESAFE_API_KEY', 'fixture'), \
              mock.patch.object(server, 'extract_candidates', return_value=[]), \
-             mock.patch.object(server, 'call_llm_with_deadline', return_value=reply) as generate, \
-             mock.patch.object(server, 'analyze_with_jev') as jev:
+             mock.patch.object(server, 'call_llm_with_deadline', return_value=reply) as generate:
             result = server.analyze(text, context_id='sentence-fixture')
             self.assertEqual([term], [item['text'] for item in result['entities']])
             self.assertEqual('sentence_concepts', result['analysis_strategy'])
@@ -109,7 +85,6 @@ class AnalysisLatencyTests(unittest.TestCase):
             self.assertEqual(3, len(generate.call_args.args[0]))
             server.analyze(text, context_id='sentence-fixture')
             generate.assert_called_once()
-            jev.assert_not_called()
 
     def test_sentence_discovery_rejects_invented_terms_and_fragments(self):
         reply = json.dumps({'entities': [{'text': 'PT', 'start': 1, 'end': 3},
@@ -127,54 +102,3 @@ class AnalysisLatencyTests(unittest.TestCase):
             result = server.analyze(text, context_id='compact-spans')
         self.assertEqual([0, 7], [e['start'] for e in result['entities']])
         self.assertTrue(result['actions'])
-
-    def test_jev_low_probability_returns_no_entities(self):
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            'answers': {f'candidate_{i}': {'type': 'noul', 'noul': 0.2}
-                        for i in range(2)}
-        }).encode()
-        with mock.patch.object(server, 'TYPESAFE_API_KEY', 'fixture'), \
-             mock.patch.object(server.urllib.request, 'urlopen', return_value=response):
-            result = server.analyze('ACID 用于检索', context_id='jev-low')
-        self.assertEqual([], result['entities'])
-
-    def test_jev_model_switch_separates_cache(self):
-        with mock.patch.object(server, 'TYPESAFE_API_KEY', 'fixture'), \
-             mock.patch.object(server, 'TYPESAFE_MODEL', 'jev-first'):
-            first = server.analysis_cache_key('RAG', 'standard')
-        with mock.patch.object(server, 'TYPESAFE_API_KEY', 'fixture'), \
-             mock.patch.object(server, 'TYPESAFE_MODEL', 'jev-second'):
-            self.assertNotEqual(first, server.analysis_cache_key('RAG', 'standard'))
-
-    def test_jev_failure_does_not_start_second_provider_wait(self):
-        for failure in (TimeoutError(), ValueError()):
-            server.ANALYZE_CACHE.clear()
-            with mock.patch.object(server, 'TYPESAFE_API_KEY', 'fixture'), \
-                 mock.patch.object(server, 'analyze_with_jev', side_effect=failure), \
-                 mock.patch.object(server, 'call_llm') as other, \
-                 mock.patch.object(server, 'log'):
-                result = server.analyze('RAG', context_id='jev-failure')
-            self.assertEqual('local_fallback', result['analysis_mode'])
-            other.assert_not_called()
-
-    def test_jev_late_response_cannot_change_selection(self):
-        release = threading.Event()
-        finished = threading.Event()
-        def slow(*args, **kwargs):
-            release.wait(2)
-            finished.set()
-            raise TimeoutError()
-        with mock.patch.object(server, 'TYPESAFE_API_KEY', 'fixture'), \
-             mock.patch.object(server, 'ANALYSIS_TIMEOUT_SECONDS', 0.05), \
-             mock.patch.object(server.urllib.request, 'urlopen', side_effect=slow), \
-             mock.patch.object(server, 'log'):
-            started = time.monotonic()
-            try:
-                result = server.analyze('ACID', context_id='jev-slow')
-                self.assertLess(time.monotonic()-started, 1)
-                self.assertEqual('local_fallback', result['analysis_mode'])
-            finally:
-                release.set()
-                self.assertTrue(finished.wait(1))
-            self.assertEqual('local_fallback', server.analyze('ACID', context_id='jev-slow')['analysis_mode'])

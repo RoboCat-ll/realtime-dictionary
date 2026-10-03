@@ -4,6 +4,8 @@ import os
 import sys
 import tempfile
 import unittest
+import urllib.request
+import urllib.parse
 from pathlib import Path
 
 
@@ -11,6 +13,13 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def main():
+    original_open = urllib.request.OpenerDirector.open
+    def local_only(opener, request, *args, **kwargs):
+        url = request.full_url if isinstance(request, urllib.request.Request) else request
+        if urllib.parse.urlsplit(url).hostname not in ("localhost", "127.0.0.1", "::1"):
+            raise AssertionError("Offline test attempted external network access")
+        return original_open(opener, request, *args, **kwargs)
+    urllib.request.OpenerDirector.open = local_only
     with tempfile.TemporaryDirectory(prefix="realtime-dictionary-offline-") as profile:
         settings = Path(profile) / "RealtimeDictionary"
         settings.mkdir()

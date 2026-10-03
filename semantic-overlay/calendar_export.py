@@ -183,8 +183,8 @@ def check_calendar(payload):
             "unsupported": unsupported, "checked_events": len(blocks)}
 
 
-def clarify_calendar(payload):
-    """Extract explicitly supplied Chinese schedule details into an editable draft."""
+def clarify_calendar(payload, *, now=None):
+    """Locally prefill an editable draft; never create or confirm an event."""
     if not isinstance(payload, dict):
         raise ValueError("补充说明必须为对象")
     original = payload.get('time_text', '')
@@ -194,7 +194,17 @@ def clarify_calendar(payload):
     # Prefer user correction over the source phrase, retaining only explicit fields.
     def find(pattern):
         return re.search(pattern, supplement) or re.search(pattern, original)
-    year = find(r'(?<!\d)(\d{4})\s*(?:年|[./-](?=\d{1,2}[./-]\d{1,2}))')
+    reference = now if now is not None else datetime.now().astimezone()
+    year_pattern = r'(?<!\d)(\d{4})\s*(?:年|[./-](?=\d{1,2}[./-]\d{1,2}))'
+    year_value = None
+    year_inferred = False
+    for source in (supplement, original):
+        year = re.search(year_pattern, source)
+        relative = re.search(r'前年|去年|今年|明年|后年', source)
+        if year or relative:
+            year_value = int(year[1]) if year else reference.year + {
+                '前年': -2, '去年': -1, '今年': 0, '明年': 1, '后年': 2}[relative[0]]
+            break
     chinese_day = r'(?<!\d)(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]'
     dotted_day = (r'(?<!\d)(\d{1,2})\s*[./-]\s*(\d{1,2})(?!\d)'
                   r'(?=\s*(?:(?:凌晨|早上|上午|中午|下午|晚上)?\s*\d{1,2}\s*[:：点时]|[,，。]|$))')
@@ -208,7 +218,29 @@ def clarify_calendar(payload):
     clock = re.search(clock_pattern, clock_sources[0]) or re.search(clock_pattern, clock_sources[1])
     duration = find(r'(?:持续|时长|开|共)?\s*(\d+(?:\.\d+)?)\s*(小时|分钟)')
     result = {'ok': True, 'start': '', 'end': '', 'utc_offset': '', 'missing': []}
-    if year and day and clock:
+    notes = []
+    if year_value is None and day:
+        if re.search(r'曾经|当时|那年|以前|过去|已经.*(?:开过|结束|参加)|开过|回顾', original + supplement):
+            result['missing'].append('这可能是历史安排，请明确年份后核对')
+        else:
+            month, date = int(day[1]), int(day[2])
+            # Validate month/day independently; only leap-day may need multiple years.
+            try:
+                datetime(2000, month, date)
+            except ValueError:
+                raise ValueError('开始时间不是有效日期或时间') from None
+            for candidate_year in range(reference.year, min(reference.year + 9, 10000)):
+                try:
+                    candidate = datetime(candidate_year, month, date).date()
+                except ValueError:
+                    continue
+                if candidate >= reference.date():
+                    year_value, year_inferred = candidate_year, True
+                    notes.append('未注明年份，按当前日期取下一次到来的月日（今天不顺延到明年），请核对完整日期')
+                    break
+            if year_value is None:
+                raise ValueError('日期超出支持范围')
+    if year_value is not None and day and clock:
         hour, minute = int(clock[2]), int(clock[3] or 0)
         period = clock[1]
         if period in ('下午', '晚上') and 1 <= hour < 12:
@@ -218,9 +250,12 @@ def clarify_calendar(payload):
         elif period == '中午' and hour != 12:
             result['missing'].append('请用24小时制明确中午的开始时间')
         if not result['missing']:
-            value = '%04d-%02d-%02dT%02d:%02d' % (int(year[1]), int(day[1]), int(day[2]), hour, minute)
+            value = '%04d-%02d-%02dT%02d:%02d' % (year_value, int(day[1]), int(day[2]), hour, minute)
             start = _date(value, '开始时间')
             result['start'] = value
+            if start.date() < reference.date() or (start.date() == reference.date() and
+                    (start.hour, start.minute) < (reference.hour, reference.minute)):
+                notes.append('开始时间已过去，请核对；不会自动改到下一年')
             if duration:
                 minutes = float(duration[1]) * (60 if duration[2] == '小时' else 1)
                 if not minutes.is_integer() or not 0 < minutes <= 7 * 24 * 60:
@@ -229,7 +264,7 @@ def clarify_calendar(payload):
                     result['end'] = (start + timedelta(minutes=minutes)).strftime('%Y-%m-%dT%H:%M')
                 except OverflowError:
                     raise ValueError('结束日期超出范围') from None
-    if not year:
+    if year_value is None and not result['missing']:
         result['missing'].append('会议是哪一年？')
     if not day:
         result['missing'].append('会议是几月几日？')
@@ -248,5 +283,6 @@ def clarify_calendar(payload):
         result['utc_offset'] = '+08:00'
     else:
         result['missing'].append('使用哪个时区？例如北京时间或UTC+08:00')
-    result['message'] = '；'.join(result['missing']) if result['missing'] else '信息已整理完整，请核对后创建提醒。'
+    result['year_inferred'] = year_inferred
+    result['message'] = '；'.join(notes + result['missing']) if notes or result['missing'] else '信息已整理完整，请核对后创建提醒。'
     return result

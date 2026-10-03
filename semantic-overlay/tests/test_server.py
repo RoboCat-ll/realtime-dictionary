@@ -20,6 +20,61 @@ import server
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_retired_browser_routes_and_origins_are_rejected(self):
+        http = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        worker = threading.Thread(target=http.serve_forever, daemon=True)
+        worker.start()
+        base = "http://127.0.0.1:%d" % http.server_address[1]
+        headers = {"X-RealtimeDictionary-Token": server.TOKEN,
+                   "Content-Type": "application/json"}
+        try:
+            with mock.patch.object(server, "PORT", http.server_address[1]):
+                with urlopen(base + "/session", timeout=3) as response:
+                    self.assertEqual(server.TOKEN, json.load(response)["token"])
+                    self.assertIsNone(response.headers.get("Access-Control-Allow-Origin"))
+                for route, method in (("poll", "GET"), ("ack-status", "GET"),
+                                      ("trigger", "POST"), ("clear", "POST"), ("ack", "POST")):
+                    request = Request(base + "/browser/" + route, method=method,
+                                      headers=headers, data=b"{}" if method == "POST" else None)
+                    with self.assertRaises(HTTPError) as caught:
+                        urlopen(request, timeout=3)
+                    self.assertEqual(404, caught.exception.code)
+                    self.assertIsNone(caught.exception.headers.get("Access-Control-Allow-Origin"))
+                    caught.exception.close()
+                for origin in ("https://untrusted.example", "chrome-extension://retired", "null"):
+                    for method, path in (("GET", "/session"), ("POST", "/selection/analyze"),
+                                         ("OPTIONS", "/selection/analyze")):
+                        request = Request(base + path, method=method,
+                                          headers=dict(headers, Origin=origin),
+                                          data=b"{}" if method == "POST" else None)
+                        with self.assertRaises(HTTPError) as caught:
+                            urlopen(request, timeout=3)
+                        self.assertEqual(403, caught.exception.code)
+                        self.assertIsNone(caught.exception.headers.get("Access-Control-Allow-Origin"))
+                        caught.exception.close()
+        finally:
+            http.shutdown()
+            http.server_close()
+            worker.join()
+
+    def test_retired_typesafe_settings_never_decrypt_or_override_active_provider(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_dir = os.path.join(directory, "RealtimeDictionary")
+            os.makedirs(config_dir)
+            with open(os.path.join(config_dir, "config.json"), "w", encoding="utf-8") as stream:
+                json.dump({"base_url": "https://api.deepseek.com", "model": "fixture-model",
+                           "api_key": "active-fixture", "typesafe_api_key": "retired-fixture",
+                           "typesafe_api_key_protected": {"invalid": "obsolete"},
+                           "typesafe_base_url": 123, "typesafe_model": None}, stream)
+            with mock.patch.dict(os.environ, {"APPDATA": directory,
+                    "TYPESAFE_API_KEY": "ambient-retired"}, clear=True), \
+                    mock.patch.object(server.credential_store, "unprotect") as decrypt:
+                config = server.load_config()
+                decrypt.assert_not_called()
+        self.assertEqual("active-fixture", config["api_key"])
+        self.assertEqual("fixture-model", config["model"])
+        self.assertFalse(any("typesafe" in key for key in config))
+
     def test_saved_text_provider_is_isolated_from_speech_provider(self):
         with tempfile.TemporaryDirectory() as directory:
             config_dir = os.path.join(directory, "RealtimeDictionary")
@@ -171,8 +226,8 @@ class ConfigurationTests(unittest.TestCase):
                 "server.CFG['credential_source']]))"],
                 cwd=PROJECT_ROOT, env=env, text=True)
         self.assertEqual(["https://api.siliconflow.cn/v1", "saved-model",
-                     "Qwen/Qwen3.5-35B-A3B", "Qwen/Qwen2.5-7B-Instruct",
-                          "Qwen/Qwen3.5-35B-A3B", "saved_user"], json.loads(output))
+                     "saved-model", "saved-model",
+                          "saved-model", "saved_user"], json.loads(output))
 
     def test_saved_key_is_rejected_if_project_endpoint_path_changes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -219,7 +274,6 @@ class ConfigurationTests(unittest.TestCase):
                     "TYPESAFE_API_KEY": "ambient-typesafe"}, clear=True):
                 config = server.load_config()
         self.assertEqual("", config["api_key"])
-        self.assertEqual("", config["typesafe_api_key"])
         self.assertEqual("invalid_user_config", config["configuration_warning"])
 
     def test_endpoint_identity_rejects_embedded_credentials_and_invalid_urls(self):
@@ -231,72 +285,9 @@ class ConfigurationTests(unittest.TestCase):
             with self.subTest(endpoint=endpoint):
                 self.assertIsNone(server.credential_endpoint_identity(endpoint))
 
-    def test_typesafe_settings_load_from_user_config(self):
-        with tempfile.TemporaryDirectory() as directory:
-            config_dir = os.path.join(directory, "RealtimeDictionary")
-            os.makedirs(config_dir)
-            with open(os.path.join(config_dir, "config.json"), "w", encoding="utf-8") as stream:
-                json.dump({
-                    "typesafe_api_key": "typesafe-fixture",
-                    "typesafe_base_url": "https://example.typesafe.test/",
-                    "typesafe_model": "jev-fixture",
-                }, stream)
-            with mock.patch.dict(os.environ, {"APPDATA": directory}, clear=True):
-                config = server.load_config()
-        self.assertEqual("typesafe-fixture", config["typesafe_api_key"])
-        self.assertEqual("https://example.typesafe.test", config["typesafe_base_url"])
-        self.assertEqual("jev-fixture", config["typesafe_model"])
 
-    def test_typesafe_user_config_overrides_environment(self):
-        with tempfile.TemporaryDirectory() as directory:
-            config_dir = os.path.join(directory, "RealtimeDictionary")
-            os.makedirs(config_dir)
-            with open(os.path.join(config_dir, "config.json"), "w", encoding="utf-8") as stream:
-                json.dump({"typesafe_api_key": "file-key", "typesafe_model": "file-model"}, stream)
-            with mock.patch.dict(os.environ, {
-                "APPDATA": directory,
-                "TYPESAFE_API_KEY": "environment-key",
-                "TYPESAFE_BASE_URL": "https://ambient.invalid",
-                "TYPESAFE_MODEL": "environment-model",
-            }, clear=True):
-                config = server.load_config()
-        self.assertEqual("file-key", config["typesafe_api_key"])
-        self.assertEqual(server.DEFAULT_TYPESAFE_BASE_URL, config["typesafe_base_url"])
-        self.assertEqual("file-model", config["typesafe_model"])
-        self.assertEqual("saved_user", config["typesafe_credential_source"])
 
-    def test_typesafe_key_is_not_sent_to_custom_saved_endpoint(self):
-        with tempfile.TemporaryDirectory() as directory:
-            config_dir = os.path.join(directory, "RealtimeDictionary")
-            os.makedirs(config_dir)
-            with open(os.path.join(config_dir, "config.json"), "w", encoding="utf-8") as stream:
-                json.dump({"typesafe_base_url": "https://custom.example"}, stream)
-            with mock.patch.dict(os.environ, {
-                    "APPDATA": directory, "TYPESAFE_API_KEY": "ambient-key",
-                    "TYPESAFE_BASE_URL": "https://custom.example"}, clear=True):
-                config = server.load_config()
-        self.assertEqual("", config["typesafe_api_key"])
 
-    def test_typesafe_validation_requires_noul_probability(self):
-        class Response:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def read(self):
-                return json.dumps({"answers": {"highlight": {
-                    "type": "noul", "noul": 0.92}}}).encode("utf-8")
-
-        with mock.patch.object(server.urllib.request, "urlopen", return_value=Response()) as opener:
-            result = server.validate_typesafe_key(
-                "typesafe-fixture", "https://api.typesafe.ai", "jev-latest")
-        self.assertTrue(result["ok"])
-        request = opener.call_args.args[0]
-        payload = json.loads(request.data.decode("utf-8"))
-        self.assertEqual("noul", payload["questions"]["highlight"]["type"])
-        self.assertEqual("jev-latest", payload["model"])
 
     def test_health_exposes_versioned_provider_contract_without_secrets(self):
         http = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
@@ -410,9 +401,9 @@ class LocalAnalysisTests(unittest.TestCase):
                          call.call_args.kwargs["request_timeout"])
         self.assertEqual(server.LOOKUP_MODEL, call.call_args.kwargs["model"])
 
-    def test_siliconflow_uses_a_dedicated_fast_lookup_model(self):
+    def test_siliconflow_lookup_preserves_explicit_model_for_policy_check(self):
         self.assertEqual(
-            "Qwen/Qwen3.5-35B-A3B",
+            "deepseek-ai/DeepSeek-V4-Flash",
             server.select_lookup_model(
                 "https://api.siliconflow.cn/v1", "deepseek-ai/DeepSeek-V4-Flash"))
         self.assertEqual(
@@ -424,9 +415,9 @@ class LocalAnalysisTests(unittest.TestCase):
             server.select_lookup_model(
                 "https://api.siliconflow.cn/v1", "configured", "override-model"))
 
-    def test_siliconflow_uses_a_dedicated_fast_selection_model(self):
+    def test_siliconflow_selection_preserves_explicit_model_for_policy_check(self):
         self.assertEqual(
-            "Qwen/Qwen2.5-7B-Instruct",
+            "deepseek-ai/DeepSeek-V4-Flash",
             server.select_selection_model(
                 "https://api.siliconflow.cn/v1", "deepseek-ai/DeepSeek-V4-Flash"))
         self.assertEqual(
@@ -452,7 +443,7 @@ class LocalAnalysisTests(unittest.TestCase):
     def test_novel_versioned_and_chinese_embedded_product_names_are_candidates(self):
         text = "grok4.5 道德低，ollama本地部署很简单。hello 不需要查词。"
         candidates = {item[2]: item[3] for item in server.extract_candidates(text)}
-        self.assertGreaterEqual(candidates["grok4.5"], server.JEV_AUTO_ACCEPT_SCORE)
+        self.assertGreaterEqual(candidates["grok4.5"], server.LOCAL_STRONG_ACCEPT_SCORE)
         self.assertGreaterEqual(candidates["ollama"], 70)
         self.assertNotIn("hello", candidates)
         instant = server.deterministic_strong_entities(text)
@@ -482,81 +473,7 @@ class LocalAnalysisTests(unittest.TestCase):
             with self.subTest(term=term):
                 self.assertEqual([], server.deterministic_strong_entities(term)["entities"])
 
-    def test_jev_candidate_limit_prefers_high_value_terms_over_source_order(self):
-        text = " ".join([f"ordinaryword{index}" for index in range(16)] + ["RAG"])
-        candidates = [
-            (match.start(), match.end(), match.group(0), 40)
-            for match in re.finditer(r"ordinaryword\d+", text)
-        ]
-        rag_start = text.rfind("RAG")
-        candidates.append((rag_start, rag_start + 3, "RAG", 125))
-        captured = {}
 
-        class Response:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def read(self):
-                state = captured["payload"]["state"]
-                answers = {
-                    item["id"]: {"type": "noul", "noul": 0.9 if item["text"] == "RAG" else 0.1}
-                    for item in state["candidates"]
-                }
-                return json.dumps({"answers": answers}).encode("utf-8")
-
-        def open_request(request, timeout):
-            captured["payload"] = json.loads(request.data.decode("utf-8"))
-            return Response()
-
-        local_result = {"entities": [], "actions": [], "analysis_mode": "local"}
-        with mock.patch.object(server.urllib.request, "urlopen", side_effect=open_request), \
-                mock.patch.object(server, "TYPESAFE_API_KEY", "test-key"):
-            result = server.analyze_with_jev(
-                text, candidates, "standard", "candidate-priority", local_result)
-
-        state = captured["payload"]["state"]
-        sent_terms = [item["text"] for item in state["candidates"]]
-        self.assertIsInstance(state, dict)
-        self.assertEqual(server.JEV_CANDIDATE_LIMITS["standard"], len(sent_terms))
-        self.assertNotIn("RAG", sent_terms)
-        self.assertIn("RAG", [item["text"] for item in result["entities"]])
-        self.assertEqual(1, result["analysis_local_accept_count"])
-
-    def test_jev_shortlist_drops_obvious_mundane_terms(self):
-        text = "RAG 使用模型，ACID 完成检索"
-        candidates = server.extract_candidates(text)
-        captured = {}
-
-        class Response:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def read(self):
-                state = captured["payload"]["state"]
-                answers = {item["id"]: {"type": "noul", "noul": 0.9}
-                           for item in state["candidates"]}
-                return json.dumps({"answers": answers}).encode("utf-8")
-
-        def open_request(request, timeout):
-            captured["payload"] = json.loads(request.data.decode("utf-8"))
-            return Response()
-
-        with mock.patch.object(server.urllib.request, "urlopen", side_effect=open_request), \
-                mock.patch.object(server, "TYPESAFE_API_KEY", "test-key"):
-            server.analyze_with_jev(
-                text, candidates, "standard", "mundane-filter",
-                {"entities": [], "actions": [], "analysis_mode": "local"})
-
-        state = captured["payload"]["state"]
-        self.assertNotIn("RAG", [item["text"] for item in state["candidates"]])
-        self.assertIn("ACID", [item["text"] for item in state["candidates"]])
-        self.assertNotIn("模型", [item["text"] for item in state["candidates"]])
 
     def test_conservative_fallback_keeps_known_terms_only(self):
         text = "oneAPI 安排 bootcamp，提到 ACID 和 ordinaryword"
@@ -815,6 +732,19 @@ class SelectionAnalysisTests(unittest.TestCase):
         display, changed = server.accept_selection_correction(readable, dropped)
         self.assertFalse(changed)
         self.assertEqual(readable, display)
+
+    def test_ocr_model_correction_preserves_versions_dates_and_times(self):
+        source = "K8s 是 1．28，2026年9月30日14：30开会。"
+        for changed in (source.replace("1．28", "128"),
+                        source.replace("14：30", "14：00"),
+                        source.replace("30日", "3日")):
+            display, accepted = server.accept_selection_correction(source, changed)
+            self.assertFalse(accepted)
+            self.assertEqual(source, display)
+        equivalent = source.replace("．", ".").replace("：", ":")
+        display, accepted = server.accept_selection_correction(source, equivalent)
+        self.assertTrue(accepted)
+        self.assertEqual(equivalent, display)
 
     def test_selection_analysis_uses_one_bounded_model_request(self):
         generated = json.dumps({
@@ -1153,6 +1083,66 @@ class TaskExtractionTests(unittest.TestCase):
 
 
 class LookupContextTests(unittest.TestCase):
+    def test_brief_lookup_is_context_first_without_nested_terms(self):
+        generated = json.dumps({"canonical_term": "RAG",
+            "explanation": "这里的 RAG 指检索资料后据此回答。",
+            "entities": [{"text": "检索", "start": 9, "end": 11}]}, ensure_ascii=False)
+        with mock.patch.object(server, "API_KEY", "test-key"), \
+                mock.patch.object(server, "call_llm_with_deadline", return_value=generated) as call:
+            result = server.lookup("RAG", context="我们用 RAG 查询知识库", detail="brief")
+        messages = call.call_args.args[0]
+        self.assertIn("不要展开背景", messages[0]["content"])
+        self.assertIn("我们用 RAG 查询知识库", messages[1]["content"])
+        self.assertEqual("brief", result["detail"])
+        self.assertEqual([], result["entities"])
+        self.assertEqual(1, call.call_count)
+
+    def test_expanded_lookup_is_explicit_and_keeps_context(self):
+        generated = json.dumps({"explanation": "RAG 先检索资料。然后基于资料回答。",
+            "entities": []}, ensure_ascii=False)
+        with mock.patch.object(server, "API_KEY", "test-key"), \
+                mock.patch.object(server, "call_llm_with_deadline", return_value=generated) as call:
+            result = server.lookup("RAG", context="查询知识库", detail="expanded")
+        self.assertEqual("expanded", result["detail"])
+        self.assertIn("三至五句", call.call_args.args[0][0]["content"])
+        self.assertIn("查询知识库", call.call_args.args[0][1]["content"])
+        self.assertEqual(1, call.call_count)
+
+    def test_invalid_lookup_detail_never_calls_model(self):
+        with mock.patch.object(server, "call_llm_with_deadline") as call:
+            with self.assertRaises(ValueError):
+                server.lookup("RAG", detail="automatic-deep-query")
+        call.assert_not_called()
+
+    def test_lookup_http_detail_validation_and_forwarding(self):
+        http = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        worker = threading.Thread(target=http.serve_forever, daemon=True)
+        worker.start()
+        url = "http://127.0.0.1:%d/lookup" % http.server_address[1]
+        try:
+            with mock.patch.object(server, "PORT", http.server_address[1]), \
+                    mock.patch.object(server, "lookup", return_value={"explanation": "模拟释义"}) as lookup:
+                for detail in ("brief", "expanded", "full", None):
+                    payload = {"term": "RAG", "context": "知识库"}
+                    if detail is not None:
+                        payload["detail"] = detail
+                    request = Request(url, data=json.dumps(payload).encode(), headers={
+                        "Content-Type": "application/json", "X-RealtimeDictionary-Token": server.TOKEN})
+                    with urlopen(request, timeout=3) as response:
+                        self.assertEqual(200, response.status)
+                    self.assertEqual(detail or "full", lookup.call_args.kwargs["detail"])
+                count = lookup.call_count
+                request = Request(url, data=b'{"term":"RAG","detail":"invalid"}', headers={
+                    "Content-Type": "application/json", "X-RealtimeDictionary-Token": server.TOKEN})
+                with self.assertRaises(HTTPError) as rejected:
+                    urlopen(request, timeout=3)
+                self.assertEqual(400, rejected.exception.code)
+                self.assertEqual(count, lookup.call_count)
+        finally:
+            http.shutdown()
+            http.server_close()
+            worker.join(timeout=3)
+
     def test_instant_lookup_uses_bundled_glossary_without_network_or_model(self):
         with mock.patch.object(server, "call_llm_with_deadline") as model, \
                 mock.patch.object(server, "public_lookup") as public:
@@ -1345,11 +1335,6 @@ class LookupContextTests(unittest.TestCase):
 
 class AnalysisCostControlTests(unittest.TestCase):
     def setUp(self):
-        # Keep the OpenAI-compatible fixture path deterministic even when the
-        # current Windows profile has a real Jev credential configured.
-        self.typesafe_patch = mock.patch.object(server, "TYPESAFE_API_KEY", "")
-        self.typesafe_patch.start()
-        self.addCleanup(self.typesafe_patch.stop)
         server.ANALYZE_CACHE.clear()
         server.ANALYZE_INFLIGHT.clear()
         server.MODEL_ANALYSIS_CALLS.clear()

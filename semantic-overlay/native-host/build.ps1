@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 
 $hostDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $outputDir = Join-Path $hostDir "bin"
@@ -9,6 +9,10 @@ if (-not (Test-Path $compiler)) {
     throw "The built-in .NET Framework C# compiler was not found."
 }
 
+# Root C# files are production modules; diagnostic entry points are added separately.
+$nativeSources = @(Get-ChildItem -LiteralPath $hostDir -Filter "*.cs" -File |
+    Sort-Object Name | ForEach-Object { $_.FullName })
+
 New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
 
 & $compiler /nologo /target:winexe /platform:x64 /optimize+ `
@@ -18,17 +22,64 @@ New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
     /reference:System.Drawing.dll `
     /reference:System.Windows.Forms.dll `
     /reference:System.Web.Extensions.dll `
+    /reference:System.Security.dll `
     /reference:"$naudio" `
-    "$hostDir\Program.cs" `
-    "$hostDir\UsageMetrics.cs" `
-    "$hostDir\LocalReminders.cs" `
-    "$hostDir\AudioCapture.cs" `
-    "$hostDir\ProcessLoopbackAudioClient.cs"
+    @nativeSources
 
 if ($LASTEXITCODE -ne 0) {
     throw "Native host compilation failed with exit code $LASTEXITCODE."
 }
 Copy-Item -LiteralPath $naudio -Destination (Join-Path $outputDir "NAudio.dll") -Force
+
+& $compiler /nologo /target:exe /platform:x64 /optimize+ `
+    /main:SemanticOverlay.NativeHost.CredentialProtectionTest `
+    /out:"$outputDir\CredentialProtectionTest.exe" `
+    /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll `
+    /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll `
+    /reference:System.Security.dll /reference:"$naudio" `
+    @nativeSources `
+    "$hostDir\diagnostics\CredentialProtectionTest.cs"
+if ($LASTEXITCODE -ne 0) { throw "Credential protection diagnostic compilation failed." }
+
+& $compiler /nologo /target:exe /platform:x64 /optimize+ `
+    /main:SemanticOverlay.NativeHost.MessageReaderSafetyTest `
+    /out:"$outputDir\MessageReaderSafetyTest.exe" `
+    /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll `
+    /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll `
+    /reference:System.Security.dll /reference:"$naudio" `
+    @nativeSources `
+    "$hostDir\diagnostics\MessageReaderSafetyTest.cs"
+if ($LASTEXITCODE -ne 0) { throw "Message reader safety diagnostic compilation failed." }
+
+& $compiler /nologo /target:exe /platform:x64 /optimize+ `
+    /main:SemanticOverlay.NativeHost.SelectionLookupInteractionTest `
+    /out:"$outputDir\SelectionLookupInteractionTest.exe" `
+    /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll `
+    /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll `
+    /reference:System.Security.dll /reference:"$naudio" `
+    @nativeSources `
+    "$hostDir\diagnostics\SelectionLookupInteractionTest.cs"
+if ($LASTEXITCODE -ne 0) { throw "Selection lookup interaction diagnostic compilation failed." }
+
+& $compiler /nologo /target:exe /platform:x64 /optimize+ `
+    /main:SemanticOverlay.NativeHost.CloseoutReliabilityTest `
+    /out:"$outputDir\CloseoutReliabilityTest.exe" `
+    /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll `
+    /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll `
+    /reference:System.Security.dll /reference:"$naudio" `
+    @nativeSources `
+    "$hostDir\diagnostics\CloseoutReliabilityTest.cs"
+if ($LASTEXITCODE -ne 0) { throw "Development closeout diagnostic compilation failed." }
+
+& $compiler /nologo /target:exe /platform:x64 /optimize+ `
+    /main:SemanticOverlay.NativeHost.TrayMenuTest `
+    /out:"$outputDir\TrayMenuTest.exe" `
+    /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll `
+    /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll `
+    /reference:System.Security.dll /reference:"$naudio" `
+    @nativeSources `
+    "$hostDir\diagnostics\TrayMenuTest.cs"
+if ($LASTEXITCODE -ne 0) { throw "Tray menu diagnostic compilation failed." }
 
 & $compiler /nologo /target:winexe /platform:x64 /optimize+ `
     /out:"$outputDir\FollowTarget.exe" `
@@ -39,17 +90,6 @@ Copy-Item -LiteralPath $naudio -Destination (Join-Path $outputDir "NAudio.dll") 
 
 if ($LASTEXITCODE -ne 0) {
     throw "Follow target compilation failed with exit code $LASTEXITCODE."
-}
-
-& $compiler /nologo /target:winexe /platform:x64 /optimize+ `
-    /out:"$outputDir\JevE2ETarget.exe" `
-    /reference:System.dll `
-    /reference:System.Drawing.dll `
-    /reference:System.Windows.Forms.dll `
-    "$hostDir\diagnostics\JevE2ETarget.cs"
-
-if ($LASTEXITCODE -ne 0) {
-    throw "Jev E2E target compilation failed with exit code $LASTEXITCODE."
 }
 
 & $compiler /nologo /target:winexe /platform:x64 /optimize+ `
@@ -71,12 +111,9 @@ if ($LASTEXITCODE -ne 0) {
     /reference:System.Drawing.dll `
     /reference:System.Windows.Forms.dll `
     /reference:System.Web.Extensions.dll `
+    /reference:System.Security.dll `
     /reference:"$naudio" `
-    "$hostDir\Program.cs" `
-    "$hostDir\UsageMetrics.cs" `
-    "$hostDir\LocalReminders.cs" `
-    "$hostDir\AudioCapture.cs" `
-    "$hostDir\ProcessLoopbackAudioClient.cs" `
+    @nativeSources `
     "$hostDir\diagnostics\CaptionHost.cs"
 
 if ($LASTEXITCODE -ne 0) {
@@ -115,12 +152,9 @@ if ($LASTEXITCODE -ne 0) {
     /reference:System.Drawing.dll `
     /reference:System.Windows.Forms.dll `
     /reference:System.Web.Extensions.dll `
+    /reference:System.Security.dll `
     /reference:"$naudio" `
-    "$hostDir\Program.cs" `
-    "$hostDir\UsageMetrics.cs" `
-    "$hostDir\LocalReminders.cs" `
-    "$hostDir\AudioCapture.cs" `
-    "$hostDir\ProcessLoopbackAudioClient.cs" `
+    @nativeSources `
     "$hostDir\diagnostics\CaptionTextTest.cs"
 
 if ($LASTEXITCODE -ne 0) {
@@ -135,12 +169,9 @@ if ($LASTEXITCODE -ne 0) {
     /reference:System.Drawing.dll `
     /reference:System.Windows.Forms.dll `
     /reference:System.Web.Extensions.dll `
+    /reference:System.Security.dll `
     /reference:"$naudio" `
-    "$hostDir\Program.cs" `
-    "$hostDir\UsageMetrics.cs" `
-    "$hostDir\LocalReminders.cs" `
-    "$hostDir\AudioCapture.cs" `
-    "$hostDir\ProcessLoopbackAudioClient.cs" `
+    @nativeSources `
     "$hostDir\diagnostics\LocalReminderTest.cs"
 
 if ($LASTEXITCODE -ne 0) {
@@ -148,13 +179,31 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 & $compiler /nologo /target:exe /platform:x64 /optimize+ `
+    /main:SemanticOverlay.NativeHost.CalendarFlowTest `
+    /out:"$outputDir\CalendarFlowTest.exe" `
+    /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll `
+    /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll `
+    /reference:System.Security.dll /reference:"$naudio" `
+    @nativeSources "$hostDir\diagnostics\CalendarFlowTest.cs"
+if ($LASTEXITCODE -ne 0) { throw "Calendar flow diagnostic compilation failed." }
+
+& $compiler /nologo /target:exe /platform:x64 /optimize+ `
+    /main:SemanticOverlay.NativeHost.CompactWorkflowTest `
+    /out:"$outputDir\CompactWorkflowTest.exe" `
+    /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll `
+    /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll `
+    /reference:System.Security.dll /reference:"$naudio" `
+    @nativeSources "$hostDir\diagnostics\CompactWorkflowTest.cs"
+if ($LASTEXITCODE -ne 0) { throw "Compact workflow diagnostic compilation failed." }
+
+& $compiler /nologo /target:exe /platform:x64 /optimize+ `
     /main:SemanticOverlay.NativeHost.RefinementTest `
     /out:"$outputDir\RefinementTest.exe" `
     /reference:System.dll /reference:System.Core.dll `
     /reference:System.Drawing.dll /reference:System.Windows.Forms.dll `
-    /reference:System.Web.Extensions.dll /reference:"$naudio" `
-    "$hostDir\Program.cs" "$hostDir\UsageMetrics.cs" "$hostDir\LocalReminders.cs" `
-    "$hostDir\AudioCapture.cs" "$hostDir\ProcessLoopbackAudioClient.cs" `
+    /reference:System.Web.Extensions.dll `
+    /reference:System.Security.dll /reference:"$naudio" `
+    @nativeSources `
     "$hostDir\diagnostics\RefinementTest.cs"
 if ($LASTEXITCODE -ne 0) { throw "Refinement test compilation failed." }
 

@@ -1,6 +1,77 @@
 # Semantic Overlay Project Rules
 
+## Model billing policy (2026-09-28)
+
+- Follow `C:\Users\17863\AGENTS.md`, section `硅基流动费用约束`, before any
+  API-backed action or test. SiliconFlow permits only currently verified free
+  models; all DeepSeek variants and other paid models are forbidden. No paid
+  fallback, including speech/vision helpers. Unknown pricing blocks the request.
+- Official DeepSeek text requests remain within existing user authorization.
+  Inspect actual endpoint/model/overrides before launching old configurations.
+  Documentation updates alone do not implement a runtime network guard.
+
+## Accuracy refinement contract (2026-09-30)
+
+- Local OCR repairs must not consume a recognized whole technical token together
+  with its neighboring English words. Join only bounded whitespace/dot OCR gaps,
+  preserve identifier boundaries and numeric suffixes, and do not fuzzy-correct
+  short ordinary words. URLs, addresses and paths are not repair targets.
+  Model OCR edits must also preserve negation/cancellation markers; a small edit
+  distance is not permission to change whether an event will happen.
+- Prefer complete passage concepts over nested-only substring terms. Keep a short
+  term if it also occurs independently elsewhere in the same message. The final
+  highlighted list remains source-grounded, deduplicated and limited to five;
+  explicit selected-word lookup stays available for omissions.
+- Verify these changes on synthetic positive and negative cases without provider
+  requests. Offline correctness is not a measured real-client accuracy increase.
+
+## Jev retirement (2026-09-30)
+
+- Jev/TypeSafe is retired. Do not read its saved/environment credentials, offer its configuration UI, invoke its endpoint, or build/run its dedicated diagnostics. Shared OCR, candidate extraction, local fallback and generative analysis remain supported. Existing user credential files and historical evidence are not rewritten or deleted.
+- Analysis uses the configured generative provider, otherwise explicitly labeled local results. Current documentation and UI previews must reflect this routing.
+
 ## Product Contract
+
+- Browser integration is retired by user decision (2026-10-01). Remove the DOM
+  extension, browser-specific desktop routing, /browser endpoints, extension CORS,
+  browser-only diagnostics and package payload. Keep QQ/WeChat lookup and shared
+  native OCR intact. No browser profile/settings or installed external files are
+  changed; do not restore this capability as a fallback.
+
+- Progressive UI refinement: default message cards show meaning and source; term
+  details expand only on explicit lookup, and empty schedule sections take no
+  space. Source highlighter is the primary term navigation; do not duplicate
+  every highlighted term as a button. Manual selected-word lookup stays available.
+- The message explanation panel is a lightweight borderless float attached near
+  the clicked message bubble (v2, 2026-10-01). It shows without stealing chat
+  focus (ShowWithoutActivation + topmost via SetWindowPos), but it never uses
+  WS_EX_NOACTIVATE: clicking, selecting text and editing must focus it normally.
+  Escape closes it only while the float itself has focus (KeyPreview); no global
+  Escape hook. Placement derives from the bubble rectangle and the per-monitor
+  working area (right side first, flip left, clear the input zone, never cover
+  the target bubble). While open, a 400 ms heartbeat: target move follows unless
+  the user dragged the float; target resize closes it; minimize/foreground-loss
+  hides and restores it; target close closes it; chat scroll is not re-probed
+  (the float has no pointer and its content is self-contained).
+- Term lookup and word detail render inside the same float instance as a word
+  view with an explicit back link, never as stacked popups; returning restores
+  the sentence view with source, meaning and reading position intact. Unmarked
+  words stay explainable via selection (nearby action button or Ctrl+Enter).
+  Schedule candidates keep their compact row and explicit confirmation entry in
+  the sentence view; rendering candidates switches back from the word view.
+- Async result application is always marshalled to the UI thread and re-checks
+  the generation guard there (InvokeRequired path included), because an await
+  continuation may land on a thread pool thread when no synchronization context
+  exists. A user edit dims the stale explanation in place instead of clearing it,
+  and late results must never overwrite edited content. Failure states keep an
+  explicit retry action.
+- Calendar confirmation summarizes known fields and presents missing fields;
+  an explicit edit toggle reveals all fields. Preserve complete visible dates,
+  inference notices, manual overrides and explicit creation confirmation.
+- Caption-history query details stay collapsed until requested. Switching archive
+  dates or explicitly switching to the current session invalidates old pending
+  lookups/translations/tasks; incoming lines must still preserve reading position
+  and selection. These local UI checks are not live sustained ASR acceptance.
 
 - The default workflow is one-shot message explanation: `Ctrl+Alt+K` arms one
   target gesture for 10 seconds, and the next click on a WeChat or QQ message
@@ -17,6 +88,16 @@
   the pending result before a corrected retry.
 - Analyze only the clicked message. Do not include adjacent chat messages, window
   titles, contacts, or other screen text in the request.
+- Bubble fallback must search nearby connected background components when the
+  clicked pixel lies inside a closed glyph. Only a component enclosing the click
+  may become the message crop; nearby messages must not be merged into it.
+- Bounded message OCR may repair a verified split glyph only when adjacent OCR
+  boxes share the baseline and together occupy one character width. Keep it
+  classified as editable OCR, never accessibility-exact text. Do not guess
+  missing numeric punctuation or globally replace source words.
+- Model OCR correction must preserve numeric values and their decimal/time/date
+  separators. Equivalent fullwidth punctuation and OCR whitespace may normalize;
+  the existing isolated incomplete trailing-date exclusion remains bounded.
 - One passage-analysis request returns the passage explanation and zero to five useful
   terms. A term must occur verbatim in the submitted passage; do not force a term count
   and do not render invented or fragmentary terms.
@@ -46,8 +127,7 @@
   client-specific product behavior unless a real compatibility failure requires it.
 - Active selected-text lookup is the reliability baseline. Automatic highlighting
   is an optional experiment that must prove it restores understanding faster without
-  excessive interruption. Meeting captions, schedules/reminders, and the browser
-  extension are frozen experimental capabilities, not first-run or release promises.
+  excessive interruption. Meeting captions and schedules/reminders are frozen experimental capabilities, not first-run or release promises.
 - The persisted work mode is either conversation (default) or experimental live captions.
   Conversation mode remains event-driven and OCR-backed. Live-caption mode is
   explicit opt-in and transcribes captured meeting audio; it must never infer
@@ -110,8 +190,7 @@
   Choose the beta speech default from bounded
   English-speech latency and accuracy checks, allow an explicit speech-model
   override, and report the active model in health output. A file transcription
-  API is not a streaming latency guarantee. TypeSafe Jev has its own validated configuration
-  entry and is used only for structured highlight judgments. Audio is sent
+  API is not a streaming latency guarantee. Audio is sent
   only during an explicitly active meeting session, never saved automatically,
   and never written to logs.
 - API credentials are provider scoped: a DeepSeek or generic OpenAI environment
@@ -122,7 +201,7 @@
   credentials fill missing keys only. A generic `OPENAI_API_KEY` may go to a
   custom endpoint only when that endpoint is explicitly supplied by the same
   environment configuration, never merely because it appears in a saved user
-  or project file. Apply the same boundary to a TypeSafe environment key.
+  or project file.
   Resolve the effective endpoint before
   selecting a fallback credential. Health may name the credential source but
   must never expose credential values, fingerprints or provider error bodies.
@@ -132,18 +211,37 @@
 - Automated regression and soak tests must use local fixtures by default.
   Access to a paid endpoint requires an explicit live-billing switch and a
   bounded call budget; stress duration alone never authorizes paid traffic.
-- The bounded Jev desktop diagnostic must preflight `/health` and trigger no
-  hotkeys unless the active service reports `analysis_provider=typesafe` and
-  `analysis_mode=jev`; a missing or different provider aborts the diagnostic.
 - With a generative API key configured, full analysis reads the original sentence
   context and discovers/selects concepts in one request, without local candidate
-  hints or a candidate-presence gate. Jev is compatibility-only when no generative
-  key exists; never serially call both providers. Health must report this routing.
+  hints or a candidate-presence gate. Without a generative key, use only labeled
+  local rules. Health must report this routing.
 - Sentence discovery requests only verbatim concept strings; local code locates
-  spans. On SiliconFlow, default to the validated fast lookup-model preset for
-  analysis unless explicitly overridden. Generative background analysis has a
+  spans. Use the configured model unless explicitly overridden; SiliconFlow
+  requests must pass the free-only admission check. Generative background analysis has a
   bounded 10-second default deadline (not a first-visible latency promise).
   Existing local previews stay visible. Local action extraction remains available.
+- Provider HTTP connections may be reused only after a complete, bounded response,
+  scoped to origin, proxy/tunnel route and credential identity. Discard partial,
+  expired or failed connections; retain certificate validation and redirect denial.
+  By default text calls retry transient connection failures or HTTP 502/503/504 at most
+  twice for official DeepSeek and once for other providers,
+  within the original total deadline, without changing provider/model/credentials.
+  Explicit diagnostic attempt overrides are also capped at three.
+  For official DeepSeek text calls with at least a 4s total budget, reserve retry
+  time by bounding non-final-attempt response headers to 2.5s; this does not shorten
+  successful body generation. A header-budget timeout may retry with the
+  remaining total budget and the same attempt cap. Discard that socket and record unknown usage;
+  do not claim the original POST was unbilled or automatically retry elsewhere.
+  Never retry authentication, billing-policy, malformed-output or exhausted-deadline
+  failures. Record each physical attempt separately; interrupted usage is unknown.
+  Log connection, submission, header/body timing and attempt count without content.
+  Deadline workers must be bounded; expired workers must not send later attempts.
+  Official api.deepseek.com and api.siliconflow.cn HTTPS requests default to
+  direct routing when no explicit proxy environment variable is present; do not
+  silently inherit the Windows system proxy for these domestic API hosts. Honor
+  explicit proxy settings, match exact hostnames only and keep other routes intact.
+  The <=1% user-visible request-failure target requires uncached live evidence and
+  latency statistics; local injected-fault tests are not provider acceptance.
 - Model analysis uses a bounded in-memory exact-text cache, skips only a closed
   set of clearly mundane greetings/acknowledgements, coalesces duplicate work, and enforces a
   per-hour request ceiling. Reaching the ceiling must preserve local highlights
@@ -289,8 +387,7 @@
   map normalized coordinates on moves/resizes, offer reset, and never present
   a full-screen opaque selector. Reflow may require adjusting the selection.
 - A manual framed region is authoritative for the current window. It uses the
-  native OCR path even when that window is browser-based; the automatic browser
-  adapter must not silently override an explicit frame.
+  native OCR path; no adapter may override an explicit frame.
 - The scope menu must show the effective manual selection, mutually exclusive
   with automatic/full scope. Log only selection dimensions, not screen contents.
 - While an enabled foreground conversation has trackable highlights, probe local
@@ -299,7 +396,7 @@
   coordinates to a freshly captured tracking baseline.
 - A highlighted term can be locally ignored from its context action. Ignored
   terms never render, are stored only in the current user's profile, and can be
-  restored from the tray/extension settings. Do not send feedback lists to a
+  restored from the tray settings. Do not send feedback lists to a
   remote model or write ignored terms to diagnostics logs.
 - Windows OCR conversation highlights learn a conservative local familiarity signal. A
   concept counts as an unclicked exposure at most once per explicit highlight
@@ -328,15 +425,13 @@
   online explanation request; bundled-glossary and structural text are preview
   only, never a reason to require a second AI button click. A late response may
   replace only the preview for the same lookup generation.
-- Short dictionary explanations use a dedicated fast non-thinking lookup model
-  when the configured provider is SiliconFlow; do not spend the flagship model's
-  latency on one- or two-sentence definitions. The model name must be visible in
+- Short dictionary explanations respect the explicitly configured text model;
+  never silently substitute a paid preset. The model name must be visible in
   health/status output and overridable without changing the speech or structured
   highlight engines. Other providers continue to use their configured model.
-- Whole-message explanation uses its own fast non-thinking selection model when
-  the configured provider is SiliconFlow. It must be independently overridable
+- Whole-message explanation respects the configured text model. It may be independently overridable
   and reported by `/health`; changing it must not alter dictionary lookup,
-  sentence concept discovery, TypeSafe judgment, or speech. A successful model
+  sentence concept discovery or speech. A successful model
   response retains source-exact deterministic local terms that the model omitted,
   capped by the same five-term limit.
 - Definition lookup carries a bounded local sentence context around the term.
@@ -365,7 +460,7 @@
   confidence, and `needs_confirmation=true`; ambiguous dates stay unresolved
   instead of inventing a year or timezone.
 - Knowledge terms use a deterministic normalized-term color, shared across native
-  and browser surfaces. Case and whitespace variants share a color; do not strip
+  and native caption surfaces. Case and whitespace variants share a color; do not strip
   punctuation (C, C++ and C# must remain distinct). Blue is reserved for schedules.
 - Microsoft calendar access uses the user's registered public-client app and
   delegated Calendars.ReadWrite via device login. Tokens stay in process memory;
@@ -382,7 +477,9 @@
   Only explicit confirmation may export an ICS file; export does not mean the
   event has been imported into a calendar. Microsoft writes use the separate
   explicitly confirmed workflow above; no invitations.
-  Missing years and end times remain empty. Identical confirmed content uses a
+  Candidate years stay empty until the editor's explicit local prefill step;
+  its inferred year follows the next-occurrence contract below. Missing end
+  times remain empty. Identical confirmed content uses a
   stable UID; importing software ultimately controls duplicate handling.
 - `/calendar/export` is token-protected, validates every field and a strict
   boolean `confirmed`, and returns an RFC 5545 file in JSON without storing or
@@ -396,7 +493,8 @@
   Imported calendars are limited to 1 MiB; this checks a snapshot, not live accounts.
 - `/calendar/clarify` accepts the original time phrase and explicit supplemental
   text to build an editable proposal (Chinese date/time, duration, Beijing time
-  or numeric UTC offset). Never infer the current year or a default duration.
+  or numeric UTC offset). Unqualified month/day may prefill the next occurrence
+  year as specified below, never a default duration.
   Missing or ambiguous fields stay empty; clarification never exports an event.
 - Local mode may extract only high-confidence schedule language containing both
   a time expression and an action cue. A bare date or time must not become a task.
@@ -427,30 +525,28 @@
   system routing. Never disable TLS verification or change system proxy settings.
 
 - The local service binds only to `127.0.0.1`, and the port is fixed at `8877`:
-  the native host and the browser extension both hardcode it, so `config.json`
+  the native host hardcodes it, so `config.json`
   must not offer a port option (the server ignores and warns about one).
 - The native host accepts the analysis service only when `/health` and `/session`
   identify `realtime-dictionary` with the exact supported protocol version. A stale
   build or unrelated process on port 8877 must produce an explicit error instead of
   being treated as a healthy backend. Health/status responses may expose provider
   and model names but never tokens or credentials.
-- The server generates a random token at startup. `/selection/analyze`, `/analyze`, `/lookup`, and
-  every `/browser/*` endpoint require the `X-RealtimeDictionary-Token` header.
+- The server generates a random token at startup. `/selection/analyze`, `/analyze`,
+  and `/lookup` require the `X-RealtimeDictionary-Token` header.
 - The token is handed out only by `GET /session`. Requests with a non-loopback
-  `Host` header are rejected (DNS-rebinding defense), and CORS responses echo
-  only `chrome-extension://` origins, so ordinary web pages can never read the
-  token or any endpoint response. Callers fetch `/session` and retry once on 403.
+  `Host` header are rejected (DNS-rebinding defense). No CORS is provided and
+  every request carrying Origin is rejected. Native callers fetch `/session`
+  and retry once on token expiry.
 - API-key setup must validate the candidate key and configured model before
   saving. Applying a validated key gracefully restarts only the local analysis
   service; the tray host and global hotkeys remain active.
-- Provider presets must favor the user's chosen quality baseline after it passes
-  the project's terminology, false-positive, calendar-candidate,
-  Chinese-explanation, and JSON-output checks. As of 2026-09-11 the SiliconFlow
-  preset is `deepseek-ai/DeepSeek-V4-Flash`. Cost control comes from sending only
-  the selected stable caption line, suppressing duplicate generations, and
-  keeping at most the latest queued line; do not silently replace the selected
-  model with a cheaper model. Availability and pricing must be rechecked before
-  a later release rather than assumed permanent.
+- Provider presets must pass the project's terminology, false-positive,
+  calendar-candidate, Chinese-explanation and JSON-output checks within the
+  current billing policy. The historical SiliconFlow DeepSeek preset is no
+  longer authorized. Use only verified free SiliconFlow models; quality loss
+  never authorizes a paid fallback. Minimize repeated requests and recheck
+  availability and pricing before API-backed verification or release.
 - Scanned text is sent to the local service; when an API key is configured it is
   forwarded to the model provider. User-facing docs must state this.
 - Conversation screenshots needed by the Windows OCR bridge are temporary files
@@ -458,9 +554,26 @@
   OCR completes. They must never be retained in the project or installation tree.
 - Live-caption mode must disclose that foreground captions can be sent repeatedly
   while the mode is active. It never scans a background window.
-- The browser adapter scans only from the explicit experimental scan command by default.
-  Automatic rescans require the user to enable "auto follow" in the extension
-  popup, and then send only viewport text with at least 8 seconds between calls.
+
+## Development closeout contract (2026-09-30)
+
+- Keep `Program.cs` as the GUI entry point. Put context coordination in
+  `OverlayContext.cs` and responsibility-based `OverlayContext.*.cs` partials;
+  shared windows, tracking, familiarity and native interop have named root C# modules.
+  `ServiceManager.*.cs` partials separate OCR, local HTTP and runtime lifecycle.
+  Mechanical moves retain existing methods, fields and class identities.
+- `RequestFeedback.cs` owns content-free error text and elapsed wait feedback.
+  Editing a pending input invalidates its result and restores explicit submission;
+  brief lookup failures have an explicit retry. Never start an extra model request
+  just to update UI status, and never display exception bodies or credentials.
+- `PreferenceStore.cs` serializes preference access and atomically replaces the
+  same JSON format. It does not migrate credentials or change consent semantics.
+- `request_validation.py` validates bounded UTF-8 JSON object request bodies before
+  dispatch. Invalid length, malformed encoding and non-object JSON return 400/413.
+- Launcher ownership requires an exact absolute backend script argument, ignoring
+  case; substring matches must not stop backup scripts or test processes.
+- `DEVELOPMENT_CLOSEOUT.md` records this bounded development milestone and its
+  checks. It must not claim measured completion percentage or real-client acceptance.
 
 ## Structure
 
@@ -477,19 +590,56 @@
 - `server.py`: term analysis and lookup service.
 - `outlook_calendar.py`: delegated Microsoft calendar login/check/create; tokens
   and review tickets stay in memory. `OUTLOOK_SETUP.md` documents registration.
-- `../browser-extension/`: optional browser DOM adapter that polls the local service command channel.
 - `installer/`: source and build script for the single-file per-user Windows setup executable.
 - `tests/`: offline regression tests for term ranking, offsets, and Chinese-only fallbacks; tests never call a model provider.
 - Runtime logs use `_native_host.log`, `_ocr_service.log`, and `_server.log`.
 
-The only user-facing launcher is `start.cmd`; it selects PowerShell, builds the
-native host when needed, removes only stale host/backend processes whose paths
-belong to this project, and starts the tray utility. `start.ps1` is the
-PowerShell implementation behind it.
+Desktop and installed shortcuts launch `native-host/bin/SemanticOverlay.exe`
+directly so routine startup shows no console. A development-directory shortcut
+uses the most recently compiled executable and does not build newer sources.
+`start.cmd` remains the explicit development/portable build-and-start entry;
+`start.ps1` implements source freshness checks and startup diagnostics behind it.
 - First launch may show one concise tray notification. The tray menu must always
   provide an in-app Chinese help item; routine launches remain background-only.
 
 ## Engineering Rules
+
+- Tray navigation: top level contains status, message explanation, manual lookup,
+  caption history, explanation-model settings, Settings, Experiments, Help and
+  Exit. Usage/privacy/caption persistence/familiarity belong under Settings;
+  whole-window scan presentation/density/scope belong under Experiments.
+  Reading archived captions remains available when experiments are disabled.
+  Menu regrouping must preserve existing callbacks, preference values and hotkeys.
+- Native source modules stay directly under `native-host/`: `TrayMenu.cs` owns
+  tray construction; `MessageExplanationForms.cs` owns message/selection lookup
+  windows; `MessageTextReader.cs` owns accessibility/bubble reading;
+  `ServiceManager.cs` owns configuration and API coordination; its `Http`, `Ocr`
+  and `Runtime` partials own transport, OCR and process lifecycle;
+  `ServiceContracts.cs` owns response DTOs; `CaptionForms.cs` owns caption data
+  and windows; `CalendarForms.cs` owns calendar confirmation windows.
+  Preserve existing class names and namespace while extracting these units.
+  The build compiles all root-level native C# files; freshness checks must include
+  them. Diagnostics remain below `native-host/diagnostics/`, not in root sources.
+
+- Employee-pilot hardening: every SiliconFlow inference must pass a runtime
+  free-price check against the official pricing page before network submission.
+  All DeepSeek variants are forbidden there; unknown, nonzero, stale or unreadable
+  pricing fails closed. Never reroute a blocked request to a paid provider.
+- Provider usage records contain only local request ID, provider/model/operation,
+  timestamps, outcome, elapsed time and reported token counts. Missing usage is
+  unknown, never zero. Do not log query text, provider bodies or credentials.
+- New saved credentials use Windows CurrentUser DPAPI with endpoint/slot binding.
+  An unreadable protected credential disables credential fallback. Legacy plaintext
+  remains read-compatible with a warning; converting live saved secrets requires
+  separate user approval. No automatic migration, plaintext backup or key rotation.
+- Text uploads require an explicit first-use disclosure naming the effective
+  provider. Caption saving is user-controllable and archive deletion requires an
+  explicit date-specific confirmation. Do not delete existing archives in tests.
+- Keep version.txt authoritative for server, native host and installer builds.
+  Distributable installer payloads require the embedded Python runtime and must
+  be checked for version consistency and exclusion of user settings/logs/secrets.
+- New security and provider-policy modules live at the project root; regression
+  tests stay in tests/ and native diagnostics in native-host/diagnostics/.
 
 - Highlight windows must be limited to term rectangles; only those rectangles may intercept clicks.
 - Definition lookup must be asynchronous and must never block target tracking.
@@ -516,6 +666,18 @@ PowerShell implementation behind it.
   text alone never calls a model. Previously recognized terms retain their
   visible emphasis and direct click-to-explain behavior. A missing highlight
   must not strand the user or require copying the whole message.
+- A deliberate selection in the clicked-message panel offers a small nearby
+  explanation button without sending a request. Mouse and keyboard selections
+  retain the bottom action as a fallback; scrolling, moving, editing or leaving
+  the panel dismisses the nearby action. Lookup uses the selected phrase and
+  current message only, with no neighboring chat or clipboard read.
+- Term annotations in this panel are brief and context-first. Existing passage
+  annotations are reused; unmarked terms explicitly request `/lookup` with
+  `detail=brief`. The default lookup detail remains `full` for existing clients.
+  Only clicking `展开解释` requests additional detail with `detail=expanded`; collapsing/reopening an
+  already successful expansion does not send another request. A late expansion
+  cannot replace another term or edited message, and a failed expansion retains
+  the readable brief explanation with an explicit retry action.
 - Render accepted corrected text as the visible sentence and make each returned
   exact sentence term clickable in place. A term annotation must not hide the
   whole-message explanation. Keep raw OCR editable behind an explicit correction
@@ -528,13 +690,20 @@ PowerShell implementation behind it.
   as a confirmed appointment. Show schedule candidates separately after the
   whole-message meaning and term controls. Clicking `添加日程` opens the existing
   editable reminder/calendar confirmation flow; never create anything on analysis
-  alone. Missing year, end time and UTC offset remain empty until confirmed.
+  alone. Calendar confirmation may prefill an unstated year using the next valid
+  occurrence of the supplied month/day, including today even if the clock has
+  passed. Show the complete inferred date and its basis for editing; explicit
+  numeric/relative years override it, and historical framing must not silently
+  roll into a future appointment. Missing end time and UTC offset remain empty.
+  Opening an incomplete draft runs local clarification without a provider call
+  or creating a reminder. Do not overwrite existing fields during initial prefill.
   Reject example framing such as `我打一个比方` even if the quoted sentence contains
   a valid time and meeting verb. Preserve dotted month/day input such as `9.30
   14:30` as the candidate's exact source phrase; `参加` plus a discussion event is
   actionable. Never transfer a time from an example or neighboring message into
   a real task. Calendar clarification may parse the dotted month/day, but may not
-  supply an unstated year, end time, or UTC offset.
+  invent an end time or UTC offset. Year defaults follow the above rule; invalid
+  dates fail, and February 29 uses the next actual leap-day occurrence.
   When a timed example is excluded, the clicked-message panel must say it is an
   example and direct the user to a message containing the actual arrangement;
   do not show the generic no-task state as if task recognition failed. This
@@ -594,7 +763,8 @@ PowerShell implementation behind it.
 - Compile: `pwsh -File native-host/build.ps1`
 - Python syntax: `D:\Dev\anaconda\python.exe -m py_compile ocr_service.py server.py`
 - Service test: POST a passage to `/selection/analyze`, sample text to `/analyze`, and a term to `/lookup` with the token from `GET /session`; validate source-exact terms, entity offsets, and explanation output. Without the token all three endpoints must return 403, and a request with a foreign `Host` header must return 403.
-- Browser bridge test: POST `/browser/trigger` (with token), then verify an installed extension acknowledges the generation.
+- Retired-browser regression: old `/browser/*` routes return 404 and web/extension
+  Origin requests return 403 without CORS headers; native `/session` stays usable.
 - Runtime: confirm `Ctrl+Alt+K` and `Ctrl+Alt+G` register successfully.
 - Visual: verify no window larger than an individual term rectangle is created for highlighting.
 - Caption stress: `CaptionTarget.exe` accepts `CAPTION_TEST_DURATION_MS` and

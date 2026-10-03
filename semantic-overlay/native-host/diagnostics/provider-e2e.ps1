@@ -2,13 +2,18 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$KeyFile,
     [string]$BaseUrl = "https://api.siliconflow.cn/v1",
-    [string]$Model = "deepseek-ai/DeepSeek-V4-Flash",
+    [string]$Model = "Qwen/Qwen2.5-7B-Instruct",
     [string]$Sample = "We will meet the OneAPI team at 14:00 on September 3 for a bootcamp about Kubernetes rollback strategy.",
     [string]$Term = "bootcamp",
-    [switch]$Save
+    [switch]$Save,
+    [switch]$LiveModelTest
 )
 
 $ErrorActionPreference = "Stop"
+if (-not $LiveModelTest) { throw 'Explicit -LiveModelTest is required; this diagnostic can issue three model requests.' }
+if ($Save) { throw 'This diagnostic no longer writes credentials. Use the tray configuration to save them with Windows encryption.' }
+Get-Content -LiteralPath 'C:\Users\17863\AGENTS.md' | Select-String -Pattern '硅基流动费用约束|硅基流动仅允许|调用前核对|不得因免费'
+
 $projectRoot = Split-Path -Parent (
     Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path))
 $python = Join-Path $projectRoot "runtime\python.exe"
@@ -71,18 +76,7 @@ try {
         -TimeoutSec 25
 
     $saved = $false
-    if ($Save) {
-        $configDirectory = Join-Path $env:APPDATA "RealtimeDictionary"
-        [IO.Directory]::CreateDirectory($configDirectory) | Out-Null
-        $configPath = Join-Path $configDirectory "config.json"
-        $config = @{
-            base_url = $BaseUrl.TrimEnd('/')
-            model = $Model.Trim()
-            api_key = $secret
-        } | ConvertTo-Json -Compress
-        [IO.File]::WriteAllText($configPath, $config, [Text.UTF8Encoding]::new($false))
-        $saved = $true
-    }
+
 
     [pscustomobject]@{
         health_ok = $health.ok
