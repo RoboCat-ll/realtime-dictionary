@@ -374,3 +374,15 @@ verification requirement. No proxy/system setting or credential was changed.
   Other missing expressions returned; no reference-specific vocabulary rewriting.
 - Segments29 ->30. Full native build and AudioSegmentationTest/CaptionTextTest
   passed, installed target matches candidate hash. No unrelated broad re-audit.
+
+
+## 2026-10-09 真实客户端演示补验
+
+用户准备指定 QQ / 微信测试会话并授权录制；当前宿主/后端 0.20.4-beta，文字服务为官方 DeepSeek 的 deepseek-flash。未改凭据，未调用硅基流动模型，未发送聊天消息或创建提醒。
+
+- QQ RAG 消息：完整原句读取、整句解释正常，语境含义与源句相符。
+- QQ 未高亮“反馈”：从浮框原句选择后返回用户评价/意见的语境释义。自动化最初误选上方解释文本，随后选择正确原句；首次点击仍未触发，再次点击成功。不能宣称单击流完全无冲突，需区分焦点和产品事件问题。
+- 微信 AGI/AIGC：气泡 OCR 保留两个缩写及完整语义（空格规范化），解释正常；仅这一条不能推导微信准确率。
+- QQ 今晚八点会议：完整原句、待确认事项和日程弹窗正常，开始预填读取日 2026-10-09 20:00 北京时间；时间已过时明确提示，结束时长仍需补充。历史消息中的相对日期按读取日推断，需用户核对，不宣称解析了原消息发送日期。
+- 公开演示为 4 段真实捕获拼接，44 秒，片段原速保留请求等待；省略片段间工具定位空等，重复查询可能命中缓存，不是首次请求性能基准。遮盖联系人/无关消息，不包含完整桌面。
+- 本轮未改生产代码，无新的字幕、安装或总体成功率结论。未把自动化失败计作已修复。
