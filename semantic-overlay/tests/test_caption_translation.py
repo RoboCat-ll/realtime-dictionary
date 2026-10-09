@@ -11,7 +11,7 @@ import server
 class CaptionTranslationTests(unittest.TestCase):
     def test_explicit_translation_sends_only_the_selected_excerpt(self):
         source = "The bootcamp starts at five."
-        with mock.patch.object(server, "API_KEY", "test-key"), \
+        with mock.patch.object(server, "selected_text_key", return_value="test-key"), \
              mock.patch.object(server, "call_llm_with_deadline",
                                return_value="训练营五点开始。") as translate:
             result = server.translate_caption_text(source)
@@ -19,14 +19,31 @@ class CaptionTranslationTests(unittest.TestCase):
         messages = translate.call_args.args[0]
         self.assertEqual(source, messages[1]["content"])
         self.assertFalse(translate.call_args.kwargs["json_mode"])
+        self.assertEqual("text", translate.call_args.kwargs["provider"])
+        self.assertEqual(server.LOOKUP_MODEL, translate.call_args.kwargs["model"])
 
     def test_missing_key_and_oversized_excerpt_are_rejected_without_model_call(self):
         with mock.patch.object(server, "call_llm_with_deadline") as translate:
             with self.assertRaises(ValueError):
                 server.translate_caption_text("x" * 1001)
-            with mock.patch.object(server, "API_KEY", ""):
+            with mock.patch.object(server, "selected_text_key", return_value=""):
                 with self.assertRaises(RuntimeError):
                     server.translate_caption_text("Hello")
+        translate.assert_not_called()
+
+    def test_independent_text_key_works_without_speech_key(self):
+        with mock.patch.object(server, "API_KEY", ""), \
+             mock.patch.object(server, "selected_text_key", return_value="text-fixture"), \
+             mock.patch.object(server, "call_llm_with_deadline", return_value="你好") as translate:
+            self.assertEqual("你好", server.translate_caption_text("Hello")["translation"])
+        self.assertEqual("text", translate.call_args.kwargs["provider"])
+
+    def test_invalid_text_configuration_cannot_use_speech_key(self):
+        with mock.patch.object(server, "API_KEY", "speech-fixture"), \
+             mock.patch.dict(server.CFG, {"text_config_invalid": True}), \
+             mock.patch.object(server, "call_llm_with_deadline") as translate:
+            with self.assertRaises(RuntimeError):
+                server.translate_caption_text("Hello")
         translate.assert_not_called()
 
     def test_http_translation_requires_token_and_rejects_large_requests(self):

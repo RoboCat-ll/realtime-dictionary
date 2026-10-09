@@ -58,8 +58,8 @@ namespace RealtimeDictionary.Setup
         {
             if (!VerifyPayload()) throw new InvalidOperationException("安装包不完整或版本不一致。");
             string target = InstallDirectory;
-            StopInstalledProcesses(target);
             EnsureNoOtherPortableHost(target);
+            StopInstalledProcesses(target);
             Directory.CreateDirectory(target);
             ExtractPayload(target);
 
@@ -69,6 +69,12 @@ namespace RealtimeDictionary.Setup
         }
 
         internal static bool VerifyPayload()
+        {
+            return VerifyPayload(Assembly.GetExecutingAssembly().GetManifestResourceStream(
+                "RealtimeDictionary.Payload.zip"));
+        }
+
+        internal static bool VerifyPayload(Stream payload)
         {
             string[] required = {
                 "start.cmd",
@@ -83,11 +89,11 @@ namespace RealtimeDictionary.Setup
                 "native-host/bin/SemanticOverlay.exe",
                 "native-host/bin/NAudio.dll",
                 "THIRD_PARTY_LICENSES/NAudio.txt",
-                "browser-extension/manifest.json"
+                "ocr_service.py",
+                "outlook_calendar.py",
+                "native-host/windows_ocr_worker.ps1"
             };
             bool[] found = new bool[required.Length];
-            Stream payload = Assembly.GetExecutingAssembly().GetManifestResourceStream(
-                "RealtimeDictionary.Payload.zip");
             if (payload == null)
                 return false;
             using (payload)

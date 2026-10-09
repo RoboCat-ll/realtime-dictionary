@@ -197,6 +197,35 @@ namespace SemanticOverlay.NativeHost
         private readonly List<Control> clarificationInputs = new List<Control>();
         private readonly ComboBox durationChoices = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 470 };
         private readonly Label durationLabel = new Label { Text = "持续多久？选择后自动填写结束时间", AutoSize = true };
+        private int selectedDurationMinutes;
+        private bool updatingDurationEnd;
+
+        private void ApplyDraftOnUi(Action action)
+        {
+            if (IsDisposed || Disposing) return;
+            MethodInvoker apply = delegate { if (!IsDisposed && !Disposing) action(); };
+            if (!InvokeRequired) { apply(); return; }
+            try { BeginInvoke(apply); }
+            catch (InvalidOperationException) { /* The user closed the draft. */ }
+        }
+
+        private void UpdateDurationEnd()
+        {
+            if (selectedDurationMinutes == 0) return;
+            DateTime begins;
+            updatingDurationEnd = true;
+            try {
+                end.Text = DateTime.TryParseExact(start.Text.Trim(), "yyyy-MM-ddTHH:mm",
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.None, out begins)
+                    ? begins.AddMinutes(selectedDurationMinutes).ToString("yyyy-MM-ddTHH:mm") : "";
+            }
+            catch (ArgumentOutOfRangeException) {
+                end.Text = "";
+                status.Text = "结束日期超出范围，请修改开始时间。";
+            }
+            finally { updatingDurationEnd = false; }
+        }
 
         public CalendarForm(HighlightItem item, Func<Dictionary<string, object>, CalendarResponse> exporter,
             Func<LocalReminderRequest, LocalReminderResult> reminderCreator, Action showReminders,
@@ -233,7 +262,7 @@ namespace SemanticOverlay.NativeHost
             TextBox supplement = new TextBox();
             supplement.Width = 470;
             supplement.MaxLength = 1000;
-            Label supplementLabel = new Label { Text = "补充缺失信息（例：持续1小时，北京时间）",
+            Label supplementLabel = new Label { Text = "补充缺失信息（例：持续1小时）",
                 AutoSize = true, Margin = new Padding(3, 12, 3, 3) };
             layout.Controls.Add(supplementLabel);
             layout.Controls.Add(supplement);
@@ -250,22 +279,43 @@ namespace SemanticOverlay.NativeHost
                 foreach (TextBox field in new[] { title, start, end, offset, supplement }) field.Enabled = false;
                 status.Text = "正在本地解析日期…";
                 durationChoices.Enabled = false;
+                Action releaseDraft = delegate {
+                    busy = false;
+                    applySupplement.Enabled = check.Enabled = import.Enabled = true;
+                    durationChoices.Enabled = true;
+                    foreach (TextBox field in new[] { title, start, end, offset, supplement }) field.Enabled = true;
+                };
                 try
                 {
+                    // Supplement the visible draft, not a superseded source date.
+                    string draftTime = item.time_text ?? item.term ?? "";
+                    DateTime knownStart;
+                    if (DateTime.TryParseExact(start.Text.Trim(), "yyyy-MM-ddTHH:mm",
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        System.Globalization.DateTimeStyles.None, out knownStart)) {
+                        draftTime = knownStart.ToString("yyyy年M月d号HH:mm",
+                            System.Globalization.CultureInfo.InvariantCulture);
+                        if (Regex.IsMatch(offset.Text.Trim(), @"^[+-]\d{2}:\d{2}$"))
+                            draftTime += " UTC" + offset.Text.Trim();
+                    }
                     var payload = new Dictionary<string, object> {
-                        { "operation", "clarify" }, { "time_text", item.time_text ?? item.term ?? "" },
+                        { "operation", "clarify" }, { "time_text", draftTime },
                         { "supplement", supplement.Text.Trim() }
                     };
-                    CalendarResponse response = await Task.Factory.StartNew(() => exporter(payload));
-                    if (IsDisposed || Disposing) return;
+                    CalendarResponse response = await Task.Factory.StartNew(() => exporter(payload)).ConfigureAwait(false);
+                    ApplyDraftOnUi(delegate {
+                    try {
                     if (response == null || !response.ok)
                     {
                         status.Text = response == null ? "整理失败，请手动填写或重试。" : response.error;
                         return;
                     }
-                    if (!initial || String.IsNullOrWhiteSpace(start.Text)) start.Text = response.start ?? "";
-                    if (!initial || String.IsNullOrWhiteSpace(end.Text)) end.Text = response.end ?? "";
-                    if (!initial || String.IsNullOrWhiteSpace(offset.Text)) offset.Text = response.utc_offset ?? "";
+                    if ((!initial || String.IsNullOrWhiteSpace(start.Text)) && !String.IsNullOrWhiteSpace(response.start))
+                        start.Text = response.start;
+                    if ((!initial || String.IsNullOrWhiteSpace(end.Text)) && !String.IsNullOrWhiteSpace(response.end))
+                        end.Text = response.end;
+                    if ((!initial || String.IsNullOrWhiteSpace(offset.Text)) && !String.IsNullOrWhiteSpace(response.utc_offset))
+                        offset.Text = response.utc_offset;
                     status.ForeColor = response.missing != null && response.missing.Count > 0
                         ? Color.FromArgb(180, 90, 25) : Color.FromArgb(48, 90, 150);
                     status.Text = response.message;
@@ -275,17 +325,15 @@ namespace SemanticOverlay.NativeHost
                         inferenceNotice.Text += " 开始时间已过去，请核对；不会自动顺延到明年。";
                     inferenceNotice.Visible = inferenceNotice.Text.Length > 0;
                     RefreshDraftPresentation();
-                }
-                catch (Exception) { if (!IsDisposed) status.Text = "整理失败，请手动填写或检查服务连接。"; }
-                finally
-                {
-                    busy = false;
-                    if (!IsDisposed && !Disposing) {
-                        applySupplement.Enabled = check.Enabled = import.Enabled = true;
-                        durationChoices.Enabled = true;
-                        foreach (TextBox field in new[] { title, start, end, offset, supplement }) field.Enabled = true;
                     }
+                    catch (Exception) { status.Text = "整理失败，请手动填写或重试。"; }
+                    finally { releaseDraft(); }
+                    });
                 }
+                catch (Exception) { ApplyDraftOnUi(delegate {
+                    status.Text = "整理失败，请手动填写或检查服务连接。";
+                    releaseDraft();
+                }); }
             };
             applySupplement.Click += async delegate { await clarifyDraft(false); };
             Shown += async delegate {
@@ -294,7 +342,9 @@ namespace SemanticOverlay.NativeHost
             title.Text = item.title ?? "";
             start.Text = item.start_iso ?? "";
             end.Text = item.end_iso ?? "";
-            offset.Text = item.utc_offset ?? "";
+            offset.Text = String.IsNullOrWhiteSpace(item.utc_offset) ? "+08:00" : item.utc_offset;
+            offset.Visible = false;
+            layout.Controls.Add(offset);
             title.AccessibleName = "Reminder title";
             start.AccessibleName = "Reminder start";
             end.AccessibleName = "Reminder end";
@@ -306,10 +356,18 @@ namespace SemanticOverlay.NativeHost
             durationChoices.Items.AddRange(new object[] { "30 分钟", "1 小时", "2 小时", "手动填写结束时间" });
             layout.Controls.Add(durationLabel);
             layout.Controls.Add(durationChoices);
+            start.TextChanged += delegate { UpdateDurationEnd(); RefreshDraftSummary(); };
+            end.TextChanged += delegate {
+                if (!updatingDurationEnd) {
+                    selectedDurationMinutes = 0;
+                    durationChoices.SelectedIndex = -1;
+                }
+            };
             durationChoices.SelectedIndexChanged += delegate {
                 if (busy) return;
                 if (durationChoices.SelectedIndex == 3) {
-                    draftExpanded = true; RefreshDraftPresentation(); end.Focus(); return;
+                    selectedDurationMinutes = 0;
+                    RefreshDraftPresentation(); end.Focus(); return;
                 }
                 DateTime begins;
                 if (!DateTime.TryParseExact(start.Text.Trim(), "yyyy-MM-ddTHH:mm",
@@ -320,11 +378,10 @@ namespace SemanticOverlay.NativeHost
                 int[] minutes = { 30, 60, 120 };
                 int choice = durationChoices.SelectedIndex;
                 if (choice < 0 || choice >= minutes.Length) return;
-                try { end.Text = begins.AddMinutes(minutes[choice]).ToString("yyyy-MM-ddTHH:mm"); }
-                catch (ArgumentOutOfRangeException) { status.Text = "结束日期超出范围，请修改开始时间。"; return; }
+                selectedDurationMinutes = minutes[choice];
+                UpdateDurationEnd();
                 RefreshDraftPresentation();
             };
-            AddDraftField(layout, "时区（中国填 +08:00）", offset);
             ComboBox reminderLead = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 220 };
             reminderLead.Items.AddRange(new object[] { "准时提醒", "提前 5 分钟", "提前 10 分钟", "提前 30 分钟", "提前 60 分钟" });
             reminderLead.SelectedIndex = 2;
@@ -435,6 +492,11 @@ namespace SemanticOverlay.NativeHost
                 check.Enabled = import.Enabled = false;
                 foreach (TextBox field in new[] { title, start, end, offset }) field.Enabled = false;
                 status.Text = "正在检查导入的日历…";
+                Action releaseCheck = delegate {
+                    busy = false;
+                    check.Enabled = import.Enabled = true;
+                    foreach (TextBox field in new[] { title, start, end, offset }) field.Enabled = true;
+                };
                 try
                 {
                     var payload = new Dictionary<string, object> {
@@ -442,7 +504,9 @@ namespace SemanticOverlay.NativeHost
                         { "start", start.Text.Trim() }, { "end", end.Text.Trim() },
                         { "utc_offset", offset.Text.Trim() }, { "calendar_ics", calendarIcs }
                     };
-                    CalendarResponse result = await Task.Factory.StartNew(() => exporter(payload));
+                    CalendarResponse result = await Task.Factory.StartNew(() => exporter(payload)).ConfigureAwait(false);
+                    ApplyDraftOnUi(delegate {
+                    try {
                     if (result == null || !result.ok)
                     {
                         status.Text = result == null ? "检查失败，请重试。" : result.error;
@@ -453,14 +517,15 @@ namespace SemanticOverlay.NativeHost
                         status.Text += "\r\n冲突：" + String.Join("、", result.conflicts.ToArray());
                     checkedDraft = result.state == "clear" || result.state == "conflict";
                     export.Enabled = checkedDraft;
+                    }
+                    catch (Exception) { status.Text = "检查失败，请重试。"; }
+                    finally { releaseCheck(); }
+                    });
                 }
-                catch (Exception) { status.Text = "检查失败，请确认本地服务正在运行并重试。"; }
-                finally
-                {
-                    busy = false;
-                    check.Enabled = import.Enabled = true;
-                    foreach (TextBox field in new[] { title, start, end, offset }) field.Enabled = true;
-                }
+                catch (Exception) { ApplyDraftOnUi(delegate {
+                    status.Text = "检查失败，请确认本地服务正在运行并重试。";
+                    releaseCheck();
+                }); }
             };
             export.Text = "确认并导出日历文件…";
             export.AutoSize = true;
@@ -492,9 +557,17 @@ namespace SemanticOverlay.NativeHost
                 payload["confirmed"] = true;
                 foreach (TextBox field in new[] { title, start, end, offset }) field.Enabled = false;
                 bool saved = false;
+                Action releaseExport = delegate {
+                    busy = false;
+                    check.Enabled = import.Enabled = true;
+                    export.Enabled = !saved;
+                    foreach (TextBox field in new[] { title, start, end, offset }) field.Enabled = true;
+                };
                 try
                 {
-                    CalendarResponse response = await Task.Factory.StartNew(() => exporter(payload));
+                    CalendarResponse response = await Task.Factory.StartNew(() => exporter(payload)).ConfigureAwait(false);
+                    ApplyDraftOnUi(delegate {
+                    try {
                     if (response == null || !response.ok)
                     {
                         status.Text = response == null ? "服务没有返回结果，请重试。" : response.error;
@@ -515,17 +588,17 @@ namespace SemanticOverlay.NativeHost
                         saved = true;
                         status.Text = "文件已保存，请在日历软件中导入。\r\n重复导入的处理取决于日历软件。";
                     }
+                    }
+                    catch (Exception) { status.Text = "导出失败，请检查保存位置是否可写。"; }
+                    finally { releaseExport(); }
+                    });
                 }
                 catch (Exception)
                 {
-                    status.Text = "导出失败，请检查实时字典是否启动及保存位置是否可写。";
-                }
-                finally
-                {
-                    busy = false;
-                    check.Enabled = import.Enabled = true;
-                    export.Enabled = !saved;
-                    foreach (TextBox field in new[] { title, start, end, offset }) field.Enabled = true;
+                    ApplyDraftOnUi(delegate {
+                        status.Text = "导出失败，请检查实时字典是否启动及保存位置是否可写。";
+                        releaseExport();
+                    });
                 }
             };
         }
@@ -537,8 +610,8 @@ namespace SemanticOverlay.NativeHost
 
         private bool UpdateMissingFields(bool focusFirst)
         {
-            var fields = new[] { title, start, end, offset };
-            var names = new[] { "事项", "完整开始时间", "完整结束时间", "UTC 时差" };
+            var fields = new[] { title, start, end };
+            var names = new[] { "事项", "完整开始时间", "完整结束时间" };
             var missing = new List<string>();
             TextBox first = null;
             for (int index = 0; index < fields.Length; index++)
@@ -554,6 +627,8 @@ namespace SemanticOverlay.NativeHost
                 status.ForeColor = Color.FromArgb(180, 90, 25);
                 status.Text = "还缺少：" + String.Join("、", missing.ToArray()) +
                     "。\r\n可直接填写，或在“补充说明”中补充后点“整理补充信息”。";
+                if (missing.Count == 1 && String.IsNullOrWhiteSpace(end.Text) && !draftExpanded)
+                    status.Text = "还差时长。请选择持续多久，或选择“手动填写结束时间”。";
                 if (focusFirst) first.Focus();
                 return false;
             }
@@ -579,8 +654,18 @@ namespace SemanticOverlay.NativeHost
                 field.Key.Visible = field.Value.Visible = visible;
             }
             bool missing = draftFields.Keys.Any(field => String.IsNullOrWhiteSpace(field.Text));
-            foreach (Control control in clarificationInputs) control.Visible = missing || draftExpanded;
+            bool onlyEndMissing = String.IsNullOrWhiteSpace(end.Text) &&
+                !String.IsNullOrWhiteSpace(title.Text) && !String.IsNullOrWhiteSpace(start.Text) &&
+                !String.IsNullOrWhiteSpace(offset.Text);
+            // One explicit duration fills the sole missing field; do not show
+            // three competing ways to enter the same information by default.
+            foreach (Control control in clarificationInputs) control.Visible = draftExpanded || (missing && !onlyEndMissing);
+            if (onlyEndMissing && !draftExpanded && durationChoices.SelectedIndex != 3) {
+                end.Visible = false;
+                draftFields[end].Visible = false;
+            }
             durationLabel.Visible = durationChoices.Visible = draftExpanded || String.IsNullOrWhiteSpace(end.Text);
+            durationLabel.Text = onlyEndMissing ? "还差时长：选择后自动补齐结束时间" : "持续多久？选择后自动填写结束时间";
         }
 
         private void RefreshDraftSummary()
@@ -588,7 +673,7 @@ namespace SemanticOverlay.NativeHost
             draftSummary.Text = "事项：" + (String.IsNullOrWhiteSpace(title.Text) ? "待补充" : title.Text) +
                 "\r\n开始：" + (String.IsNullOrWhiteSpace(start.Text) ? "待补充" : start.Text.Replace('T', ' ')) +
                 "\r\n结束：" + (String.IsNullOrWhiteSpace(end.Text) ? "待补充" : end.Text.Replace('T', ' ')) +
-                "  时区：" + (String.IsNullOrWhiteSpace(offset.Text) ? "待补充" : "UTC" + offset.Text);
+                (offset.Text == "+08:00" ? "（北京时间）" : "（原文指定时间）");
         }
 
         private void AddDraftField(TableLayoutPanel layout, string text, Control field)

@@ -145,13 +145,13 @@ namespace SemanticOverlay.NativeHost
                 ? (health.explanation_model ?? health.model ?? "已配置")
                 : "本地/公共词典";
             trayUsageItem.ToolTipText = String.Format(
-                "高亮：{0} · 解释：{1} · 调用 {2}/{3} · 缓存 {4}",
+                "高亮：{0} · 解释：{1} · 兼容扫描分析 {2}/{3} · 缓存 {4}；消息解释、查词和翻译见今日模型用量",
                 analysis,
                 explanation,
                 health.model_analysis_calls_last_hour,
                 health.model_analysis_limit_per_hour,
                 health.analysis_cache_entries);
-            trayUsageItem.Text = String.Format("解释模型：{0} · 本小时分析 {1}/{2}",
+            trayUsageItem.Text = String.Format("解释模型：{0} · 本小时兼容扫描 {1}/{2}",
                 health.has_explanation_key ? "已配置" : "未配置",
                 health.model_analysis_calls_last_hour, health.model_analysis_limit_per_hour);
         }
@@ -168,7 +168,7 @@ namespace SemanticOverlay.NativeHost
                 "拖选后出现的“解释这段”仅作为单击识别失败时的兜底。\r\n" +
                 "主动查词：选中文字后按 Ctrl + Alt + D；读取不到时会自动采用明确复制的文字，仍可手动修改。\r\n" +
                 "未高亮的词也能在原句中选取，再点附近的“解释”；需要背景和例子时点“展开解释”。\r\n" +
-                "连续查词模式（托盘开关，默认关闭）：开启后双击一条消息即解释，可在“触发方式”里改为 Alt＋单击。单击和正常聊天不会触发；双击与客户端原生行为的兼容性仍在验收中。\r\n" +
+                "连续查词模式（托盘开关，默认关闭）：开启后双击一条消息即解释，可在“设置 → 连续查词触发方式”里改为 Alt＋单击。单击和正常聊天不会触发；双击与客户端原生行为的兼容性仍在验收中。\r\n" +
                 "托盘“设置”中可查看用量、隐私和本地体验数据，调整字幕保存与词语熟悉度。\r\n\r\n" +
                 "实验功能（默认关闭）\r\n" +
                 "整窗 OCR 高亮、会议字幕和提醒只保留兼容测试。\r\n" +

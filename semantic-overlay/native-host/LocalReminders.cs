@@ -53,6 +53,7 @@ namespace SemanticOverlay.NativeHost
         private readonly object gate = new object();
         private readonly JavaScriptSerializer serializer = new JavaScriptSerializer();
         private List<LocalReminderItem> items = new List<LocalReminderItem>();
+        internal bool LoadFailed { get; private set; }
 
         public LocalReminderStore(string filePath)
         {
@@ -76,6 +77,7 @@ namespace SemanticOverlay.NativeHost
 
         public LocalReminderResult Create(LocalReminderRequest request, DateTime nowUtc)
         {
+            if (LoadFailed) return Fail("提醒文件无法读取，原文件已保留。请恢复文件后重新启动，当前不能保存提醒。");
             if (request == null)
                 return Fail("提醒内容无效。");
             string title = (request.title ?? "").Trim();
@@ -128,8 +130,10 @@ namespace SemanticOverlay.NativeHost
         {
             lock (gate)
             {
-                int removed = items.RemoveAll(item => ParseUtc(item.due_utc) < nowUtc.AddHours(-24));
-                if (removed > 0) { try { Save(); } catch { } }
+                var retained = items.Where(item => ParseUtc(item.due_utc) >= nowUtc.AddHours(-24)).ToList();
+                if (retained.Count != items.Count) {
+                    try { Save(retained); items = retained; } catch { }
+                }
                 return items.Where(item => ParseUtc(item.due_utc) <= nowUtc &&
                     ParseUtc(item.due_utc) >= nowUtc.AddHours(-24))
                     .OrderBy(item => ParseUtc(item.due_utc)).Select(Clone).FirstOrDefault();
@@ -140,8 +144,9 @@ namespace SemanticOverlay.NativeHost
         {
             lock (gate)
             {
-                items.RemoveAll(item => item.id == id);
-                Save();
+                var next = items.Where(item => item.id != id).ToList();
+                Save(next);
+                items = next;
             }
         }
 
@@ -149,10 +154,12 @@ namespace SemanticOverlay.NativeHost
         {
             lock (gate)
             {
-                LocalReminderItem item = items.FirstOrDefault(value => value.id == id);
+                var next = items.Select(Clone).ToList();
+                LocalReminderItem item = next.FirstOrDefault(value => value.id == id);
                 if (item == null) return;
                 item.due_utc = Iso(nowUtc.AddMinutes(10));
-                Save();
+                Save(next);
+                items = next;
             }
         }
 
@@ -163,24 +170,32 @@ namespace SemanticOverlay.NativeHost
                 try
                 {
                     if (File.Exists(path))
+                    {
                         items = serializer.Deserialize<List<LocalReminderItem>>(
-                            File.ReadAllText(path, Encoding.UTF8)) ?? new List<LocalReminderItem>();
+                            File.ReadAllText(path, Encoding.UTF8));
+                        if (items == null) throw new InvalidDataException("提醒文件不是有效列表。");
+                    }
                 }
-                catch { items = new List<LocalReminderItem>(); }
+                catch { LoadFailed = true; items = new List<LocalReminderItem>(); }
                 items = items.Where(item => Valid(item) && ParseUtc(item.due_utc) >= nowUtc.AddHours(-24) &&
                     ParseUtc(item.start_utc) <= nowUtc.AddYears(10)).Take(Limit).ToList();
-                try { if (File.Exists(path)) Save(); } catch { }
             }
         }
 
         private void Save()
         {
+            Save(items);
+        }
+
+        private void Save(List<LocalReminderItem> next)
+        {
+            if (LoadFailed) throw new InvalidOperationException("提醒文件无法读取，未覆盖原文件。");
             string directory = Path.GetDirectoryName(path);
             Directory.CreateDirectory(directory);
             string temp = path + ".tmp-" + Guid.NewGuid().ToString("N");
             try
             {
-                File.WriteAllText(temp, serializer.Serialize(items), new UTF8Encoding(false));
+                File.WriteAllText(temp, serializer.Serialize(next), new UTF8Encoding(false));
                 if (File.Exists(path)) File.Replace(temp, path, null);
                 else File.Move(temp, path);
             }
@@ -257,6 +272,8 @@ namespace SemanticOverlay.NativeHost
 
         public void ShowList()
         {
+            if (store.LoadFailed) MessageBox.Show("提醒文件无法读取，原文件已保留。请恢复文件后重新启动；当前列表不能代表已保存的提醒。",
+                "提醒读取失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             using (ReminderListForm form = new ReminderListForm(store, delegate {
                 if (CountChanged != null) CountChanged();
             })) form.ShowDialog();
@@ -268,16 +285,16 @@ namespace SemanticOverlay.NativeHost
             LocalReminderItem item = store.NextDue(DateTime.UtcNow);
             if (item == null) return;
             current = new ReminderAlertForm(item);
-            current.Dismissed += delegate {
-                try { store.Dismiss(item.id); } catch { }
+            current.DismissRequested = delegate {
+                try { store.Dismiss(item.id); } catch { return false; }
                 current = null;
                 if (CountChanged != null) CountChanged();
-                CheckDue();
+                return true;
             };
-            current.Snoozed += delegate {
-                try { store.Snooze(item.id, DateTime.UtcNow); } catch { }
+            current.SnoozeRequested = delegate {
+                try { store.Snooze(item.id, DateTime.UtcNow); } catch { return false; }
                 current = null;
-                CheckDue();
+                return true;
             };
             current.ShowInactive();
         }
@@ -293,8 +310,8 @@ namespace SemanticOverlay.NativeHost
     {
         private readonly System.Windows.Forms.Timer soundTimer = new System.Windows.Forms.Timer { Interval = 5000 };
         private int soundCount;
-        public event Action Dismissed;
-        public event Action Snoozed;
+        public Func<bool> DismissRequested;
+        public Func<bool> SnoozeRequested;
 
         public ReminderAlertForm(LocalReminderItem item)
         {
@@ -317,12 +334,23 @@ namespace SemanticOverlay.NativeHost
             Button dismiss = new Button { Text = "知道了", Size = new Size(105, 34), Location = new Point(285, 138) };
             Button snooze = new Button { Text = "10分钟后提醒", Size = new Size(135, 34), Location = new Point(140, 138) };
             Controls.Add(snooze); Controls.Add(dismiss);
-            dismiss.Click += delegate { soundTimer.Stop(); Hide(); if (Dismissed != null) Dismissed(); Dispose(); };
-            snooze.Click += delegate { soundTimer.Stop(); Hide(); if (Snoozed != null) Snoozed(); Dispose(); };
+            dismiss.Click += delegate { CompleteAction(DismissRequested); };
+            snooze.Click += delegate { CompleteAction(SnoozeRequested); };
             soundTimer.Tick += delegate { if (++soundCount >= 6) soundTimer.Stop(); else SystemSounds.Exclamation.Play(); };
         }
 
         protected override bool ShowWithoutActivation { get { return true; } }
+        private void CompleteAction(Func<bool> action)
+        {
+            bool saved = false;
+            try { saved = action != null && action(); } catch { }
+            if (!saved) {
+                MessageBox.Show(this, "提醒操作未能保存，原提醒仍保留。请检查配置目录后重试。",
+                    "提醒未保存", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            soundTimer.Stop(); Hide(); Dispose();
+        }
         protected override CreateParams CreateParams
         {
             get { CreateParams value = base.CreateParams; value.ExStyle |= NativeMethods.WsExToolWindow | NativeMethods.WsExNoActivate; return value; }

@@ -9,7 +9,8 @@ $buildSource = Join-Path $hostDir "build.ps1"
 $naudioSource = Join-Path $projectDir "vendor\NAudio\NAudio.dll"
 $serverSource = Join-Path $projectDir "server.py"
 $log = Join-Path $projectDir "_native_host.log"
-$logLineCount = if (Test-Path -LiteralPath $log) { @(Get-Content -LiteralPath $log).Count } else { 0 }
+$logOffset = if (Test-Path -LiteralPath $log) { (Get-Item -LiteralPath $log).Length } else { 0 }
+$logCreated = if (Test-Path -LiteralPath $log) { (Get-Item -LiteralPath $log).CreationTimeUtc } else { $null }
 
 function Get-ProjectHost {
     Get-CimInstance Win32_Process -Filter "Name = 'SemanticOverlay.exe'" -ErrorAction SilentlyContinue |
@@ -102,8 +103,18 @@ $registered = -not $startedNew
 $registrationFailed = $false
 while ($startedNew -and (Get-Date) -lt $deadline) {
     if (Test-Path $log) {
-        $newLog = @(Get-Content -LiteralPath $log -ErrorAction SilentlyContinue |
-            Select-Object -Skip $logLineCount) -join "`n"
+        $logInfo = Get-Item -LiteralPath $log
+        if ($logInfo.Length -lt $logOffset -or $logInfo.CreationTimeUtc -ne $logCreated) { $logOffset = 0 }
+        $newLog = ""
+        try {
+            $logStream = [IO.File]::Open($log, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+                [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+            try {
+                [void]$logStream.Seek($logOffset, [IO.SeekOrigin]::Begin)
+                $logReader = [IO.StreamReader]::new($logStream, [Text.Encoding]::UTF8)
+                try { $newLog = $logReader.ReadToEnd() } finally { $logReader.Dispose() }
+            } finally { $logStream.Dispose() }
+        } catch { $newLog = "" }
         if ($newLog -match "Ctrl\+Alt\+(K|G) registration: failed") {
             $registrationFailed = $true
             break

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -56,6 +56,18 @@ namespace SemanticOverlay.NativeHost
 
         private IntPtr OnMouseHook(int code, IntPtr message, IntPtr data)
         {
+            if (code >= 0 && message.ToInt64() == NativeMethods.WmMouseWheel &&
+                selectionAnalysis != null)
+            {
+                var scroll = (NativeMethods.MouseHookData)Marshal.PtrToStructure(
+                    data, typeof(NativeMethods.MouseHookData));
+                var readingCard = selectionAnalysis;
+                Point scrollPoint = new Point(scroll.point.X, scroll.point.Y);
+                try { dispatcher.BeginInvoke(new Action(delegate {
+                    if (selectionAnalysis == readingCard && !readingCard.IsDisposed)
+                        readingCard.ObserveChatScroll(scrollPoint);
+                })); } catch { }
+            }
             if (code >= 0 && MessageClickArmed &&
                 (message.ToInt64() == 0x0201 || message.ToInt64() == NativeMethods.WmLButtonUp ||
                  message.ToInt64() == NativeMethods.WmMouseWheel || message.ToInt64() == 0x0204))
@@ -219,22 +231,26 @@ namespace SemanticOverlay.NativeHost
         {
             services.Log("One-click probe entered: " + ClassifyChatApp(target));
             if (ClassifyChatApp(target) == "other") return;
+            MessageOperation operation = services.BeginMessageOperation(ClassifyChatApp(target));
             await Task.Delay(120);
             services.Log("One-click probe resumed");
             if (generation != selectionGeneration || NativeMethods.GetForegroundWindow() != target)
             {
                 services.Log("One-click message cancelled before capture: " +
                     (generation != selectionGeneration ? "new gesture" : "foreground changed"));
+                if (operation != null) operation.Complete("cancelled");
                 trayStatusItem.Text = "状态：读取已取消，请重新选择消息";
                 return;
             }
             if (Interlocked.CompareExchange(ref selectionProbeBusy, 1, 0) != 0)
             {
+                if (operation != null) operation.Complete("busy");
                 services.Log("One-click message capture skipped: previous probe busy");
                 trayStatusItem.Text = "状态：上一条消息仍在读取，请稍后重试";
                 return;
             }
             Stopwatch probeWatch = Stopwatch.StartNew();
+            ShowMessageHint("正在读取消息…", target, 10000, generation);
             services.Log("One-click capture started");
             MessageProbeResult result = null;
             try
@@ -246,9 +262,11 @@ namespace SemanticOverlay.NativeHost
                     Rectangle window = new Rectangle(nativeWindow.Left, nativeWindow.Top,
                         nativeWindow.Width, nativeWindow.Height);
                     MessageProbeResult accessible = MessageTextReader.ReadAtPointBounded(point, window, 1000);
-                    if (accessible != null) return accessible;
                     Rectangle bubble;
-                    if (!MessageBubbleDetector.TryFind(window, point, out bubble))
+                    bool foundBubble = MessageBubbleDetector.TryFind(window, point, out bubble);
+                    if (accessible != null && (!foundBubble || MessageTextReader.FitsBubble(accessible.Bounds, bubble)))
+                        return accessible;
+                    if (!foundBubble)
                     {
                         services.Log("One-click message capture failed: bubble not located");
                         return null;
@@ -263,15 +281,20 @@ namespace SemanticOverlay.NativeHost
             {
                 services.Log("One-click message probe failed: " + error.GetType().Name);
             }
-            finally { Interlocked.Exchange(ref selectionProbeBusy, 0); }
+            finally {
+                Interlocked.Exchange(ref selectionProbeBusy, 0);
+                HideMessageHint(generation);
+            }
             if (generation != selectionGeneration || NativeMethods.GetForegroundWindow() != target)
             {
+                if (operation != null) operation.Complete("cancelled");
                 services.Log("One-click message cancelled after capture: " +
                     (generation != selectionGeneration ? "new gesture" : "foreground changed"));
                 return;
             }
             if (result == null || String.IsNullOrWhiteSpace(result.Text))
             {
+                if (operation != null) operation.Complete("read_failed");
                 if (quietFailure)
                 {
                     // 连续查词：无法可靠确认消息时只给轻量提示——不发附近文字、
@@ -279,22 +302,22 @@ namespace SemanticOverlay.NativeHost
                     trayStatusItem.Text = "状态：未读到消息（连续查词）";
                     NativeRect failRect;
                     if (NativeMethods.GetWindowRect(target, out failRect))
-                        statusWindow.ShowMessage("没有读到完整消息", failRect, 1600);
+                        statusWindow.ShowMessage("未读到 · 选词后按 Ctrl+Alt+D", failRect, 2000);
                     services.Log("Continuous lookup: message not confirmed at gesture point");
                 }
                 else
                 {
                     trayStatusItem.Text = "状态：未读到消息，请重新按 Ctrl+Alt+K";
-                    ShowNotice("没有读到完整消息。请重新按 Ctrl+Alt+K 后再点击一次。",
-                        ToolTipIcon.Warning);
+                    ShowMessageHint("未读到 · 选词后按 Ctrl+Alt+D", target, 2500, generation);
                 }
                 return;
             }
             services.Log("One-click message captured (" + result.Text.Length + " chars, " +
                 result.Source + ", " + result.Bounds.Width + "x" + result.Bounds.Height +
                 ", " + probeWatch.ElapsedMilliseconds + "ms)");
-            OpenSelectionResult(result.Text, result.Exact, result.Source, true,
-                result.Bounds, target);
+            try { OpenSelectionResult(result.Text, result.Exact, result.Source, true,
+                result.Bounds, target, operation); }
+            catch { if (operation != null) operation.Complete("client_error", result.Source); throw; }
             trayStatusItem.Text = "状态：消息解释已打开";
         }
 
@@ -348,11 +371,12 @@ namespace SemanticOverlay.NativeHost
         }
 
         private void OpenSelectionResult(string text, bool exactSelection, string textSource,
-            bool autoAnalyze, Rectangle anchor, IntPtr target)
+            bool autoAnalyze, Rectangle anchor, IntPtr target, MessageOperation operation = null)
         {
             if (selectionAnalysis != null && !selectionAnalysis.IsDisposed)
                 selectionAnalysis.Close();
             selectionAnalysis = new SelectionAnalysisForm(services, OpenReminderEditor);
+            selectionAnalysis.Operation = operation;
             selectionAnalysis.SetAnchor(anchor, target);
             selectionAnalysis.OpenText(text, exactSelection, textSource,
                 ClassifyChatApp(selectionTarget), autoAnalyze);

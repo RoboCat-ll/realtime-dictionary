@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -129,6 +129,7 @@ namespace SemanticOverlay.NativeHost
         internal static bool DisableFloatSizeRestoreForDiagnostics;
         public bool CaptionDisclosureAccepted { get; private set; }
         public Func<string, bool> CloudConsentRequested;
+        public Action PreferenceSaveFailed;
         private readonly object cloudConsentLock = new object();
         public int IgnoredTermCount { get { return ignoredTerms.Count; } }
         public int AutoSuppressedTermCount { get { return familiarity.SuppressedCount; } }
@@ -182,7 +183,7 @@ namespace SemanticOverlay.NativeHost
             CaptionArchiveEnabled = !preferences.TryGetValue("caption_archive_enabled", out value) || value != "false";
             CaptionDisclosureAccepted = preferences.TryGetValue("caption_disclosure_v2", out value) && value == "true";
             ContinuousLookupEnabled = preferences.TryGetValue("continuous_lookup", out value) &&
-                String.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
+                String.Equals(value, "true", StringComparison.OrdinalIgnoreCase) && SelectionToolbarEnabled;
             ContinuousLookupTrigger = preferences.TryGetValue("continuous_lookup_trigger", out value) &&
                 value == "alt_click" ? "alt_click" : "double_click";
             if (!ExperimentalFeaturesEnabled && WorkMode == "caption" &&
@@ -245,6 +246,16 @@ namespace SemanticOverlay.NativeHost
                     elapsedMs, manualCorrection, success, termCount);
         }
 
+        internal MessageOperation BeginMessageOperation(string sourceApp)
+        {
+            return usageMetrics == null ? null : usageMetrics.BeginMessageOperation(sourceApp);
+        }
+
+        public void RecordCaptionMetric(string outcome, int elapsedMs, int attempts)
+        {
+            if (usageMetrics != null) usageMetrics.RecordCaption(outcome, elapsedMs, attempts);
+        }
+
         public void RecordFeedbackMetric(string triggerMode, string sourceApp, string feedback)
         {
             if (usageMetrics != null) usageMetrics.RecordFeedback(triggerMode, sourceApp, feedback);
@@ -260,12 +271,24 @@ namespace SemanticOverlay.NativeHost
             return AutoLearnFamiliarTerms && familiarity.ShouldSuppress(term);
         }
 
+        private void SavePreference(string key, string value)
+        {
+            try { preferences.SetAndSave(key, value); }
+            catch (Exception error) {
+                if (!(error is IOException) && !(error is UnauthorizedAccessException) &&
+                    !(error is System.Security.SecurityException) && !(error is InvalidOperationException)) throw;
+                preferences.SetForSession(key, value);
+                Log("Preference save unavailable; session-only setting: " + error.GetType().Name);
+                if (PreferenceSaveFailed != null) PreferenceSaveFailed();
+            }
+        }
+
         public void SetAutoLearnFamiliarTerms(bool enabled)
         {
             if (AutoLearnFamiliarTerms == enabled) return;
             if (!enabled) familiarity.EndSession(false);
             AutoLearnFamiliarTerms = enabled;
-            preferences.SetAndSave("auto_learn_familiar_terms", enabled ? "true" : "false");
+            SavePreference("auto_learn_familiar_terms", enabled ? "true" : "false");
             if (enabled) familiarity.BeginSession();
             Log("Local familiarity learning " + (enabled ? "enabled" : "disabled"));
         }
@@ -273,34 +296,35 @@ namespace SemanticOverlay.NativeHost
         public void SetExperimentalFeaturesEnabled(bool enabled)
         {
             ExperimentalFeaturesEnabled = enabled;
-            preferences.SetAndSave("experimental_features", enabled ? "true" : "false");
+            SavePreference("experimental_features", enabled ? "true" : "false");
             Log("Experimental features " + (enabled ? "enabled" : "disabled"));
         }
 
         public void SetCaptionPromptEnabled(bool enabled)
         {
             CaptionPromptEnabled = enabled;
-            preferences.SetAndSave("caption_prompt_enabled", enabled ? "true" : "false");
+            SavePreference("caption_prompt_enabled", enabled ? "true" : "false");
             Log("Caption startup prompt " + (enabled ? "enabled" : "disabled"));
         }
 
         public void SetCaptionArchiveEnabled(bool enabled)
         {
             CaptionArchiveEnabled = enabled;
-            preferences.SetAndSave("caption_archive_enabled", enabled ? "true" : "false");
+            SavePreference("caption_archive_enabled", enabled ? "true" : "false");
         }
 
         public void SetContinuousLookupEnabled(bool enabled)
         {
+            if (enabled && !SelectionToolbarEnabled) SetSelectionToolbarEnabled(true);
             ContinuousLookupEnabled = enabled;
-            preferences.SetAndSave("continuous_lookup", enabled ? "true" : "false");
+            SavePreference("continuous_lookup", enabled ? "true" : "false");
             Log("Continuous lookup mode " + (enabled ? "enabled" : "disabled"));
         }
 
         public void SetContinuousLookupTrigger(string value)
         {
             ContinuousLookupTrigger = value == "alt_click" ? "alt_click" : "double_click";
-            preferences.SetAndSave("continuous_lookup_trigger", ContinuousLookupTrigger);
+            SavePreference("continuous_lookup_trigger", ContinuousLookupTrigger);
             Log("Continuous lookup trigger changed to " + ContinuousLookupTrigger);
         }
 
@@ -334,13 +358,16 @@ namespace SemanticOverlay.NativeHost
             try { SetFloatSize(logicalSize); return true; }
             catch (UnauthorizedAccessException) { Log("Float size save denied; current-session size retained."); }
             catch (IOException) { Log("Float size save unavailable; current-session size retained."); }
+            catch (System.Security.SecurityException) { Log("Float size save blocked; current-session size retained."); }
+            catch (InvalidOperationException) { Log("Float size preference unreadable; current-session size retained."); }
+            if (PreferenceSaveFailed != null) PreferenceSaveFailed();
             return false;
         }
 
         public void AcceptCaptionDisclosure()
         {
             CaptionDisclosureAccepted = true;
-            preferences.SetAndSave("caption_disclosure_v2", "true");
+            SavePreference("caption_disclosure_v2", "true");
         }
 
         private void EnsureCloudConsent(bool textProvider)
@@ -359,7 +386,7 @@ namespace SemanticOverlay.NativeHost
                 if (preferences.TryGetValue(key, out value) && value == "true") return;
                 if (CloudConsentRequested == null || !CloudConsentRequested(provider.Host))
                     throw new InvalidOperationException("尚未同意发送文字，本次请求未发送。");
-                preferences.SetAndSave(key, "true");
+                SavePreference(key, "true");
             }
         }
 
@@ -374,41 +401,42 @@ namespace SemanticOverlay.NativeHost
             if (value != "concise" && value != "standard" && value != "detailed")
                 value = "standard";
             Difficulty = value;
-            preferences.SetAndSave("difficulty", value);
+            SavePreference("difficulty", value);
             Log("Highlight difficulty changed to " + value);
         }
 
         public void SetSelectionToolbarEnabled(bool enabled)
         {
+            if (!enabled && ContinuousLookupEnabled) SetContinuousLookupEnabled(false);
             SelectionToolbarEnabled = enabled;
-            preferences.SetAndSave("selection_toolbar", enabled ? "true" : "false");
+            SavePreference("selection_toolbar", enabled ? "true" : "false");
         }
 
         public void SetScanScope(string value)
         {
             ScanScope = value == "full" ? "full" : "auto";
-            preferences.SetAndSave("scan_scope", ScanScope);
+            SavePreference("scan_scope", ScanScope);
             Log("Scan scope changed to " + ScanScope);
         }
 
         public void SetWorkMode(string value)
         {
             WorkMode = value == "caption" ? "caption" : "conversation";
-            preferences.SetAndSave("work_mode", WorkMode);
+            SavePreference("work_mode", WorkMode);
             Log("Work mode changed to " + WorkMode);
         }
 
         public void SetPresentationMode(string value)
         {
             PresentationMode = value == "attached" ? "attached" : "assistant";
-            preferences.SetAndSave("presentation_mode", PresentationMode);
+            SavePreference("presentation_mode", PresentationMode);
             Log("Conversation presentation changed to " + PresentationMode);
         }
 
         public void SetCaptionAudioScope(string value)
         {
             CaptionAudioScope = value == "system" ? "system" : "process";
-            preferences.SetAndSave("caption_audio_scope", CaptionAudioScope);
+            SavePreference("caption_audio_scope", CaptionAudioScope);
             Log("Caption audio scope changed to " + CaptionAudioScope);
         }
 
@@ -603,6 +631,8 @@ namespace SemanticOverlay.NativeHost
             EnsureRunning();
             ProviderUsageSummary usage = GetJson<ProviderUsageSummary>("http://127.0.0.1:8877/usage");
             StringBuilder text = new StringBuilder("日期：" + usage.date + "\r\n" + usage.billing_notice + "\r\n");
+            if (usageMetrics != null && usageMetrics.FailedWrites > 0)
+                text.Append("\r\n本次交互统计保存失败 " + usageMetrics.FailedWrites + " 次；统计可能不完整。\r\n");
             foreach (ProviderUsageGroup group in usage.groups ?? new List<ProviderUsageGroup>()) {
                 text.Append("\r\n" + group.provider + " / " + group.model + "\r\n请求：" + group.requests +
                     " 次；用量未知：" + group.unknown_usage_requests + " 次\r\n");
@@ -791,7 +821,7 @@ namespace SemanticOverlay.NativeHost
         public void Log(string message)
         {
             string line = "[" + DateTime.Now.ToString("HH:mm:ss") + "] " + message;
-            try { File.AppendAllText(logPath, line + Environment.NewLine, Encoding.UTF8); }
+            try { BoundedJournal.Append(logPath, line, 2 * 1024 * 1024); }
             catch { }
         }
 

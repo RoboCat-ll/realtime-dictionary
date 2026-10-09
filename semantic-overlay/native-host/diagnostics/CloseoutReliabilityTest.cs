@@ -85,6 +85,55 @@ namespace SemanticOverlay.NativeHost
                     form.Close();
                 }
 
+                int sentenceRefreshes = 0;
+                int reminderOpens = 0;
+                using (var form = new SelectionAnalysisForm(null, delegate { reminderOpens++; }, null,
+                    delegate(string text, bool correction, bool refresh) {
+                        if (refresh && ++sentenceRefreshes == 1) throw new TimeoutException("private-provider-body");
+                        if (refresh && sentenceRefreshes == 2) return new SelectionAnalysisResponse {
+                            analysis_mode = "local_fallback", explanation = "服务暂不可用" };
+                        return new SelectionAnalysisResponse { analysis_mode = "model",
+                            explanation = "可靠整句含义", display_text = "RAG 的原句",
+                            actions = new System.Collections.Generic.List<AnalysisEntity> {
+                                new AnalysisEntity { text = "RAG", title = "讨论 RAG", start = 0, end = 3 } },
+                            terms = new System.Collections.Generic.List<SelectionTerm> {
+                                new SelectionTerm { text = "RAG", explanation = "检索增强生成" } } };
+                    }))
+                {
+                    form.Show();
+                    var input = Field<TextBox>(form, "source");
+                    input.Text = "RAG 的原句";
+                    Task first = Call(form, "RunAnalysis", false);
+                    Wait(delegate { return first.IsCompleted; });
+                    var wordAction = Field<Button>(form, "explainSelected");
+                    var actionRow = Field<FlowLayoutPanel>(form, "terms");
+                    Require(actionRow.ClientRectangle.Contains(wordAction.Bounds) && !actionRow.AutoScroll,
+                        "Selected-word action must fit without a redundant scrollbar");
+                    for (int attempt = 0; attempt < 2; attempt++)
+                    {
+                        Task retry = Call(form, "RunAnalysis", true);
+                        Wait(delegate { return retry.IsCompleted; });
+                        Require(Field<TextBox>(form, "body").Text == "可靠整句含义" &&
+                            Field<RichTextBox>(form, "sentence").Text == "RAG 的原句" &&
+                            Field<Label>(form, "status").Text.Contains("保留"),
+                            "Sentence refresh failure must preserve meaning and source");
+                        Require(Field<System.Collections.IList>(form, "linkedTerms").Count == 1,
+                            "Refresh failure must retain clickable term annotations");
+                        var rows = Field<FlowLayoutPanel>(form, "tasks");
+                        ((Button)rows.Controls[0].Controls[1]).PerformClick();
+                        Require(reminderOpens == attempt + 1,
+                            "Retained calendar candidate must remain clickable after refresh");
+                    }
+                    Task recovered = Call(form, "RunAnalysis", true);
+                    Wait(delegate { return recovered.IsCompleted; });
+                    Require(Field<Label>(form, "status").Text == "整句解释 · 模型结果" &&
+                        Field<Button>(form, "analyze").Enabled, "Retry must recover normally");
+                    input.Text = "另一条消息";
+                    Require(Field<string>(form, "successfulAnalysisInput") == null,
+                        "Editing a sentence must invalidate retained analysis");
+                    form.Close();
+                }
+
                 int briefCalls = 0;
                 using (var form = new SelectionAnalysisForm(null, null,
                     delegate(string term, string context, string detail) {
@@ -129,6 +178,37 @@ namespace SemanticOverlay.NativeHost
                     Require(!newer.IsFaulted && input.Text == "NEW" &&
                         Field<TextBox>(form, "body").Text == "new definition",
                         "Canonical rendering must work while stale lookup results are discarded");
+                    form.Close();
+                }
+
+                int refreshCalls = 0;
+                using (var form = new ManualLookupForm(null, delegate(string term, bool refresh) {
+                    if (!refresh) return new LookupResponse { term = term, lookup_mode = "model",
+                        explanation = "已有可靠释义", can_refresh = true };
+                    if (++refreshCalls == 2) return new LookupResponse {
+                        lookup_mode = "local_fallback", explanation = "服务暂不可用", can_refresh = true };
+                    throw new TimeoutException("private-provider-body");
+                }))
+                {
+                    form.Show();
+                    Field<TextBox>(form, "query").Text = "RAG";
+                    Task first = Call(form, "RunLookup", false);
+                    Wait(delegate { return first.IsCompleted; });
+                    Task refresh = Call(form, "RunLookup", true);
+                    Wait(delegate { return refresh.IsCompleted; });
+                    Require(Field<TextBox>(form, "body").Text == "已有可靠释义" &&
+                        Field<Label>(form, "notice").Text.Contains("保留"),
+                        "Failed refresh must preserve the prior same-query model definition");
+                    Task fallback = Call(form, "RunLookup", true);
+                    Wait(delegate { return fallback.IsCompleted; });
+                    Require(Field<TextBox>(form, "body").Text == "已有可靠释义" &&
+                        Field<Button>(form, "retry").Enabled,
+                        "Fallback refresh must preserve the model answer and allow another retry");
+                    Field<TextBox>(form, "query").Text = "other";
+                    Task edited = Call(form, "RunLookup", true);
+                    Wait(delegate { return edited.IsCompleted; });
+                    Require(!Field<TextBox>(form, "body").Text.Contains("已有可靠释义"),
+                        "An edited query must not inherit the prior definition");
                     form.Close();
                 }
 

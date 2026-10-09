@@ -207,4 +207,14 @@ if ($LASTEXITCODE -ne 0) { throw "Compact workflow diagnostic compilation failed
     "$hostDir\diagnostics\RefinementTest.cs"
 if ($LASTEXITCODE -ne 0) { throw "Refinement test compilation failed." }
 
+foreach ($auditDiagnostic in @("AuditStorageTest", "AuditCaptionHistoryTest", "FivePointFlowTest", "LocalVideoCaptureTest")) {
+    & $compiler /nologo /target:exe /platform:x64 /optimize+ `
+        "/main:SemanticOverlay.NativeHost.$auditDiagnostic" `
+        "/out:$outputDir\$auditDiagnostic.exe" `
+        /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll `
+        /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll `
+        /reference:System.Security.dll /reference:"$naudio" `
+        @nativeSources "$hostDir\diagnostics\$auditDiagnostic.cs"
+    if ($LASTEXITCODE -ne 0) { throw "$auditDiagnostic compilation failed." }
+}
 Write-Host "Built $outputDir\SemanticOverlay.exe"

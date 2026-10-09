@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Drawing;
 using System.Linq;
 using System.Reflection;
@@ -108,10 +108,9 @@ namespace SemanticOverlay.NativeHost
                         Require(Item(menu.Items, "字幕记录…").Enabled && Item(menu.Items, "模型设置…").Enabled,
                             "Archived captions or core settings became gated by experiments");
                         ToolStripMenuItem continuous = Item(menu.Items, "连续查词模式");
-                        Require(continuous.DropDownItems.OfType<ToolStripMenuItem>()
-                                .Select(item => item.Text).SequenceEqual(new[] { "触发方式" }),
-                            "Continuous lookup trigger submenu missing");
-                        ToolStripMenuItem triggerMenu = Item(continuous.DropDownItems, "触发方式");
+                        Require(continuous.DropDownItems.Count == 0,
+                            "Continuous switch must be a clickable leaf, not a submenu");
+                        ToolStripMenuItem triggerMenu = Item(Item(menu.Items, "设置").DropDownItems, "连续查词触发方式");
                         Require(triggerMenu.DropDownItems.OfType<ToolStripMenuItem>()
                                 .Select(item => item.Text).SequenceEqual(new[] { "双击消息（默认）", "Alt＋单击消息" }) &&
                             triggerMenu.DropDownItems.OfType<ToolStripMenuItem>()

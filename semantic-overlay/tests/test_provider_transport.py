@@ -313,6 +313,27 @@ class TransportTests(unittest.TestCase):
         guard.expire()  # Simulate a callback that was already queued.
         connection_socket.shutdown.assert_not_called()
 
+    def test_early_socket_header_timeout_is_retryable_only_with_header_budget(self):
+        for budget in (None, 2.5):
+            with self.subTest(header_budget=budget):
+                request = urllib.request.Request("http://fixture.invalid/chat/completions", data=b"{}")
+                request.timeout = 10
+                request.rd_started = time.monotonic()
+                request.rd_deadline = request.rd_started + 10
+                if budget is not None:
+                    request.rd_header_budget = budget
+                connection = mock.Mock()
+                # Simulate a socket timer firing before the nominal header deadline.
+                connection.getresponse.side_effect = TimeoutError("fixture timeout")
+                pool = transport.ConnectionPool()
+                with mock.patch.object(transport, "SocketDeadline"):
+                    with self.assertRaises(TimeoutError) as caught:
+                        transport.open_connection(request, mock.Mock(return_value=connection), pool)
+                self.assertEqual(budget is not None,
+                                 isinstance(caught.exception, transport.HeaderBudgetTimeout))
+                self.assertEqual(0, pool.active)
+                connection.close.assert_called_once()
+
     def test_socket_deadline_interrupts_headers_that_never_finish(self):
         connection_socket = mock.Mock()
         guard = transport.SocketDeadline(connection_socket, time.monotonic() + 1)

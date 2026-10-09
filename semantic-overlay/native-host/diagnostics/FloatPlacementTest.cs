@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -28,6 +29,16 @@ namespace SemanticOverlay.NativeHost
         private static void Require(bool condition, string message)
         {
             if (!condition) throw new InvalidOperationException(message);
+        }
+
+        private static void Foreground(Form form)
+        {
+            // A shell-started diagnostic is subject to Windows foreground lock.
+            // Explicit synthetic Alt releases that lock for this UI fixture.
+            SendKeys.SendWait("%");
+            NativeMethods.SetForegroundWindow(form.Handle);
+            form.Activate();
+            Application.DoEvents();
         }
 
         private static void Wait(Func<bool> condition)
@@ -230,6 +241,56 @@ namespace SemanticOverlay.NativeHost
             }
         }
 
+        private static void CheckReadingContinuity()
+        {
+            using (var target = new Form { Bounds = new Rectangle(80, 80, 900, 700) })
+            using (var form = new SelectionAnalysisForm(null, null))
+            {
+                target.Show();
+                form.SetAnchor(new Rectangle(140, 160, 200, 40), target.Handle);
+                form.Show();
+                var sentence = Field<RichTextBox>(form, "sentence");
+                var body = Field<TextBox>(form, "body");
+                sentence.Text = "消息原文 RAG";
+                body.Text = "已经获得的解释";
+                form.Size = new Size(480, 300);
+                target.Size = new Size(820, 640);
+                Invoke(form, "FollowTick", null, EventArgs.Empty);
+                Require(!form.IsDisposed && sentence.Text == "消息原文 RAG" &&
+                    body.Text == "已经获得的解释", "Target resize must retain the reading card and contents");
+                Require(Field<Rectangle>(form, "anchorRect").IsEmpty &&
+                    Field<Label>(form, "heading").Text.Contains("已保留原消息"),
+                    "Resize must invalidate stale bubble coordinates visibly");
+                Require(form.Size == new Size(480, 300), "Resize must preserve a fitting reading size");
+                Invoke(form, "ShowWordView");
+                Invoke(form, "ShowSentenceView");
+                Require(Field<Label>(form, "heading").Text.Contains("已保留原消息"),
+                    "View switching must retain detached-source indication");
+                form.Hide();
+                form.RestoreReadingCard();
+                Require(form.Visible && body.Text == "已经获得的解释", "Explicit restore must recover existing contents");
+                form.SetAnchor(new Rectangle(150, 180, 220, 40), target.Handle);
+                Require(!Field<Label>(form, "heading").Text.Contains("已保留原消息"),
+                    "A newly selected message must reset the detached indicator");
+                Foreground(target);
+                Application.DoEvents();
+                Require(NativeMethods.GetForegroundWindow() == target.Handle,
+                    "Scroll test needs its own target in the foreground");
+                form.ObserveChatScroll(new Point(target.Left - 20, target.Top - 20));
+                Require(!Field<Rectangle>(form, "anchorRect").IsEmpty,
+                    "Wheel outside the target must not detach its bubble");
+                Point chatPoint = new Point(target.Right - 20, target.Bottom - 20);
+                Require(!form.Bounds.Contains(chatPoint), "Scroll fixture must target the chat, not the float");
+                form.ObserveChatScroll(chatPoint);
+                Require(Field<Rectangle>(form, "anchorRect").IsEmpty &&
+                    body.Text == "已经获得的解释", "Chat wheel must retain content and invalidate the anchor");
+                target.Close();
+                Invoke(form, "FollowTick", null, EventArgs.Empty);
+                Require(form.IsDisposed, "Closing the actual target must still close its reading card");
+            }
+            Console.WriteLine("target-resize-reading-retained-restore-close-ok");
+        }
+
         private static void CheckSizing(string previews)
         {
             Rectangle original = new Rectangle(200, 200, 480, 320);
@@ -273,7 +334,7 @@ namespace SemanticOverlay.NativeHost
                 Application.DoEvents();
 
                 // 短正文：完整显示且无常驻滚动条
-                Require(form.Height >= 320 * dpi / 96 && body.Height >= 70 * dpi / 96,
+                Require(form.Height >= 320 * dpi / 96 && body.Height >= 34 * dpi / 96,
                     "Sentence view must retain a readable height even for short content");
                 Require(body.ScrollBars == ScrollBars.None,
                     "Short meaning must not show a permanent scrollbar");
@@ -292,6 +353,41 @@ namespace SemanticOverlay.NativeHost
                     "Long meaning must gain a vertical scrollbar only beyond the cap");
                 Snapshot(form, previews, "float-size-long.png");
 
+                Size automaticSize = form.Size;
+                int compactBodyHeight = body.Height;
+                form.GetType().GetField("userSized", BindingFlags.Instance | BindingFlags.NonPublic)
+                    .SetValue(form, true);
+                form.Height += 200;
+                Invoke(form, "UpdateCardLayout");
+                Application.DoEvents();
+                Require(body.Height > compactBodyHeight,
+                    "Manually enlarging a sentence card must increase usable meaning area");
+                Snapshot(form, previews, "float-reading-tall.png");
+                string originalSource = sentence.Text;
+                string longMeaning = body.Text;
+                sentence.Text = String.Concat(Enumerable.Repeat("这是一条需要完整阅读的长消息，原句也应该使用扩大的阅读空间。", 8));
+                body.Text = "这句话是在讨论消息阅读。";
+                Invoke(form, "UpdateCardLayout");
+                Application.DoEvents();
+                Require(sentence.Height > 110 * dpi / 96,
+                    "Long source must gain space when meaning is short");
+                Button retryButton = Field<Button>(form, "analyze");
+                Point retryBottom = form.PointToClient(retryButton.PointToScreen(new Point(0, retryButton.Height)));
+                Require(retryButton.Visible && retryBottom.Y <= form.ClientSize.Height,
+                    "Growing reading areas must leave the retry action visible");
+                Require(body.ScrollBars == ScrollBars.None, "Short meaning must stay scrollbar-free in a manual card");
+                Require(body.Height <= 40 * dpi / 96,
+                    "Short meaning must not consume surplus manual height");
+                sentence.Text = originalSource;
+                Invoke(form, "UpdateCardLayout");
+                Application.DoEvents();
+                Snapshot(form, previews, "float-short-manual.png");
+                body.Text = longMeaning;
+                form.GetType().GetField("userSized", BindingFlags.Instance | BindingFlags.NonPublic)
+                    .SetValue(form, false);
+                form.Size = automaticSize;
+                Invoke(form, "UpdateCardLayout");
+
                 // 用户调整尺寸后：返回整句、切换词语、收到结果都不再强制恢复
                 Panel grip = Field<Panel>(form, "resizeGrip");
                 Require(grip != null && grip.Visible, "Resize grip must exist");
@@ -309,7 +405,8 @@ namespace SemanticOverlay.NativeHost
                     Cursor.Position = new Point(Cursor.Position.X + 60, Cursor.Position.Y + 30);
                     Invoke(edges[1], "OnMouseMove", new MouseEventArgs(MouseButtons.Left, 0, 62, 110, 0));
                     Require(form.Width == beforeDrag.Width + 60 && form.Height == beforeDrag.Height,
-                        "Real right-edge handlers must change width independently");
+                        "Real right-edge handlers must change width independently; before=" + beforeDrag +
+                        " after=" + form.Size + " cursor=" + Cursor.Position + " area=" + Screen.FromControl(form).WorkingArea);
                     Invoke(edges[1], "OnMouseUp", new MouseEventArgs(MouseButtons.Left, 1, 62, 110, 0));
                     Require(!edges[1].Capture && !Field<bool>(form, "gripResizing"),
                         "Resize must release capture on completion");
@@ -332,6 +429,10 @@ namespace SemanticOverlay.NativeHost
                     text = "RAG", explanation = "这里指检索增强生成。" });
                 Wait(delegate { return show.IsCompleted; });
                 Require(form.Size == custom, "User size must survive switching to the word view: " + form.Size);
+                Require(termBody.Height <= 100 * dpi / 96,
+                    "Short word definition must not consume surplus manual height");
+                Require(termBody.ScrollBars == ScrollBars.None,
+                    "Short word content must remain scrollbar-free after enlargement");
                 LinkLabel back = Field<LinkLabel>(form, "wordBack");
                 Invoke(back, "OnLinkClicked", new LinkLabelLinkClickedEventArgs(back.Links[0]));
                 Application.DoEvents();
@@ -355,6 +456,59 @@ namespace SemanticOverlay.NativeHost
                 form.Close();
                 Console.WriteLine("float-sizing-ok");
             }
+        }
+
+        private static void CheckInitialHide()
+        {
+            using (var target = new Form { Bounds = new Rectangle(60, 60, 850, 700) })
+            using (var other = new Form { Bounds = new Rectangle(950, 100, 300, 200) })
+            using (var form = new SelectionAnalysisForm(null, null))
+            {
+                target.Show();
+                form.SetAnchor(new Rectangle(100, 150, 150, 40), target.Handle);
+                form.OpenText("待确认的原句", false, "ocr", "synthetic", false);
+                other.Show(); Foreground(other);
+                Require(NativeMethods.GetForegroundWindow() == other.Handle, "Foreign focus fixture required");
+                Invoke(form, "FollowTick", null, EventArgs.Empty);
+                Field<System.Windows.Forms.Timer>(form, "followTimer").Stop();
+                var watch = Stopwatch.StartNew();
+                while (watch.ElapsedMilliseconds < 650) { Application.DoEvents(); Thread.Sleep(10); }
+                Require(!NativeMethods.IsWindowVisible(form.Handle),
+                    "Initial compensation must not resurrect a card hidden for foreign foreground");
+                Foreground(target);
+                Console.WriteLine("restore-fixture foreground=" + NativeMethods.GetForegroundWindow() +
+                    " target=" + target.Handle + " hidden=" + Field<bool>(form, "autoHidden") +
+                    " managed=" + form.Visible);
+                Invoke(form, "FollowTick", null, EventArgs.Empty);
+                Require(NativeMethods.IsWindowVisible(form.Handle), "Returning to target restores the card");
+            }
+            Console.WriteLine("initial-hide-respected-ok");
+        }
+
+        private static void CheckWordRevisit()
+        {
+            int calls = 0;
+            using (var form = new SelectionAnalysisForm(null, null,
+                delegate(string term, string context, string detail) {
+                    Interlocked.Increment(ref calls);
+                    return new LookupResponse { lookup_mode = "model", explanation = context + ":" + term };
+                }))
+            {
+                form.Show();
+                Field<TextBox>(form, "source").Text = "项目反馈";
+                var task = (Task)Invoke(form, "ShowTerm", new SelectionTerm { text = "反馈" });
+                Wait(delegate { return task.IsCompleted; });
+                Invoke(form, "ShowSentenceView");
+                task = (Task)Invoke(form, "ShowTerm", new SelectionTerm { text = "反馈" });
+                Wait(delegate { return task.IsCompleted; });
+                Require(calls == 1, "Returning to an explained word must not request it again");
+                Field<TextBox>(form, "source").Text = "控制系统反馈";
+                task = (Task)Invoke(form, "ShowTerm", new SelectionTerm { text = "反馈" });
+                Wait(delegate { return task.IsCompleted; });
+                Require(calls == 2 && Field<TextBox>(form, "termBody").Text.Contains("控制系统"),
+                    "Changed context must request a new explanation");
+            }
+            Console.WriteLine("word-revisit-context-cache-ok");
         }
 
         private static void CheckStaleAndRetry(string previews)
@@ -432,6 +586,9 @@ namespace SemanticOverlay.NativeHost
             try
             {
                 CheckPlacement();
+                CheckReadingContinuity();
+                CheckInitialHide();
+                CheckWordRevisit();
                 string previews = args.Length > 0 ? args[0] : null;
                 CheckViewSwitchAndFocus(previews);
                 CheckSizing(previews);

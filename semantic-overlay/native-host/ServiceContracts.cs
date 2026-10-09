@@ -75,6 +75,7 @@ namespace SemanticOverlay.NativeHost
 
     internal sealed class SelectionAnalysisResponse
     {
+        public bool analysis_cached { get; set; }
         public bool ok { get; set; }
         public string source_text { get; set; }
         public string display_text { get; set; }
@@ -168,6 +169,7 @@ namespace SemanticOverlay.NativeHost
         public int recognize_ms { get; set; }
         public int worker_ms { get; set; }
         public List<OcrWord> words { get; set; }
+        public List<OcrWord> latin_words { get; set; }
     }
 
     internal sealed class OcrWord

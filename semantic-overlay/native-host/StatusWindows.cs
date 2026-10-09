@@ -199,15 +199,20 @@ namespace SemanticOverlay.NativeHost
     {
         private readonly Label label;
         private readonly System.Windows.Forms.Timer dismissTimer;
+        private readonly bool clickThrough;
 
-        public StatusForm()
+        public StatusForm(bool clickThrough = false)
         {
+            this.clickThrough = clickThrough;
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.Manual;
-            TopMost = true;
+            // WinForms applies managed TopMost during first handle creation with
+            // activation. Compact hints use SetWindowPos(SWP_NOACTIVATE) instead.
+            TopMost = !clickThrough;
             BackColor = Color.FromArgb(255, 248, 218);
             ClientSize = new Size(104, 32);
+            if (clickThrough) { ClientSize = new Size(220, 32); Opacity = 0.97; }
             DoubleBuffered = true;
 
             label = new Label();
@@ -274,10 +279,19 @@ namespace SemanticOverlay.NativeHost
 
         public void ShowMessage(string message, NativeRect target, int milliseconds)
         {
+            dismissTimer.Stop();
             label.Text = message ?? string.Empty;
+            Rectangle working = Screen.FromRectangle(new Rectangle(target.Left, target.Top,
+                Math.Max(1, target.Width), Math.Max(1, target.Height))).WorkingArea;
+            int textWidth = TextRenderer.MeasureText(label.Text, label.Font).Width + 16;
+            ClientSize = new Size(Math.Min(Math.Max(clickThrough ? 220 : 104, textWidth),
+                Math.Max(104, working.Width - 16)), ClientSize.Height);
             PositionFor(target);
             if (!Visible)
-                NativeMethods.ShowWindow(Handle, NativeMethods.SwShowNoActivate);
+            {
+                IntPtr window = Handle;
+                NativeMethods.ShowWindow(window, NativeMethods.SwShowNoActivate);
+            }
             NativeMethods.SetWindowPos(
                 Handle,
                 NativeMethods.HwndTopMost,

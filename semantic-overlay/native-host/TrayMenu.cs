@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -35,7 +35,7 @@ namespace SemanticOverlay.NativeHost
                 delegate { OpenManualLookup(false); });
             ToolStripMenuItem continuousItem = new ToolStripMenuItem("连续查词模式") {
                 Checked = services.ContinuousLookupEnabled,
-                ToolTipText = "开启后，双击 QQ／微信消息即解释（可改为 Alt＋单击）。需要「启用点击消息解释」保持开启。双击与客户端原生行为的兼容性尚在验收中。"
+                ToolTipText = "开启后，双击 QQ／微信消息即解释（可改为 Alt＋单击），会同时启用点击消息解释。双击与客户端原生行为的兼容性尚在验收中。"
             };
             continuousItem.Click += delegate {
                 services.SetContinuousLookupEnabled(!services.ContinuousLookupEnabled);
@@ -67,7 +67,8 @@ namespace SemanticOverlay.NativeHost
             }
             continuousTriggerMenu.DropDownOpening += delegate { refreshTriggerChecks(); };
             refreshTriggerChecks();
-            continuousItem.DropDownItems.Add(continuousTriggerMenu);
+            settingsMenu.DropDownItems.Add(continuousTriggerMenu);
+            continuousTriggerMenu.Text = "连续查词触发方式";
             menu.Items.Add(continuousItem);
             menu.Opening += delegate { continuousItem.Checked = services.ContinuousLookupEnabled; };
             menu.Items.Add("字幕记录…", null,

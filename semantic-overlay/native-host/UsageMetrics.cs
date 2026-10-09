@@ -3,9 +3,26 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using System.Web.Script.Serialization;
+using System.Diagnostics;
+using System.Threading;
 
 namespace SemanticOverlay.NativeHost
 {
+    internal sealed class MessageOperation
+    {
+        private readonly Stopwatch watch = Stopwatch.StartNew();
+        private readonly Action<string, int, string, bool> record;
+        private int completed;
+        internal bool IsCompleted { get { return completed != 0; } }
+        internal MessageOperation(Action<string, int, string, bool> callback) { record = callback; }
+        internal void Complete(string outcome, string textSource = "unknown", bool cacheHit = false)
+        {
+            if (Interlocked.Exchange(ref completed, 1) != 0) return;
+            watch.Stop();
+            record(outcome, (int)Math.Min(600000, watch.ElapsedMilliseconds), textSource, cacheHit);
+        }
+    }
+
     // Product evidence only. The API intentionally accepts bounded categorical
     // fields and numbers, never chat text, terms, explanations, screenshots or keys.
     internal sealed class UsageMetricsStore
@@ -15,6 +32,7 @@ namespace SemanticOverlay.NativeHost
         private readonly JavaScriptSerializer serializer = new JavaScriptSerializer();
         private readonly string path;
         private readonly string sessionId = Guid.NewGuid().ToString("N");
+        internal int FailedWrites;
 
         internal string Path { get { return path; } }
 
@@ -68,6 +86,30 @@ namespace SemanticOverlay.NativeHost
             fields["manual_correction"] = manualCorrection;
             fields["success"] = success;
             fields["count"] = Math.Max(0, Math.Min(termCount, 5));
+            Append(fields);
+        }
+
+        internal MessageOperation BeginMessageOperation(string sourceApp)
+        {
+            string id = Guid.NewGuid().ToString("N");
+            return new MessageOperation(delegate(string outcome, int elapsed, string source, bool cached) {
+                var fields = BaseEvent("message_operation_completed");
+                fields["operation_id"] = id;
+                fields["source_app"] = Category(sourceApp, "wechat", "qq", "other");
+                fields["outcome"] = Category(outcome, "model", "local_result", "local_unavailable", "local_fallback", "read_failed", "busy", "cancelled", "edited", "client_error", "invalid_input");
+                fields["elapsed_ms"] = elapsed;
+                fields["text_source"] = Category(source, "message_accessibility", "bubble_ocr", "accessibility", "ocr");
+                fields["cache_hit"] = cached;
+                Append(fields);
+            });
+        }
+
+        internal void RecordCaption(string outcome, int elapsedMs, int attempts)
+        {
+            var fields = BaseEvent("caption_chunk_completed");
+            fields["outcome"] = Category(outcome, "transcript", "empty", "gap", "dropped", "cancelled");
+            fields["elapsed_ms"] = Math.Max(0, Math.Min(600000, elapsedMs));
+            fields["attempts"] = Math.Max(0, Math.Min(2, attempts));
             Append(fields);
         }
 
@@ -125,14 +167,10 @@ namespace SemanticOverlay.NativeHost
             {
                 lock (gate)
                 {
-                    FileInfo existing = new FileInfo(path);
-                    if (existing.Exists && existing.Length >= MaximumBytes) return;
-                    Directory.CreateDirectory(System.IO.Path.GetDirectoryName(path));
-                    File.AppendAllText(path, serializer.Serialize(fields) + Environment.NewLine,
-                        new UTF8Encoding(false));
+                    BoundedJournal.Append(path, serializer.Serialize(fields), MaximumBytes);
                 }
             }
-            catch { }
+            catch { Interlocked.Increment(ref FailedWrites); }
         }
     }
 }

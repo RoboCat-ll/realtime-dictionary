@@ -11,12 +11,28 @@ namespace SemanticOverlay.NativeHost
         [STAThread]
         public static int Main()
         {
+            if (OverlayContext.TrimAudioOverlap("with your family", "Your family and drive.", true) != "and drive." ||
+                OverlayContext.TrimAudioOverlap("with your family", "Your family and drive.", false) != "Your family and drive." ||
+                OverlayContext.TrimAudioOverlap("yes", "Yes yes please.", true) != "Yes yes please." ||
+                OverlayContext.TrimAudioOverlap("we need snacks", "We have monkeys.", true) != "We have monkeys." ||
+                OverlayContext.TrimAudioOverlap("现在讨论这个方案", "这个方案明天开始。", true) != "明天开始。" ||
+                OverlayContext.TrimAudioOverlap("好好", "好好看看。", true) != "好好看看。")
+                throw new InvalidOperationException("Audio overlap merge lost new or deliberately repeated words.");
+            if (!OverlayContext.CanMergeAudioChunk(true, 2, 1) ||
+                OverlayContext.CanMergeAudioChunk(false, 2, 1) ||
+                OverlayContext.CanMergeAudioChunk(true, 3, 1) ||
+                OverlayContext.CanMergeAudioChunk(true, 1, -1))
+                throw new InvalidOperationException("Overlap merge crossed a missing chunk or new session.");
             string first = OverlayContext.NormalizeTranscriptIdentity("One API，讨论会！");
             string second = OverlayContext.NormalizeTranscriptIdentity("one api 讨论会");
             if (!String.Equals(first, second, StringComparison.Ordinal))
                 throw new InvalidOperationException("Formatting-only transcript changes were not normalized.");
             if (OverlayContext.NormalizeTranscriptIdentity("，。！？ …").Length != 0)
                 throw new InvalidOperationException("Punctuation-only transcript was accepted.");
+            DateTime chunkTime = DateTime.Now;
+            if (!OverlayContext.IsRepeatedAudioResult("YES", chunkTime, "YES", chunkTime) ||
+                OverlayContext.IsRepeatedAudioResult("YES", chunkTime.AddSeconds(2), "YES", chunkTime))
+                throw new InvalidOperationException("Distinct repeated speech was discarded or same-chunk replay accepted.");
             var speech = OverlayContext.SplitCaptionSpeech(
                 "  First sentence. Second sentence! 这是第三句。 版本 3.5 仍正常");
             if (speech.Count != 4 || speech[0].Text != "First sentence." ||
@@ -49,6 +65,8 @@ namespace SemanticOverlay.NativeHost
             DateTime started = new DateTime(2024, 2, 11, 10, 0, 0);
             backlog.Enqueue(new byte[] { 1 }, started);
             CaptionAudioChunk active = backlog.TakeNext();
+            active.HasOverlap = true;
+            active.Sequence = 42;
             backlog.Enqueue(new byte[] { 2 }, started.AddSeconds(1));
             backlog.Enqueue(new byte[] { 3 }, started.AddSeconds(2));
             CaptionAudioChunk overflow = backlog.Enqueue(new byte[] { 4 }, started.AddSeconds(3));
@@ -57,8 +75,40 @@ namespace SemanticOverlay.NativeHost
                 throw new InvalidOperationException("Pending overflow or same-chunk retry was lost.");
             CaptionAudioChunk retry = backlog.TakeNext();
             if (!Object.ReferenceEquals(retry, active) || retry.Attempts != 2 ||
+                !retry.HasOverlap || retry.Sequence != 42 ||
                 backlog.HoldForRetry(retry) || backlog.TakeNext().Wav[0] != 3)
                 throw new InvalidOperationException("Retry did not precede later speech or exceed its bound.");
+            var ordered = new CaptionOrderedCompletions();
+            if (!OverlayContext.CanStartCaptionRequest(1, 1) ||
+                OverlayContext.CanStartCaptionRequest(2, 0) ||
+                OverlayContext.CanStartCaptionRequest(0, 3))
+                throw new Exception("Caption worker or ordered buffer exceeded its bound.");
+            var delivered = new System.Collections.Generic.List<int>();
+            var firstChunk = new CaptionAudioChunk { Sequence = 1 };
+            var secondChunk = new CaptionAudioChunk { Sequence = 2 };
+            ordered.Add(secondChunk, delegate { delivered.Add(2); return true; });
+            ordered.Drain(delegate { return true; });
+            if (delivered.Count != 0 || ordered.Count != 1)
+                throw new Exception("Later transcription overtook earlier audio.");
+            ordered.Add(firstChunk, delegate { return false; });
+            ordered.Drain(delegate { return true; });
+            if (delivered.Count != 0 || ordered.Count != 1)
+                throw new Exception("Retry failed to retain its source position.");
+            ordered.Add(firstChunk, delegate { delivered.Add(1); return true; });
+            ordered.Drain(delegate { return true; });
+            if (String.Join(",", delivered) != "1,2" || ordered.Count != 0)
+                throw new Exception("Retry recovery reordered buffered transcriptions.");
+            ordered.Add(new CaptionAudioChunk { Sequence = 4 }, delegate { delivered.Add(4); return true; });
+            ordered.Add(new CaptionAudioChunk { Sequence = 3 }, delegate { return true; });
+            ordered.Drain(delegate { return true; });
+            if (String.Join(",", delivered) != "1,2,4")
+                throw new Exception("Explicit dropped segment blocked later audio.");
+            ordered.Add(new CaptionAudioChunk { Sequence = 6 }, delegate { throw new Exception("Cancelled result applied"); });
+            int cancelled = 0;
+            ordered.Clear(delegate(string outcome, int ms, int attempts) { if (outcome == "cancelled") cancelled++; });
+            ordered.Drain(delegate { return true; });
+            if (cancelled != 1 || ordered.Count != 0) throw new Exception("Buffered result survived session close.");
+            Console.WriteLine("caption-ordered-parallel-retry-gap-cancel-ok");
             using (var lyric = new CaptionLyricForm(String.Empty))
             {
                 var target = new NativeRect { Left = 100, Top = 80, Right = 1380, Bottom = 800 };

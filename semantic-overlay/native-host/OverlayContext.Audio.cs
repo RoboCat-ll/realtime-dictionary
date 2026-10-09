@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -20,6 +20,10 @@ namespace SemanticOverlay.NativeHost
 {
     internal sealed partial class OverlayContext : ApplicationContext
     {
+        private int audioChunkSequence;
+        private int lastAcceptedAudioSequence = -1;
+        private string lastAudioContextText;
+
         private void StartAudioCaptionSession()
         {
             StopAudioCaptionSession();
@@ -29,7 +33,11 @@ namespace SemanticOverlay.NativeHost
             audioDroppedChunks = 0;
             audioRetryNotBeforeUtc = DateTime.MinValue;
             lastAudioTranscript = null;
+            lastAudioContextText = null;
+            audioChunkSequence = 0;
+            lastAcceptedAudioSequence = -1;
             lastAudioTranscriptIdentity = null;
+            lastAudioTranscriptCapturedAt = DateTime.MinValue;
             queuedAudio.Clear();
             audioCaptureStartedUtc = DateTime.MinValue;
             audioLastTranscriptUtc = DateTime.MinValue;
@@ -93,7 +101,7 @@ namespace SemanticOverlay.NativeHost
         {
             SystemAudioCaptionCapture capture = new SystemAudioCaptionCapture(
                 preferIsolated ? (uint?)processId : null);
-            capture.AudioChunkReady += delegate(byte[] wav) { QueueAudioTranscription(wav, generation); };
+            capture.AudioChunkReadyWithContext += delegate(byte[] wav, bool overlap) { QueueAudioTranscription(wav, generation, overlap); };
             capture.Failed += delegate(string error)
             {
                 try { dispatcher.BeginInvoke(new Action(delegate { ReportAudioFailure(generation, error); })); }
@@ -111,7 +119,7 @@ namespace SemanticOverlay.NativeHost
                 services.Log("Process audio isolation unavailable; falling back to system output: " +
                     isolatedError.GetType().Name);
                 capture = new SystemAudioCaptionCapture();
-                capture.AudioChunkReady += delegate(byte[] wav) { QueueAudioTranscription(wav, generation); };
+                capture.AudioChunkReadyWithContext += delegate(byte[] wav, bool overlap) { QueueAudioTranscription(wav, generation, overlap); };
                 capture.Failed += delegate(string error)
                 {
                     try { dispatcher.BeginInvoke(new Action(delegate { ReportAudioFailure(generation, error); })); }
@@ -130,7 +138,7 @@ namespace SemanticOverlay.NativeHost
             }
         }
 
-        private void QueueAudioTranscription(byte[] wav, int generation)
+        private void QueueAudioTranscription(byte[] wav, int generation, bool hasOverlap)
         {
             DateTime capturedAt = DateTime.Now;
             try
@@ -138,13 +146,15 @@ namespace SemanticOverlay.NativeHost
                 dispatcher.BeginInvoke(new Action(delegate
                 {
                     if (!active || generation != audioSessionGeneration || audioCapture == null) return;
-                    CaptionAudioChunk dropped = queuedAudio.Enqueue(wav, capturedAt);
+                    CaptionAudioChunk dropped = queuedAudio.Enqueue(wav, capturedAt, hasOverlap, ++audioChunkSequence);
                     if (dropped != null)
                     {
+                        dropped.Complete("dropped", services.RecordCaptionMetric);
                         RecordAudioGap(dropped.CapturedAt, "识别服务积压");
                         services.Log("Audio transcription queue full; marked oldest pending chunk as gap");
+                        audioCompletions.Add(dropped, delegate { return true; });
+                        audioCompletions.Drain(delegate { return active && generation == audioSessionGeneration; });
                     }
-                    if (audioTranscriptionRunning) return;
                     if (DateTime.UtcNow < audioRetryNotBeforeUtc)
                         audioRetryTimer.Start();
                     else BeginAudioTranscription(generation);
@@ -155,9 +165,25 @@ namespace SemanticOverlay.NativeHost
 
         private void BeginAudioTranscription(int generation)
         {
+            if (!active || generation != audioSessionGeneration || DateTime.UtcNow < audioRetryNotBeforeUtc)
+                return;
             audioRetryTimer.Stop();
-            CaptionAudioChunk chunk = queuedAudio.TakeNext();
-            if (chunk == null) return;
+            while (queuedAudio.HasWork && CanStartCaptionRequest(audioTranscriptionsInFlight, audioCompletions.Count))
+            {
+                CaptionAudioChunk chunk = queuedAudio.TakeNext();
+                if (chunk == null) break;
+                LaunchAudioTranscription(chunk, generation);
+            }
+        }
+
+        internal static bool CanStartCaptionRequest(int inFlight, int completed)
+        {
+            return inFlight >= 0 && completed >= 0 && inFlight < 2 && completed < AudioQueueLimit;
+        }
+
+        private void LaunchAudioTranscription(CaptionAudioChunk chunk, int generation)
+        {
+            audioTranscriptionsInFlight++;
             audioTranscriptionRunning = true;
             SetCaptionStatus(audioDroppedChunks > 0
                 ? "字幕：正在转写 · 缺失" + audioDroppedChunks + "段"
@@ -169,58 +195,82 @@ namespace SemanticOverlay.NativeHost
                     {
                         dispatcher.BeginInvoke(new Action(delegate
                         {
-                            if (generation != audioSessionGeneration) return;
-                            audioTranscriptionRunning = false;
-                            if (task.IsFaulted || task.Result == null || !task.Result.ok)
-                            {
-                                Exception failure = task.IsFaulted ? task.Exception.GetBaseException() : null;
-                                string message = failure != null ? failure.Message :
-                                    (task.Result == null ? "语音识别没有返回结果" : task.Result.error);
-                                bool retryable = failure is TimeoutException ||
-                                    failure is System.Net.WebException || failure is IOException ||
-                                    (!task.IsFaulted && task.Result != null && task.Result.retryable);
-                                if (!retryable)
-                                {
-                                    RecordAudioGap(chunk.CapturedAt, "识别服务已停止");
-                                    StopAudioAfterFailure(generation, message);
-                                    return;
-                                }
-                                audioTransientFailures++;
-                                bool retryingSameChunk = queuedAudio.HoldForRetry(chunk);
-                                if (!retryingSameChunk)
-                                    RecordAudioGap(chunk.CapturedAt, "重试后仍无法转录");
-                                int delaySeconds = Math.Min(12, 2 * audioTransientFailures);
-                                audioRetryNotBeforeUtc = DateTime.UtcNow.AddSeconds(delaySeconds);
-                                audioRetryTimer.Start();
-                                trayStatusItem.Text = "状态：" + message + "，" +
-                                    delaySeconds + " 秒后" + (retryingSameChunk ? "重试本段" : "继续后续") +
-                                    "；待转录 " + queuedAudio.PendingCount + " 段";
-                                SetCaptionStatus(retryingSameChunk ? "字幕：重试这段声音…" :
-                                    "字幕：缺失" + audioDroppedChunks + "段");
-                                services.Log("Transient audio transcription failure; retry_same_chunk=" +
-                                    retryingSameChunk + "; cooldown seconds=" + delaySeconds);
+                            if (generation != audioSessionGeneration) {
+                                chunk.Complete("cancelled", services.RecordCaptionMetric);
+                                return;
                             }
-                            else if (!String.IsNullOrWhiteSpace(task.Result.text))
-                            {
-                                audioTransientFailures = 0;
-                                audioRetryNotBeforeUtc = DateTime.MinValue;
-                                ApplyAudioTranscript(task.Result.text.Trim(), generation,
-                                    chunk.CapturedAt, task.Result.raw_text,
-                                    task.Result.term_corrections);
-                            }
-                            else if (task.Result != null && task.Result.ok)
-                            {
-                                audioTransientFailures = 0;
-                                audioRetryNotBeforeUtc = DateTime.MinValue;
-                                SetCaptionStatus("字幕：正在收音 · 等待发言");
-                            }
-                            if (queuedAudio.HasWork && active && generation == audioSessionGeneration &&
-                                DateTime.UtcNow >= audioRetryNotBeforeUtc)
-                                BeginAudioTranscription(generation);
+                            audioTranscriptionsInFlight--;
+                            audioTranscriptionRunning = audioTranscriptionsInFlight > 0;
+                            audioCompletions.Add(chunk, delegate {
+                                return CompleteAudioTranscription(chunk, task, generation);
+                            });
+                            audioCompletions.Drain(delegate { return active && generation == audioSessionGeneration; });
+                            BeginAudioTranscription(generation);
                         }));
                     }
-                    catch { }
+                    catch { chunk.Complete("cancelled", services.RecordCaptionMetric); }
                 });
+        }
+
+        private bool CompleteAudioTranscription(CaptionAudioChunk chunk,
+            Task<AudioTranscriptionResponse> task, int generation)
+        {
+            if (task.IsFaulted || task.Result == null || !task.Result.ok)
+            {
+                Exception failure = task.IsFaulted ? task.Exception.GetBaseException() : null;
+                string message = failure != null ? failure.Message :
+                    (task.Result == null ? "语音识别没有返回结果" : task.Result.error);
+                bool retryable = failure is TimeoutException ||
+                    failure is System.Net.WebException || failure is IOException ||
+                    (!task.IsFaulted && task.Result != null && task.Result.retryable);
+                if (!retryable)
+                {
+                    chunk.Complete("gap", services.RecordCaptionMetric);
+                    RecordAudioGap(chunk.CapturedAt, "识别服务已停止");
+                    StopAudioAfterFailure(generation, message);
+                    return true;
+                }
+                audioTransientFailures++;
+                bool retryingSameChunk = queuedAudio.HoldForRetry(chunk);
+                if (!retryingSameChunk)
+                {
+                    chunk.Complete("gap", services.RecordCaptionMetric);
+                    RecordAudioGap(chunk.CapturedAt, "重试后仍无法转录");
+                }
+                int delaySeconds = Math.Min(12, 2 * audioTransientFailures);
+                audioRetryNotBeforeUtc = DateTime.UtcNow.AddSeconds(delaySeconds);
+                audioRetryTimer.Start();
+                trayStatusItem.Text = "状态：" + message + "，" +
+                    delaySeconds + " 秒后" + (retryingSameChunk ? "重试本段" : "继续后续") +
+                    "；待转录 " + queuedAudio.PendingCount + " 段";
+                SetCaptionStatus(retryingSameChunk ? "字幕：重试这段声音…" :
+                    "字幕：缺失" + audioDroppedChunks + "段");
+                services.Log("Transient audio transcription failure; retry_same_chunk=" +
+                    retryingSameChunk + "; cooldown seconds=" + delaySeconds);
+                return !retryingSameChunk;
+            }
+            else if (!String.IsNullOrWhiteSpace(task.Result.text))
+            {
+                audioTransientFailures = 0;
+                audioRetryNotBeforeUtc = DateTime.MinValue;
+                bool accepted = ApplyAudioTranscript(task.Result.text.Trim(), generation,
+                    chunk.CapturedAt, task.Result.raw_text,
+                    task.Result.term_corrections, chunk.HasOverlap, chunk.Sequence);
+                chunk.Complete(accepted ? "transcript" : "empty", services.RecordCaptionMetric);
+                SetCaptionStatus(accepted ? "字幕：已更新 · 分段后 " +
+                    (chunk.ElapsedMilliseconds / 1000.0).ToString("0.0") + " 秒" +
+                    (queuedAudio.PendingCount > 0 ? " · 待处理 " + queuedAudio.PendingCount + " 段" : "") +
+                    (audioDroppedChunks > 0 ? " · 缺失 " + audioDroppedChunks + " 段" : "") :
+                    "字幕：本段没有可用文字 · 继续收音");
+            }
+            else if (task.Result != null && task.Result.ok)
+            {
+                chunk.Complete("empty", services.RecordCaptionMetric);
+                audioTransientFailures = 0;
+                audioRetryNotBeforeUtc = DateTime.MinValue;
+                SetCaptionStatus("字幕：正在收音 · 等待发言");
+            }
+            return true;
         }
 
         private void ResumeAudioAfterCooldown(object sender, EventArgs args)
@@ -230,7 +280,7 @@ namespace SemanticOverlay.NativeHost
                 audioRetryTimer.Stop();
                 return;
             }
-            if (audioTranscriptionRunning || DateTime.UtcNow < audioRetryNotBeforeUtc) return;
+            if (DateTime.UtcNow < audioRetryNotBeforeUtc) return;
             audioRetryTimer.Stop();
             if (queuedAudio.HasWork)
                 BeginAudioTranscription(audioSessionGeneration);
@@ -238,24 +288,29 @@ namespace SemanticOverlay.NativeHost
                 SetCaptionStatus("字幕：正在收音 · 等待发言");
         }
 
-        private void ApplyAudioTranscript(string text, int generation, DateTime capturedAt,
-            string rawText, int termCorrections)
+        private bool ApplyAudioTranscript(string text, int generation, DateTime capturedAt,
+            string rawText, int termCorrections, bool hasOverlap, int sequence)
         {
-            if (!active || generation != audioSessionGeneration) return;
-            text = (text ?? String.Empty).Trim();
+            if (!active || generation != audioSessionGeneration) return false;
+            string contextText = (text ?? String.Empty).Trim();
+            text = TrimAudioOverlap(lastAudioContextText, contextText,
+                CanMergeAudioChunk(hasOverlap, sequence, lastAcceptedAudioSequence));
             string identity = NormalizeTranscriptIdentity(text);
             if (identity.Length == 0)
             {
                 services.Log("Discarded empty or formatting-only audio transcript");
-                return;
+                return false;
             }
-            if (String.Equals(identity, lastAudioTranscriptIdentity, StringComparison.Ordinal))
+            if (IsRepeatedAudioResult(identity, capturedAt, lastAudioTranscriptIdentity, lastAudioTranscriptCapturedAt))
             {
                 services.Log("Discarded duplicate audio transcript");
-                return;
+                return false;
             }
+            lastAudioContextText = contextText;
+            lastAcceptedAudioSequence = sequence;
             lastAudioTranscript = text;
             lastAudioTranscriptIdentity = identity;
+            lastAudioTranscriptCapturedAt = capturedAt;
             pendingCaptionText = text;
             pendingCaptionCommitted = true;
             audioLastTranscriptUtc = DateTime.UtcNow;
@@ -266,13 +321,13 @@ namespace SemanticOverlay.NativeHost
                 timestamp = capturedAt, text = text,
                 raw_text = rawText
             };
-            SaveCaptionEntry(entry, false);
+            bool saved = SaveCaptionEntry(entry, false);
             captionHistory.Add(entry);
             captionHistory.Sort(delegate(CaptionEntry left, CaptionEntry right) {
                 return left.timestamp.CompareTo(right.timestamp);
             });
             if (captionHistory.Count > CaptionHistoryLimit) captionHistory.RemoveAt(0);
-            captionHistoryWindow.RefreshArchiveDate();
+            captionHistoryWindow.AppendLiveEntry(entry, captionArchive.CurrentDate, saved);
             foreach (CaptionSpeechSegment segment in SplitCaptionSpeech(text))
                 audioDisplayQueue.Enqueue(segment);
             if (!audioDisplayTimer.Enabled)
@@ -287,6 +342,38 @@ namespace SemanticOverlay.NativeHost
                     : "字幕：已更新 · 继续收音");
             services.Log("Accepted audio transcript with " + text.Length + " characters");
             StartAudioTextAnalysis(text, generation, ++audioTextGeneration);
+            return true;
+        }
+
+        internal static bool CanMergeAudioChunk(bool hasOverlap, int sequence, int previousSequence)
+        {
+            return hasOverlap && previousSequence > 0 && sequence == previousSequence + 1;
+        }
+
+        internal static string TrimAudioOverlap(string previous, string current, bool sharedAudio)
+        {
+            current = (current ?? String.Empty).Trim();
+            if (!sharedAudio || String.IsNullOrWhiteSpace(previous)) return current;
+            const string tokenPattern = @"[\u4e00-\u9fff]|[A-Za-z]+(?:['’][A-Za-z]+)*|[0-9]+";
+            MatchCollection before = Regex.Matches(previous, tokenPattern);
+            MatchCollection after = Regex.Matches(current, tokenPattern);
+            for (int count = Math.Min(16, Math.Min(before.Count, after.Count)); count >= 1; count--)
+            {
+                bool equal = true, chineseOnly = true;
+                for (int index = 0; index < count; index++)
+                {
+                    string left = before[before.Count - count + index].Value.Replace('’', '\'');
+                    string right = after[index].Value.Replace('’', '\'');
+                    if (!String.Equals(left, right, StringComparison.OrdinalIgnoreCase)) { equal = false; break; }
+                    if (right.Length != 1 || right[0] < '\u4e00' || right[0] > '\u9fff') chineseOnly = false;
+                }
+                if (!equal || (chineseOnly && count < 4) ||
+                    (count == 1 && after[0].Length < 5)) continue;
+                int end = after[count - 1].Index + after[count - 1].Length;
+                while (end < current.Length && (Char.IsWhiteSpace(current[end]) || Char.IsPunctuation(current[end]))) end++;
+                return current.Substring(end).Trim();
+            }
+            return current;
         }
 
         private void RecordAudioGap(DateTime capturedAt, string reason)
@@ -297,26 +384,27 @@ namespace SemanticOverlay.NativeHost
                 text = "这段声音未能转录（" + reason + "）",
                 is_gap = true
             };
-            SaveCaptionEntry(gap, false);
+            bool saved = SaveCaptionEntry(gap, false);
             captionHistory.Add(gap);
             captionHistory.Sort(delegate(CaptionEntry left, CaptionEntry right) {
                 return left.timestamp.CompareTo(right.timestamp);
             });
             if (captionHistory.Count > CaptionHistoryLimit) captionHistory.RemoveAt(0);
-            captionHistoryWindow.RefreshArchiveDate();
+            captionHistoryWindow.AppendLiveEntry(gap, captionArchive.CurrentDate, saved);
             trayStatusItem.Text = "状态：字幕已有 " + audioDroppedChunks + " 处明确缺口";
             SetCaptionStatus("字幕：缺失" + audioDroppedChunks + "段");
         }
 
-        private void SaveCaptionEntry(CaptionEntry entry, bool replaceLast)
+        private bool SaveCaptionEntry(CaptionEntry entry, bool replaceLast)
         {
-            if (!services.CaptionArchiveEnabled) return;
-            if (captionArchive.Append(entry, replaceLast)) return;
-            if (archiveFailureShown) return;
+            if (!services.CaptionArchiveEnabled) return false;
+            if (captionArchive.Append(entry, replaceLast)) return true;
+            if (archiveFailureShown) return false;
             archiveFailureShown = true;
             services.Log("Caption archive write failed; transcript remains in session memory");
             ShowNotice("字幕仍在本次会话中，但保存到本地历史失败。请检查磁盘空间。",
                 ToolTipIcon.Warning);
+            return false;
         }
 
         internal static string NormalizeTranscriptIdentity(string text)
@@ -326,6 +414,14 @@ namespace SemanticOverlay.NativeHost
             foreach (char value in text)
                 if (Char.IsLetterOrDigit(value)) builder.Append(Char.ToUpperInvariant(value));
             return builder.ToString();
+        }
+
+        internal static bool IsRepeatedAudioResult(string identity, DateTime capturedAt,
+            string previousIdentity, DateTime previousCapturedAt)
+        {
+            // Equal speech in a different audio chunk is a real repeated utterance.
+            return capturedAt == previousCapturedAt &&
+                String.Equals(identity, previousIdentity, StringComparison.Ordinal);
         }
 
         internal static List<CaptionSpeechSegment> SplitCaptionSpeech(string text)
@@ -462,7 +558,9 @@ namespace SemanticOverlay.NativeHost
             audioDisplayTimer.Stop();
             audioDisplayQueue.Clear();
             audioDisplayLines.Clear();
-            queuedAudio.Clear();
+            queuedAudio.Clear(services.RecordCaptionMetric);
+            audioCompletions.Clear(services.RecordCaptionMetric);
+            audioTranscriptionsInFlight = 0;
             audioTranscriptionRunning = false;
             audioTextGeneration++;
             if (audioCapture != null)
@@ -472,6 +570,8 @@ namespace SemanticOverlay.NativeHost
                 services.Log("System audio caption capture stopped");
             }
             lastAudioTranscript = null;
+            lastAudioContextText = null;
+            lastAcceptedAudioSequence = -1;
             lastAudioTranscriptIdentity = null;
             audioCaptureStartedUtc = DateTime.MinValue;
             audioLastTranscriptUtc = DateTime.MinValue;

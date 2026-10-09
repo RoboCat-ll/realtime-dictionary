@@ -183,6 +183,55 @@ def check_calendar(payload):
             "unsupported": unsupported, "checked_events": len(blocks)}
 
 
+def _explicit_calendar_phrases(text, reference):
+    """Resolve only explicit day/hour phrases; retain vague deadline wording."""
+    numerals = '零〇一二两三四五六七八九十'
+    digits = dict(zip('零〇一二两三四五六七八九', (0, 0, 1, 2, 2, 3, 4, 5, 6, 7, 8, 9)))
+
+    def number(match):
+        value = match[1]
+        if value.count('十') == 1:
+            left, right = value.split('十')
+            if len(left) > 1 or len(right) > 1:
+                return value
+            amount = (digits.get(left, 1) if left else 1) * 10 + (digits[right] if right else 0)
+        elif len(value) == 1 and value in digits:
+            amount = digits[value]
+        else:
+            return value
+        return str(amount)
+
+    text = re.sub(r'([' + numerals + r']{1,3})(?=\s*(?:[月日号点时分]|小时))', number, text)
+    text = re.sub(r'([点时])半', r'\g<1>30分', text)
+    text = re.sub(r'([点时])一刻', r'\g<1>15分', text)
+    text = re.sub(r'([点时])三刻', r'\g<1>45分', text)
+    text = text.replace('半小时', '30分钟')
+    today = reference.date()
+    days = {'今天': 0, '今晚': 0, '明天': 1, '明晚': 1, '后天': 2,
+            '后晚': 2, '大后天': 3, '昨天': -1, '昨晚': -1}
+
+    def relative(match):
+        phrase = match[0]
+        date = today + timedelta(days=days[phrase])
+        return date.strftime('%Y年%m月%d号') + ('晚上' if phrase.endswith('晚') else '')
+
+    text = re.sub(r'大后天|今天|今晚|明天|明晚|后天|后晚|昨天|昨晚', relative, text)
+
+    def weekday(match):
+        prefix, day = match[1] or '', match[2]
+        target = '一二三四五六日'.find('日' if day == '天' else day)
+        if target < 0:
+            target = int(day) - 1
+        if prefix in ('下', '下下', '本', '这'):
+            weeks = {'下': 1, '下下': 2, '本': 0, '这': 0}[prefix]
+            date = today - timedelta(days=today.weekday()) + timedelta(days=weeks * 7 + target)
+        else:
+            date = today + timedelta(days=(target - today.weekday()) % 7)
+        return date.strftime('%Y年%m月%d号')
+
+    return re.sub(r'(下下|下|本|这)?(?:周|星期)([一二三四五六日天1-7])(?![点时])', weekday, text)
+
+
 def clarify_calendar(payload, *, now=None):
     """Locally prefill an editable draft; never create or confirm an event."""
     if not isinstance(payload, dict):
@@ -191,10 +240,12 @@ def clarify_calendar(payload, *, now=None):
     supplement = payload.get('supplement', '')
     if not isinstance(original, str) or not isinstance(supplement, str) or len(original) + len(supplement) > 2000:
         raise ValueError("补充说明过长或格式不正确")
+    reference = now if now is not None else datetime.now(timezone(timedelta(hours=8)))
+    original = _explicit_calendar_phrases(original, reference)
+    supplement = _explicit_calendar_phrases(supplement, reference)
     # Prefer user correction over the source phrase, retaining only explicit fields.
     def find(pattern):
         return re.search(pattern, supplement) or re.search(pattern, original)
-    reference = now if now is not None else datetime.now().astimezone()
     year_pattern = r'(?<!\d)(\d{4})\s*(?:年|[./-](?=\d{1,2}[./-]\d{1,2}))'
     year_value = None
     year_inferred = False
@@ -212,7 +263,9 @@ def clarify_calendar(payload, *, now=None):
                 for pattern in (chinese_day, dotted_day)
                 for match in [re.search(pattern, value)] if match), None)
     # A UTC offset is not a replacement meeting start time.
-    clock_pattern = r'(凌晨|早上|上午|中午|下午|晚上)?\s*(\d{1,2})\s*[:：点时]\s*(\d{1,2})?(?:分)?'
+    clock_pattern = (r'(凌晨|早上|上午|中午|下午|晚上)?\s*(?<!\d)(\d{1,2})\s*'
+                     r'(?:[:：]\s*(\d{1,2})(?!\d)|[点时](?:\s*(\d{1,2})'
+                     r'(?:分|(?=\s*(?:[,，。]|$))))?)')
     clock_sources = [re.sub(r'UTC\s*[+-]\d{2}:\d{2}', '', value, flags=re.IGNORECASE)
                      for value in (supplement, original)]
     clock = re.search(clock_pattern, clock_sources[0]) or re.search(clock_pattern, clock_sources[1])
@@ -241,7 +294,7 @@ def clarify_calendar(payload, *, now=None):
             if year_value is None:
                 raise ValueError('日期超出支持范围')
     if year_value is not None and day and clock:
-        hour, minute = int(clock[2]), int(clock[3] or 0)
+        hour, minute = int(clock[2]), int(clock[3] or clock[4] or 0)
         period = clock[1]
         if period in ('下午', '晚上') and 1 <= hour < 12:
             hour += 12
@@ -282,7 +335,7 @@ def clarify_calendar(payload, *, now=None):
     elif re.search(r'北京时间|中国时间', zone_text):
         result['utc_offset'] = '+08:00'
     else:
-        result['missing'].append('使用哪个时区？例如北京时间或UTC+08:00')
+        result['utc_offset'] = '+08:00'
     result['year_inferred'] = year_inferred
     result['message'] = '；'.join(notes + result['missing']) if notes or result['missing'] else '信息已整理完整，请核对后创建提醒。'
     return result

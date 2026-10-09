@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -131,11 +131,14 @@ namespace SemanticOverlay.NativeHost
         private readonly Button expandTerm = new Button { Text = "展开解释",
             Width = 94, Dock = DockStyle.Right, Enabled = false };
         private readonly Func<string, string, string, LookupResponse> lookupTerm;
+        // Session-local, successful brief answers only; never persisted or shared
+        // between messages. Returning to an already read word costs no request.
+        private readonly Dictionary<string, string> readWordAnswers = new Dictionary<string, string>();
         private readonly List<Tuple<int, int, SelectionTerm>> linkedTerms =
             new List<Tuple<int, int, SelectionTerm>>();
         private readonly Font termLinkFont;
         private readonly FlowLayoutPanel terms = new FlowLayoutPanel { Dock = DockStyle.Fill,
-            FlowDirection = FlowDirection.LeftToRight, WrapContents = true, AutoScroll = true };
+            FlowDirection = FlowDirection.LeftToRight, WrapContents = false, AutoScroll = false };
         private readonly Panel termHeader = new Panel { Dock = DockStyle.Fill };
         private readonly Label termHeading = new Label { Text = "知识点 · 点击查看",
             Dock = DockStyle.Fill, Font = new Font("Microsoft YaHei UI", 9, FontStyle.Bold),
@@ -154,11 +157,15 @@ namespace SemanticOverlay.NativeHost
         private readonly Button analyze = new Button { Text = "确认并解释", Width = 112, Height = 30 };
         private readonly TableLayoutPanel layout;
         private int generation;
+        internal MessageOperation Operation;
         private int termGeneration;
+        private int openRevision;
         private bool settingText;
         private bool sourceEditorVisible;
         private string passageText = String.Empty;
         private string passageExplanation = String.Empty;
+        private string successfulAnalysisInput;
+        private SelectionAnalysisResponse successfulAnalysisResponse;
         private string sourceApp = "other";
         private string textSource = "ocr";
         private string initialText = String.Empty;
@@ -278,11 +285,15 @@ namespace SemanticOverlay.NativeHost
             source.TextChanged += delegate
             {
                 if (settingText) return;
+                if (Operation != null) Operation.Complete("edited", textSource);
                 generation++;
                 termGeneration++;
+                readWordAnswers.Clear();
                 ResetTermDetails();
                 ShowSentenceView();
                 passageExplanation = String.Empty;
+                successfulAnalysisInput = null;
+                successfulAnalysisResponse = null;
                 passageText = source.Text.Trim();
                 MarkExplanationStale();   // v2：旧结果置灰标注失效，不静默清空
                 sentence.Text = source.Text;
@@ -297,7 +308,10 @@ namespace SemanticOverlay.NativeHost
                 analyze.Enabled = source.Text.Trim().Length > 0 && source.Text.Trim().Length <= 1000;
                 status.Text = analyze.Enabled ? "原文已修改，解释已失效；确认后才会发送。" : "请输入 1–1000 个字符。";
             };
-            FormClosed += delegate { generation++; termGeneration++; termLinkFont.Dispose(); };
+            FormClosed += delegate {
+                if (Operation != null) Operation.Complete("cancelled", textSource);
+                generation++; termGeneration++; termLinkFont.Dispose();
+            };
         }
 
         internal void OpenText(string text, bool exactSelection, string textSource,
@@ -310,10 +324,14 @@ namespace SemanticOverlay.NativeHost
             string originatingApp, bool autoAnalyze)
         {
             sourceApp = originatingApp ?? "other";
+            int opened = ++openRevision;
             this.textSource = textSource ?? (exactSelection ? "accessibility" : "ocr");
             passageText = String.Empty;
             passageExplanation = String.Empty;
+            successfulAnalysisInput = null;
+            successfulAnalysisResponse = null;
             body.Clear();
+            readWordAnswers.Clear();
             ClearExplanationStale();
             ResetTermDetails();
             sentence.Text = String.Empty;
@@ -342,7 +360,8 @@ namespace SemanticOverlay.NativeHost
                 visibilityChecks++;
                 // 浮框现在可随时关闭（Esc/✕/跟随策略）：Dispose 期间禁止触碰
                 // Handle（读取会在销毁后重建句柄，导致 CreateHandle/Dispose 冲突）。
-                if (!IsDisposed && !Disposing && WindowState != FormWindowState.Minimized &&
+                if (!IsDisposed && !Disposing && opened == openRevision && CanRepairVisibility() &&
+                    WindowState != FormWindowState.Minimized &&
                     !NativeMethods.IsWindowVisible(Handle))
                 {
                     NativeMethods.ShowWindow(Handle, NativeMethods.SwShowNoActivate);
@@ -351,7 +370,7 @@ namespace SemanticOverlay.NativeHost
                         NativeMethods.SwpNoActivate | NativeMethods.SwpShowWindow);
                     if (services != null) services.Log("Selection panel native visibility restored");
                 }
-                if (IsDisposed || Disposing || visibilityChecks >= 6)
+                if (IsDisposed || Disposing || opened != openRevision || visibilityChecks >= 6)
                 {
                     visibilityTimer.Stop();
                     visibilityTimer.Dispose();
@@ -399,36 +418,54 @@ namespace SemanticOverlay.NativeHost
 
         private async Task RunAnalysis(bool forceRefresh)
         {
+            if (services != null && (Operation == null || Operation.IsCompleted))
+                Operation = services.BeginMessageOperation(sourceApp);
             string value = source.Text.Trim();
             if (value.Length == 0)
             {
                 status.Text = "请保留至少一个字符。";
+                if (Operation != null) Operation.Complete("invalid_input", textSource);
                 return;
             }
             if (value.Length > 1000)
             {
                 status.Text = "所选文字超过 1000 个字符，请缩小选区。";
+                if (Operation != null) Operation.Complete("invalid_input", textSource);
                 return;
             }
             int request = ++generation;
             termGeneration++;
-            passageText = value;
+            bool retainAnalysis = forceRefresh &&
+                String.Equals(successfulAnalysisInput, value, StringComparison.Ordinal) &&
+                !String.IsNullOrWhiteSpace(passageExplanation);
             ResetTermDetails();
             ShowSentenceView();
-            passageExplanation = String.Empty;
             analyze.Enabled = false;
-            terms.Controls.Clear();
-            tasks.Controls.Clear();
-            sentence.Text = value;
-            SetTaskSectionVisible(false);
-            linkedTerms.Clear();
-            explainSelected.Enabled = false;
-            sentenceTitle.Text = "原句";
-            termHeading.Text = "知识点 · 点击查看";
-            termBody.Text = "正在等待整句分析…";
-            ClearExplanationStale();
-            body.Text = "正在理解这段话…";
-            status.Text = "只分析当前消息";
+            if (!retainAnalysis)
+            {
+                successfulAnalysisInput = null;
+                successfulAnalysisResponse = null;
+                passageText = value;
+                passageExplanation = String.Empty;
+                terms.Controls.Clear();
+                tasks.Controls.Clear();
+                sentence.Text = value;
+                SetTaskSectionVisible(false);
+                linkedTerms.Clear();
+                explainSelected.Enabled = false;
+                sentenceTitle.Text = "原句";
+                termHeading.Text = "知识点 · 点击查看";
+                termBody.Text = "正在等待整句分析…";
+                ClearExplanationStale();
+                body.Text = "正在理解这段话…";
+            }
+            else if (successfulAnalysisResponse != null)
+            {
+                // Bind candidate clicks to this generation, rather than leaving
+                // visible buttons attached to the previous analysis request.
+                RenderTasks(successfulAnalysisResponse.actions, successfulAnalysisResponse.action_status);
+            }
+            status.Text = retainAnalysis ? "正在重新解释，保留上次结果…" : "只分析当前消息";
             Stopwatch watch = Stopwatch.StartNew();
             RequestProgress progress = new RequestProgress(this, delegate { return request == generation; },
                 delegate(string message) { status.Text = message; }, "正在理解当前消息");
@@ -438,7 +475,9 @@ namespace SemanticOverlay.NativeHost
             {
                 response = await Task.Factory.StartNew(delegate
                 {
-                    bool allowCorrection = textSource == "bubble_ocr" || textSource == "ocr";
+                    // A user's edit is authoritative even when the first capture was OCR.
+                    bool allowCorrection = (textSource == "bubble_ocr" || textSource == "ocr") &&
+                        String.Equals(value, initialText, StringComparison.Ordinal);
                     return analyzePassage(value, allowCorrection, forceRefresh);
                 });
             }
@@ -456,35 +495,48 @@ namespace SemanticOverlay.NativeHost
             if (InvokeRequired)
             {
                 BeginInvoke(new Action(delegate {
-                    ApplyAnalysisOutcome(request, response, failure, watch, value, progress); }));
+                    ApplyAnalysisOutcome(request, response, failure, watch, value, progress, retainAnalysis); }));
                 return;
             }
-            ApplyAnalysisOutcome(request, response, failure, watch, value, progress);
+            ApplyAnalysisOutcome(request, response, failure, watch, value, progress, retainAnalysis);
         }
 
         private void ApplyAnalysisOutcome(int request, SelectionAnalysisResponse response,
-            Exception failure, Stopwatch watch, string value, RequestProgress progress)
+            Exception failure, Stopwatch watch, string value, RequestProgress progress, bool retainAnalysis)
         {
             try
             {
                 if (IsDisposed || Disposing || request != generation) return;
                 watch.Stop();
                 if (failure != null) throw failure;
+                if (retainAnalysis && (response == null || String.IsNullOrWhiteSpace(response.explanation) ||
+                    response.analysis_mode != "model"))
+                    throw new InvalidOperationException("Refresh unavailable");
                 passageExplanation = response == null ? String.Empty : response.explanation ?? String.Empty;
+                successfulAnalysisInput = response != null && response.analysis_mode == "model" &&
+                    !String.IsNullOrWhiteSpace(passageExplanation) ? value : null;
                 passageText = response == null || String.IsNullOrWhiteSpace(response.display_text)
                     ? value : response.display_text.Trim();
                 body.Text = String.IsNullOrWhiteSpace(passageExplanation)
                     ? "暂时没有可靠的整段解释，请重试。" : passageExplanation;
                 ClearExplanationStale();
                 sentence.Text = passageText;
-                sentenceTitle.Text = response != null && response.ocr_corrected
-                    ? "原句（已校正，可选取词语）" : "原句（可选取词语）";
+                bool userEdited = !String.Equals(initialText, value, StringComparison.Ordinal);
+                sentenceTitle.Text = userEdited ? "原句（已手动修改，可选词）" :
+                    textSource == "bubble_ocr" || textSource == "ocr" ?
+                    (response != null && response.ocr_corrected ? "原句（OCR 已校正，仍请核对）" : "原句（OCR 识别，请核对）") :
+                    "原句（可选取词语）";
                 status.Text = response != null && response.analysis_mode == "model"
                     ? "整句解释 · 模型结果" : "整句解释 · 本地结果";
                 analyze.Text = response != null && response.can_retry ? "重新解释" : "再次检查";
                 RenderTermsSafely(response == null ? null : response.terms);
                 RenderTasks(response == null ? null : response.actions,
                     response == null ? null : response.action_status);
+                successfulAnalysisResponse = successfulAnalysisInput == null ? null : response;
+                if (Operation != null) Operation.Complete(response == null || String.IsNullOrWhiteSpace(response.explanation) ? "client_error" :
+                    response.analysis_mode == "model" ? "model" :
+                    response.analysis_mode == "local_unavailable" || response.analysis_mode == "local_fallback" ? response.analysis_mode : "local_result", textSource,
+                    response != null && response.analysis_cached);
                 if (services != null) services.RecordSelectionMetric(
                     sourceApp, textSource,
                     response == null ? "empty" : response.analysis_mode,
@@ -500,8 +552,9 @@ namespace SemanticOverlay.NativeHost
             {
                 if (!IsDisposed && request == generation)
                 {
-                    body.Text = RequestFeedback.For(error);
-                    status.Text = "解释失败";
+                    if (!retainAnalysis) body.Text = RequestFeedback.For(error);
+                    status.Text = retainAnalysis ? "重试失败 · 已保留上次解释及标注" : "解释失败";
+                    if (Operation != null) Operation.Complete("client_error", textSource);
                     analyze.Text = "重试";
                     if (services != null) services.Log("Selection analysis failed: " + error.GetType().Name);
                 }
@@ -530,7 +583,7 @@ namespace SemanticOverlay.NativeHost
             sentence.DeselectAll();
             if (items == null || items.Count == 0)
             {
-                terms.Controls.Add(new Label { Text = "没标出想查的词？在原句中拖选后点左侧按钮。",
+                terms.Controls.Add(new Label { Text = "拖选原句即可查词",
                     AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 9, 3, 3) });
                 termHeading.Text = "知识点 · 按需解释";
                 termBody.Text = "选取原句中的任意词语，再点“解释选中词语”。";
@@ -593,7 +646,7 @@ namespace SemanticOverlay.NativeHost
                 terms.Controls.Clear();
                 terms.Controls.Add(explainSelected);
                 terms.Controls.Add(new Label {
-                    Text = "术语暂时无法标出，仍可拖选原句查词。",
+                    Text = "可拖选原句继续查词",
                     AutoSize = true, ForeColor = Color.DimGray,
                     Margin = new Padding(3, 9, 3, 3)
                 });
@@ -757,6 +810,15 @@ namespace SemanticOverlay.NativeHost
             currentTermText = item.text;
             ShowWordView();   // v2：同一浮框内切换到词语视图，不另开窗口
             termHeading.Text = "知识点 · " + item.text;
+            string answerKey = passageText + "\0" + item.text;
+            string savedAnswer;
+            if (String.IsNullOrWhiteSpace(item.explanation) && readWordAnswers.TryGetValue(answerKey, out savedAnswer))
+            {
+                briefTermExplanation = savedAnswer;
+                termBody.Text = savedAnswer;
+                expandTerm.Enabled = true;
+                return;
+            }
             if (!String.IsNullOrWhiteSpace(item.explanation))
             {
                 briefTermExplanation = item.explanation;
@@ -809,6 +871,11 @@ namespace SemanticOverlay.NativeHost
                     response.lookup_mode == "local_fallback";
                 expandTerm.Text = briefLookupFailed ? "重试解释" : "展开解释";
                 expandTerm.Enabled = briefLookupFailed || (response != null && response.lookup_mode == "model");
+                if (!briefLookupFailed && response.lookup_mode == "model")
+                {
+                    if (readWordAnswers.Count >= 32) readWordAnswers.Clear();
+                    readWordAnswers[passageText + "\0" + currentTermText] = briefTermExplanation;
+                }
             }
             catch (Exception error)
             {
@@ -858,10 +925,34 @@ namespace SemanticOverlay.NativeHost
                 return;
             }
             bool bodyOverflow, sentenceOverflow;
-            layout.RowStyles[2].Height = MeasureGrow(body, body.Text, body.Font, ScaledCap(80),
+            layout.RowStyles[5].Height = explainSelected.GetPreferredSize(Size.Empty).Height +
+                explainSelected.Margin.Vertical + terms.Margin.Vertical;
+            layout.RowStyles[2].Height = MeasureGrow(body, body.Text, body.Font, ScaledCap(40),
                 ScaledCap(176), out bodyOverflow);
             layout.RowStyles[4].Height = MeasureGrow(sentence, sentence.Text, sentence.Font, ScaledCap(48),
                 ScaledCap(110), out sentenceOverflow);
+            if (userSized)
+            {
+                int fixedRows = (int)layout.RowStyles.Cast<RowStyle>().Sum(row => row.Height) -
+                    (int)layout.RowStyles[2].Height - (int)layout.RowStyles[4].Height;
+                int available = ClientSize.Height - floatGrip.Height - layout.Padding.Vertical - fixedRows - 4;
+                int meaningHeight = (int)layout.RowStyles[2].Height;
+                int sourceHeight = (int)layout.RowStyles[4].Height;
+                int extra = Math.Max(0, available - meaningHeight - sourceHeight);
+                bool ignoredOverflow;
+                int meaningNeeded = MeasureGrow(body, body.Text, body.Font, ScaledCap(40),
+                    Math.Max(ScaledCap(40), available), out ignoredOverflow);
+                int meaningExtra = Math.Min(extra, Math.Max(0, meaningNeeded - meaningHeight));
+                meaningHeight += meaningExtra;
+                extra -= meaningExtra;
+                int sourceNeeded = MeasureGrow(sentence, sentence.Text, sentence.Font, ScaledCap(48),
+                    Math.Max(ScaledCap(48), available), out ignoredOverflow);
+                int sourceExtra = Math.Min(extra, Math.Max(0, sourceNeeded - sourceHeight));
+                sourceHeight += sourceExtra;
+                layout.RowStyles[2].Height = meaningHeight;
+                layout.RowStyles[4].Height = sourceHeight;
+                MeasureGrow(body, body.Text, body.Font, ScaledCap(40), meaningHeight, out bodyOverflow);
+            }
             SetScrollOnDemand(body, bodyOverflow);
             int required = (int)layout.RowStyles.Cast<RowStyle>().Sum(row => row.Height) +
                 layout.Padding.Vertical + floatGrip.Height + 4;
@@ -986,6 +1077,7 @@ namespace SemanticOverlay.NativeHost
             Dock = DockStyle.Top, Height = 48 };
         private int generation;
         private string currentExplanation;
+        private bool currentExplanationIsModel;
         private bool settingQuery;
         private readonly Func<string, bool, LookupResponse> lookupRequest;
         private string inputSource = "typed";
@@ -1013,6 +1105,7 @@ namespace SemanticOverlay.NativeHost
                 if (settingQuery) return;
                 generation++;
                 currentExplanation = null;
+                currentExplanationIsModel = false;
                 body.Clear();
                 related.Visible = false; related.Links.Clear();
                 feedback.Visible = false;
@@ -1068,9 +1161,14 @@ namespace SemanticOverlay.NativeHost
             if (term.Length == 0 || term.Length > 200) { notice.Text = "请输入 1–200 个字符。"; return; }
             int request = ++generation;
             Stopwatch watch = Stopwatch.StartNew();
-            body.Text = refresh ? "正在换一种解释…" : "正在先查本地术语索引…";
-            related.Visible = false; related.Links.Clear();
-            feedback.Visible = false;
+            string retainedExplanation = refresh && currentExplanationIsModel ? currentExplanation : null;
+            if (String.IsNullOrWhiteSpace(retainedExplanation))
+            {
+                body.Text = refresh ? "正在换一种解释…" : "正在查询简短释义…";
+                related.Visible = false; related.Links.Clear();
+                feedback.Visible = false;
+            }
+            else notice.Text = "正在重试，保留上次释义…";
             lookup.Enabled = false; retry.Enabled = false;
             RequestProgress progress = new RequestProgress(this, delegate { return request == generation; },
                 delegate(string message) { notice.Text = message; }, "正在查询这个词语");
@@ -1079,46 +1177,25 @@ namespace SemanticOverlay.NativeHost
             {
                 string previous = refresh ? currentExplanation : null;
                 LookupResponse response;
-                if (!refresh)
-                {
-                    LookupResponse instant = await Task.Factory.StartNew(delegate {
-                        if (lookupRequest != null) return null;
-                        LookupResponse local;
-                        if (ShortcutLookup.TryExplain(term, String.Empty, out local)) return local;
-                        services.EnsureRunning();
-                        return services.LookupInstant(term, String.Empty);
-                    });
-                    if (IsDisposed || request != generation) return;
-                    if (instant != null && !String.IsNullOrWhiteSpace(instant.explanation))
-                    {
-                        string instantCanonical = (instant.term ?? String.Empty).Trim();
-                        if (!String.IsNullOrWhiteSpace(instantCanonical)) SetQueryText(instantCanonical);
-                        body.Text = instant.explanation;
-                        currentExplanation = instant.explanation;
-                        ShowRelatedTerms(instant.entities,
-                            String.IsNullOrWhiteSpace(instantCanonical) ? term : instantCanonical);
-                        if (!instant.needs_model)
-                        {
-                            response = instant;
-                            goto RenderCompletedLookup;
-                        }
-                        notice.Text = "本地即时结果 · AI 正在后台补充";
-                    }
-                }
-
                 response = await Task.Factory.StartNew(delegate {
                     if (lookupRequest != null) return lookupRequest(term, refresh);
                     LookupResponse local;
                     if (ShortcutLookup.TryExplain(term, String.Empty, out local)) return local;
                     services.EnsureRunning();
-                    return services.Lookup(term, String.Empty, refresh, previous);
+                    return services.Lookup(term, String.Empty, refresh, previous, "brief");
                 });
                 if (IsDisposed || request != generation) return;
-RenderCompletedLookup:
                 watch.Stop();
+                if (!String.IsNullOrWhiteSpace(retainedExplanation) &&
+                    (response == null || String.IsNullOrWhiteSpace(response.explanation) ||
+                     String.Equals(response.lookup_mode, "local_fallback", StringComparison.OrdinalIgnoreCase)))
+                    throw new InvalidOperationException("Refresh unavailable");
                 string canonical = response == null ? String.Empty : (response.term ?? String.Empty).Trim();
                 if (!String.IsNullOrWhiteSpace(canonical)) SetQueryText(canonical);
                 currentExplanation = response == null ? null : response.explanation;
+                currentExplanationIsModel = response != null &&
+                    String.Equals(response.lookup_mode, "model", StringComparison.OrdinalIgnoreCase) &&
+                    !String.IsNullOrWhiteSpace(currentExplanation);
                 body.Text = String.IsNullOrWhiteSpace(currentExplanation)
                     ? "暂时没有可靠解释，请稍后重试。" : currentExplanation;
                 string mode = response == null ? "无结果" :
@@ -1154,8 +1231,8 @@ RenderCompletedLookup:
                 if (services != null) services.Log("Manual lookup failed: " + error.GetType().Name);
                 if (!IsDisposed && request == generation)
                 {
-                    body.Text = RequestFeedback.For(error);
-                    notice.Text = "查询失败";
+                    body.Text = String.IsNullOrWhiteSpace(retainedExplanation) ? RequestFeedback.For(error) : retainedExplanation;
+                    notice.Text = String.IsNullOrWhiteSpace(retainedExplanation) ? "查询失败" : "重试失败 · 已保留上次释义";
                     retry.Visible = true;
                     retry.Text = "重试解释";
                     if (services != null) services.RecordLookupMetric("active_lookup", sourceApp, inputSource, "client_error",
@@ -1219,6 +1296,7 @@ RenderCompletedLookup:
             SetQueryText(String.Empty);
             body.Text = String.Empty;
             currentExplanation = null;
+            currentExplanationIsModel = false;
             retry.Visible = false;
             related.Visible = false;
             related.Links.Clear();
@@ -1300,6 +1378,7 @@ RenderCompletedLookup:
             initialQuery = query.Text;
             body.Text = String.Empty;
             currentExplanation = null;
+            currentExplanationIsModel = false;
             retry.Visible = false;
             related.Visible = false;
             related.Links.Clear();

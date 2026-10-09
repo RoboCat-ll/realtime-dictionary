@@ -11,6 +11,8 @@ namespace SemanticOverlay.NativeHost
     // 全部为本地合成检查，不发起网络或模型请求，不操作真实客户端。
     internal static class ContinuousLookupTest
     {
+        [System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
+        private static extern int WindowStyle(IntPtr hwnd, int index);
         private static void Require(bool condition, string message)
         {
             if (!condition) throw new InvalidOperationException(message);
@@ -116,6 +118,12 @@ namespace SemanticOverlay.NativeHost
                         "Trigger must default to double_click");
                     Size unset;
                     Require(!service.TryGetFloatSize(out unset), "Float size must default to unset");
+                    service.SetSelectionToolbarEnabled(false);
+                    service.SetContinuousLookupEnabled(true);
+                    Require(service.SelectionToolbarEnabled && service.ContinuousLookupEnabled,
+                        "One action must enable continuous lookup and its prerequisite");
+                    service.SetSelectionToolbarEnabled(false);
+                    Require(!service.ContinuousLookupEnabled, "Master off must also turn off continuous lookup");
                     service.SetContinuousLookupEnabled(true);
                     service.SetContinuousLookupTrigger("alt_click");
                     service.SetFloatSize(new Size(420, 320));
@@ -147,6 +155,18 @@ namespace SemanticOverlay.NativeHost
                         "Denied preference save must return failure instead of throwing");
                     Require(service.TryGetFloatSize(out restored) && restored == new Size(540, 360),
                         "Denied save must retain the current-session size");
+                    string corrupt = Path.Combine(Path.GetTempPath(), "rtd-corrupt-prefs-" + Guid.NewGuid().ToString("N") + ".json");
+                    File.WriteAllText(corrupt, "{broken");
+                    typeof(ServiceManager).GetField("preferences", BindingFlags.Instance | BindingFlags.NonPublic)
+                        .SetValue(service, new PreferenceStore(corrupt, delegate { }));
+                    int warnings = 0;
+                    service.PreferenceSaveFailed = delegate { warnings++; };
+                    service.SetContinuousLookupEnabled(true);
+                    service.SetCaptionArchiveEnabled(false);
+                    Require(service.ContinuousLookupEnabled && !service.CaptionArchiveEnabled && warnings == 2,
+                        "Failed UI preference saves must retain disclosed session values");
+                    Require(!service.TrySetFloatSize(new Size(550, 370)) && warnings == 3 &&
+                        File.ReadAllText(corrupt) == "{broken", "Corrupt preferences caused a resize exception or overwrite");
                     using (var form = new SelectionAnalysisForm(service, null))
                     {
                         form.Size = new Size(600, 400);
@@ -158,6 +178,7 @@ namespace SemanticOverlay.NativeHost
                             "Resize-save failure must retain the size and visibly explain persistence failure");
                     }
                     Console.WriteLine("resize-save-failure-session-retention-and-ui-warning-ok");
+                    File.Delete(corrupt);
                 }
                 Console.WriteLine("continuous-preferences-ok");
             }
@@ -178,6 +199,7 @@ namespace SemanticOverlay.NativeHost
                 CheckGesture();
                 CheckGates();
                 CheckPreferences();
+                CheckMessageHints();
                 Console.WriteLine("continuous-lookup-gesture-gates-preferences-ok");
                 return 0;
             }
@@ -185,6 +207,65 @@ namespace SemanticOverlay.NativeHost
             {
                 Console.WriteLine(error.ToString());
                 return 1;
+            }
+        }
+
+        private static void CheckMessageHints()
+        {
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
+            var context = (OverlayContext)System.Runtime.Serialization.FormatterServices
+                .GetUninitializedObject(typeof(OverlayContext));
+            using (var source = new Form { Location = new Point(100, 100), Size = new Size(500, 400) })
+            using (var hint = new StatusForm(true))
+            {
+                source.Show();
+                Application.DoEvents();
+                // Preserve whichever desktop window is actually foreground;
+                // Windows may legitimately refuse activation from this test process.
+                IntPtr foreground = NativeMethods.GetForegroundWindow();
+                Require(foreground != IntPtr.Zero, "A foreground window is needed for the preservation check");
+                typeof(OverlayContext).GetField("messageHintWindow", flags).SetValue(context, hint);
+                var show = typeof(OverlayContext).GetMethod("ShowMessageHint", flags);
+                var hide = typeof(OverlayContext).GetMethod("HideMessageHint", flags);
+                show.Invoke(context, new object[] { "点击消息 · 10 秒", source.Handle, 300, 1 });
+                Application.DoEvents();
+                Require(hint.Visible, "Armed hint must be visible");
+                var hintLabel = (Label)hint.Controls[0];
+                Require(TextRenderer.MeasureText(hintLabel.Text, hintLabel.Font).Width <= hintLabel.ClientSize.Width,
+                    "Armed hint wording must fit the compact reading area");
+                show.Invoke(context, new object[] { "未读到 · 选词后按 Ctrl+Alt+D", source.Handle, 300, 1 });
+                Require(TextRenderer.MeasureText(hintLabel.Text, hintLabel.Font).Width <= hintLabel.ClientSize.Width,
+                    "Capture recovery shortcut must fit the hint");
+                using (var quietHint = new StatusForm()) {
+                    quietHint.ShowMessage("未读到 · 选词后按 Ctrl+Alt+D",
+                        new NativeRect { Left=source.Left, Top=source.Top, Right=source.Right, Bottom=source.Bottom }, 300);
+                    var quietLabel = (Label)quietHint.Controls[0];
+                    Require(TextRenderer.MeasureText(quietLabel.Text, quietLabel.Font).Width <= quietLabel.ClientSize.Width,
+                        "Continuous capture recovery shortcut must fit the hint");
+                }
+                Require(NativeMethods.GetForegroundWindow() == foreground, "Hint must not steal focus: before=" +
+                    foreground + " after=" + NativeMethods.GetForegroundWindow() + " hint=" + hint.Handle +
+                    " ex=" + WindowStyle(hint.Handle, -20).ToString("X") + " style=" + WindowStyle(hint.Handle, -16).ToString("X"));
+                var parameters = (CreateParams)typeof(StatusForm).GetProperty("CreateParams", flags).GetValue(hint, null);
+                Require((parameters.ExStyle & 0x20) != 0 && (parameters.ExStyle & 0x80000) != 0,
+                    "Hint must be a transparent layered window so message clicks pass through");
+                show.Invoke(context, new object[] { "正在读取", source.Handle, 300, 2 });
+                hide.Invoke(context, new object[] { 1 });
+                Require(hint.Visible, "A stale request must not hide the current hint");
+                hide.Invoke(context, new object[] { 2 });
+                Require(!hint.Visible, "Current request must clear its hint");
+                show.Invoke(context, new object[] { "请点击消息", source.Handle, 250, 3 });
+                var deadline = DateTime.UtcNow.AddSeconds(2);
+                while (hint.Visible && DateTime.UtcNow < deadline) { Application.DoEvents(); Thread.Sleep(15); }
+                Require(!hint.Visible, "Hint must expire without user interaction");
+                show.Invoke(context, new object[] { "请点击消息", source.Handle, 2000, 4 });
+                source.Hide();
+                Application.DoEvents();
+                Require(NativeMethods.GetForegroundWindow() != source.Handle,
+                    "A hidden source must no longer own foreground");
+                typeof(OverlayContext).GetMethod("TrackTarget", flags).Invoke(context, new object[] { null, EventArgs.Empty });
+                Require(!hint.Visible, "Hint must hide when its source loses foreground");
+                Console.WriteLine("message-hint-focus-transparency-generation-expiry-ok");
             }
         }
     }

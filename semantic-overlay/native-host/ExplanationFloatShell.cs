@@ -33,6 +33,7 @@ namespace SemanticOverlay.NativeHost
         private IntPtr anchorTarget = IntPtr.Zero;
         private Rectangle lastTargetRect = Rectangle.Empty;
         private bool autoHidden;
+        private bool bubbleAnchorDetached;
         private System.Windows.Forms.Timer followTimer;
         private const int InputZoneReserve = 120; // 96DPI 逻辑像素：聊天输入区预留
 
@@ -342,6 +343,8 @@ namespace SemanticOverlay.NativeHost
         internal void SetAnchor(Rectangle screenRect, IntPtr target)
         {
             anchorRect = screenRect;
+            bubbleAnchorDetached = false;
+            UpdateReadingHeading();
             anchorTarget = target;
             userPositioned = false;
             autoHidden = false;
@@ -365,6 +368,49 @@ namespace SemanticOverlay.NativeHost
             if (anchorRect.Width <= 0) return;
             Rectangle area = Screen.FromRectangle(anchorRect).WorkingArea;
             Location = PlaceFloat(anchorRect, Size, lastTargetRect, area, ScaledInputReserve());
+        }
+
+        private void UpdateReadingHeading()
+        {
+            if (heading != null)
+                heading.Text = (wordViewActive ? "词语解释" : "这句话的意思") +
+                    (bubbleAnchorDetached ? " · 已保留原消息" : "");
+        }
+
+        private void DetachBubbleAnchor()
+        {
+            anchorRect = Rectangle.Empty;
+            bubbleAnchorDetached = true;
+            UpdateReadingHeading();
+        }
+
+        internal void ObserveChatScroll(Point point)
+        {
+            if (IsDisposed || anchorTarget == IntPtr.Zero ||
+                NativeMethods.GetForegroundWindow() != anchorTarget ||
+                (Visible && Bounds.Contains(point))) return;
+            NativeRect target;
+            if (NativeMethods.GetWindowRect(anchorTarget, out target) &&
+                new Rectangle(target.Left, target.Top, target.Width, target.Height).Contains(point))
+                DetachBubbleAnchor();
+        }
+
+        internal void RestoreReadingCard()
+        {
+            if (IsDisposed) return;
+            autoHidden = false;
+            Show();
+            Activate(); // Explicit desktop-shortcut action, unlike automatic following.
+            ClampIntoWorkingArea();
+        }
+
+        private bool CanRepairVisibility()
+        {
+            if (autoHidden) return false;
+            if (anchorTarget == IntPtr.Zero) return true;
+            if (!NativeMethods.IsWindow(anchorTarget) || NativeMethods.IsIconic(anchorTarget)) return false;
+            IntPtr foreground = NativeMethods.GetForegroundWindow();
+            return foreground == anchorTarget || IsOwnedForeground(foreground);
         }
 
         private void ClampIntoWorkingArea()
@@ -406,9 +452,9 @@ namespace SemanticOverlay.NativeHost
             Rectangle rect = new Rectangle(native.Left, native.Top, native.Width, native.Height);
             if (lastTargetRect.Width > 0 && rect.Size != lastTargetRect.Size)
             {
-                // 缩放后锚点不可靠：明确关闭，不假装跟随
-                Close();
-                return;
+                // Layout changed, not the user's reading intent. Retain the answer
+                // without pretending the old bubble coordinates remain valid.
+                DetachBubbleAnchor();
             }
             if (lastTargetRect.Width > 0 && rect.Location != lastTargetRect.Location)
             {
@@ -420,6 +466,7 @@ namespace SemanticOverlay.NativeHost
                 }
             }
             lastTargetRect = rect;
+            if (bubbleAnchorDetached) ClampIntoWorkingArea();
             IntPtr foreground = NativeMethods.GetForegroundWindow();
             bool ownForeground = foreground == anchorTarget || IsOwnedForeground(foreground);
             if (!ownForeground)
@@ -454,11 +501,12 @@ namespace SemanticOverlay.NativeHost
             wordView = new Panel {
                 Dock = DockStyle.Fill, Visible = false, BackColor = Color.White,
                 Padding = new Padding(12, 2, 12, 12) };
-            wordLayout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3 };
+            wordLayout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4 };
             wordLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             wordLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
             wordLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
             wordLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+            wordLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100)); // Spare height must not stretch a short definition.
             wordBack = new LinkLabel {
                 Text = "‹ 返回整句解释", AutoSize = true, Dock = DockStyle.Left,
                 LinkColor = Color.FromArgb(36, 88, 184),
@@ -484,7 +532,7 @@ namespace SemanticOverlay.NativeHost
                 termBody.Visible = true;
                 layout.Visible = false;
                 wordView.Visible = true;
-                heading.Text = "词语解释";
+                UpdateReadingHeading();
             }
             UpdateCardLayout();
         }
@@ -499,7 +547,7 @@ namespace SemanticOverlay.NativeHost
             termBody.Visible = false;
             wordView.Visible = false;
             layout.Visible = true;
-            heading.Text = "这句话的意思";
+            UpdateReadingHeading();
             UpdateCardLayout();
         }
 
@@ -507,6 +555,9 @@ namespace SemanticOverlay.NativeHost
         {
             if (wordLayout == null) return;
             int cap = ScaledCap(termDetailsExpanded ? 384 : 176);
+            if (userSized)
+                cap = Math.Max(ScaledCap(100), ClientSize.Height - floatGrip.Height -
+                    wordView.Padding.Vertical - wordLayout.Padding.Vertical - 30 - 30 - 4);
             bool overflow;
             wordLayout.RowStyles[2].Height = MeasureGrow(
                 termBody, termBody.Text, termBody.Font, ScaledCap(100), cap, out overflow);

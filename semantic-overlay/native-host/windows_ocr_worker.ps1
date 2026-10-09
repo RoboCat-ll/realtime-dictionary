@@ -91,6 +91,21 @@ while ($null -ne ($requestLine = [Console]::In.ReadLine())) {
                     }
                 }
 
+                $latinWords = @()
+                if ([string]$request.include_latin -eq "true") {
+                    try {
+                        $english = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage(
+                            (New-Object Windows.Globalization.Language("en-US")))
+                        if ($null -ne $english) {
+                            $latin = Wait-WinRtResult ($english.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+                            $latinWords = @(foreach ($line in $latin.Lines) { foreach ($word in $line.Words) {
+                                [PSCustomObject]@{ text=$word.Text; x=$word.BoundingRect.X; y=$word.BoundingRect.Y;
+                                    w=$word.BoundingRect.Width; h=$word.BoundingRect.Height }
+                            } })
+                        }
+                    } catch { $latinWords = @() }
+                }
+
                 [PSCustomObject]@{
                     ok = $true
                     request_id = [string]$request.request_id
@@ -98,6 +113,7 @@ while ($null -ne ($requestLine = [Console]::In.ReadLine())) {
                     recognize_ms = [int]$recognizeWatch.ElapsedMilliseconds
                     worker_ms = [int]$totalWatch.ElapsedMilliseconds
                     words = @($words)
+                    latin_words = @($latinWords)
                 } | ConvertTo-Json -Compress -Depth 4
             }
             finally {

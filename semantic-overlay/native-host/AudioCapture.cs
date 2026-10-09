@@ -15,8 +15,10 @@ namespace SemanticOverlay.NativeHost
         private const double NoiseMultiplier = 3.0;
         private const int SpeechAttackSamples = TargetRate * 12 / 100;
         private const int PreRollSamples = TargetRate * 3 / 10;
-        private const int BoundaryOverlapSamples = TargetRate / 4;
+        private const int BoundaryOverlapSamples = TargetRate;
         private const int SilenceEndSamples = TargetRate * 7 / 10;
+        private const int NaturalPauseSamples = TargetRate / 4;
+        private const int MinimumNaturalSegmentSamples = TargetRate * 3;
         private const int MinimumVoiceSamples = TargetRate * 35 / 100;
         private const int MaximumSegmentSamples = TargetRate * 8;
         private readonly object gate = new object();
@@ -42,6 +44,9 @@ namespace SemanticOverlay.NativeHost
         private bool disposed;
 
         public event Action<byte[]> AudioChunkReady;
+        public event Action<byte[], bool> AudioChunkReadyWithContext;
+        internal bool LastCompletedHasOverlap { get; private set; }
+        private bool segmentHasOverlap;
         public event Action<string> Failed;
 
         public bool IsProcessIsolated { get; private set; }
@@ -163,7 +168,12 @@ namespace SemanticOverlay.NativeHost
             List<short> mono = Downsample(buffer, count);
             if (mono.Count == 0) return;
             byte[] completed = ProcessMonoSamples(mono);
-            if (completed != null && AudioChunkReady != null) AudioChunkReady(completed);
+            if (completed != null)
+            {
+                if (AudioChunkReadyWithContext != null)
+                    AudioChunkReadyWithContext(completed, LastCompletedHasOverlap);
+                if (AudioChunkReady != null) AudioChunkReady(completed);
+            }
         }
 
         internal byte[] ProcessMonoSamples(IList<short> mono)
@@ -216,7 +226,8 @@ namespace SemanticOverlay.NativeHost
                     if (speech) { voicedSamples += mono.Count; silentSamples = 0; }
                     else silentSamples += mono.Count;
                 }
-                if (silentSamples >= SilenceEndSamples)
+                if (silentSamples >= SilenceEndSamples ||
+                    (segment.Count >= MinimumNaturalSegmentSamples && silentSamples >= NaturalPauseSamples))
                     return FinishSegment(false);
                 if (segment.Count >= MaximumSegmentSamples)
                     return FinishSegment(true);
@@ -271,13 +282,23 @@ namespace SemanticOverlay.NativeHost
         private byte[] FinishSegment(bool preserveBoundary)
         {
             byte[] wav = voicedSamples >= MinimumVoiceSamples ? BuildWav(segment) : null;
+            LastCompletedHasOverlap = segmentHasOverlap;
             preRoll.Clear();
             if (preserveBoundary && segment.Count > 0)
             {
-                int start = Math.Max(0, segment.Count - BoundaryOverlapSamples);
-                for (int index = start; index < segment.Count; index++) preRoll.Add(segment[index]);
+                int retained = Math.Min(segment.Count, BoundaryOverlapSamples);
+                segment.RemoveRange(0, segment.Count - retained);
+                // Reacquiring an attack would discard this context through the
+                // shorter rolling pre-roll and clip the start of new words.
+                active = true;
+                segmentHasOverlap = true;
             }
-            segment.Clear(); active = false; silentSamples = voicedSamples = attackSamples = 0;
+            else
+            {
+                segment.Clear(); active = false; segmentHasOverlap = false;
+            }
+            // Context alone is not new voice: do not emit it again on silence.
+            silentSamples = voicedSamples = attackSamples = 0;
             return wav;
         }
 

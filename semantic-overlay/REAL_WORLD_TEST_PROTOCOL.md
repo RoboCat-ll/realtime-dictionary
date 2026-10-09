@@ -206,3 +206,171 @@ CompactWorkflowTest, CalendarFlowTest, LocalReminderTest, SelectionLookupInterac
 CaptionTextTest, CloseoutReliabilityTest. DPI-aware target-only synthetic form previews
 were inspected; this is injected-data UI verification, not a fresh QQ/WeChat or long
 live audio trial. Source GUI restarted; no provider calls or installer rebuild.
+
+
+## 2026-10-03 reading area and trigger feedback — real desktop checks
+
+The ordinary-user installed host was checked in the designated QQ and WeChat
+test chats. Actual foreground handles remained unchanged when arming in both
+clients. The compact hint cleared after message capture; QQ arm-only expiry
+was observed after the 10-second window. Complete RAG source and relevant model
+results were visually checked. No test messages were sent.
+
+A real bottom-edge drag changed the float from 1180x528 to 1180x728, keeping
+width unchanged. The sentence meaning control increased from 282 to 482 pixels
+high; the same-size word view allocated 622 pixels to its body. Source and
+fixed actions stayed visible. These measurements are physical pixels on the
+current 2560x1440, 150-percent desktop, not mixed-DPI acceptance.
+
+Real checking exposed clipping of the long armed-hint copy at this scale.
+The copy is shortened and a text-fit regression passes. Latest candidate
+compiles; that final copy fix awaits replacement of the running host. Six
+related native diagnostic groups passed for this batch, and the hint group
+was rerun after the copy fix. Python was not changed or retested this batch.
+Repeated RAG operations are UI checks, not additional independent formal
+accuracy samples, a measured latency percentile, or a 1-percent failure proof.
+
+
+### User-visible compactness correction, pending installation
+
+The user screenshot exposed that the earlier manual-height allocation stretched
+a one-line meaning excessively. The candidate now caps short text by content
+instead of assigning all leftover height; its minimum meaning row is 40 logical
+pixels. Word layout uses a separate spacer so the final text row does not
+stretch. Explicit outer dimensions remain unchanged. New short-manual regressions
+failed against the prior implementation and pass after correction, alongside
+long-content growth and fixed-action checks. Three affected native diagnostic
+groups passed; production candidate compiled. This correction is not yet installed
+or counted as real-client acceptance. Earlier growth measurements above describe
+the prior installed behavior, not the corrected content-dependent allocation.
+
+
+Final compact-layout candidate was installed after an actual tray-menu Exit,
+with no forced termination. Host absence, source freshness, exact desktop shortcut
+target and installed/candidate SHA256 equality were checked. Automatic shortcut
+reopening through Explorer was rejected by execution policy before execution;
+ordinary-user reopening and real compact-layout recheck remain pending.
+
+## 2026-10-03 five-point installed-build recheck
+
+This section supersedes the pending-installation statements above. The user
+reopened the verified installed host; actual QQ and WeChat cards were checked.
+
+| Check | Observed evidence | Remaining limits |
+| --- | --- | --- |
+| Compact reading | A short real-message meaning body is 34 physical pixels; source/actions stay grouped at the top. Word detail remains readable in the same float. | Measurements are on this 150-percent desktop. |
+| Independent resize/persistence | Real right-edge and bottom-edge resizing reached 685x360 without a crash; sentence/word switching kept the size. Earlier real host restart restored the saved 1180x528 size. | The latest 685x360 size was not separately checked after another complete host restart. |
+| Arming feedback | Real QQ and WeChat foreground stayed unchanged. Hint clears on consumption; QQ expiry was observed after ten seconds. | No mixed-DPI acceptance. |
+| Message/word workflows | Fresh 25-per-client clicks all returned model-result status. QQ sources matched 25/25; WeChat punctuation-normalized sources matched 24/25. Highlighted RAG and an unmarked selected word were explained. | WeChat sample 18 repeatedly read AIGC as ACC. Not every explanation was independently graded for semantic correctness; cached and uncached timings are mixed. Double-click also exposed an extra text toolbar of unconfirmed origin; WeChat Alt-click avoided it. |
+| Calendar/captions | Actual calendar confirmation preserved the fixture's explicit 2026-09-30 14:30 start and past-date notice, asking for missing fields; no reminder was created. Real system-loopback captions accepted four distinct synthetic TTS lines over about thirty seconds, stayed running beyond ten seconds, and were stopped explicitly. Actual dated history showed all four lines plus an earlier failed-session gap, date navigation, selected-word explanation and selected-text translation. | This is a short synthetic audio trial, not a sustained foreign-language meeting. ASR misheard some Chinese words and bootcamp as bookcam. |
+
+Speech uses FunAudioLLM/SenseVoiceSmall on SiliconFlow's transcription endpoint.
+Applicable official pricing was checked as zero on 2026-10-03 and the runtime
+free-price guard remains enabled. The desktop settings UI saved/applied the
+authorized encrypted speech credential; official DeepSeek text settings stayed
+separate. Raw helper configuration writes initially disagreed with the
+desktop-launched backend; that discrepancy is not root-caused and is not claimed
+fixed by changing file permissions.
+
+Two backend corrections were made and applied through the existing graceful
+service restart path: caption translation now uses the independent text provider
+and its key, matching consent; a socket timeout within an armed header budget is
+retryable even when the OS timer fires slightly early. The absolute deadline,
+attempt cap, and body-timeout handling remain intact. The transport regression
+failed repeatedly before this correction; the full isolated suite subsequently
+passed 235/235 with no model calls. Live history translation was checked after
+restart; health confirmed both independent configurations remained available.
+
+Local OCR comparison on 24 identifiable rendered fixture bubbles found 18 exact
+normalized matches at each of 1.5x and 1.7x, with different failures. A separate
+capture of the AIGC bubble succeeded at 1.5x but failed at 1.7x; the result did
+not generalize across crops/positions. These are OCR-only experiments, not new
+message-acceptance samples. Production scaling was therefore not changed and
+the AIGC defect remains open. No fuzzy ACC-to-AIGC replacement was added.
+
+No chat messages, reminders, or calendar entries were created in this recheck.
+Private screenshots/audio, diagnostic helper outputs, credentials, and local
+archives remain outside Git. This batch was not pushed or packaged. The five
+checks have concrete evidence, but the open accuracy and long-session limits
+prevent claiming complete acceptance or a measured one-percent failure rate.
+
+## Five-point refinement checkpoint — 2026-10-05
+
+The earlier AIGC defect was reproduced through the real WeChat message click:
+the Chinese OCR yielded A/℃/C, and the model changed it to ACC. A fresh local
+worker re-read the exact same detector/inflation/1.7x bounded bubble image with
+the installed English recognizer. The narrow unique-box repair now yields AIGC;
+ordinary ACC, numeric temperatures, shifted and ambiguous boxes stay unchanged.
+This is exact failure-crop evidence, not a new overall OCR success-rate claim.
+If English OCR is unavailable or the legacy one-shot bridge is used, no such
+repair is promised. No language pack or fuzzy ACC-to-AIGC rule was added.
+
+Real QQ RAG capture and explanation succeeded before the final OCR build.
+The user exited the app and the actual desktop-shortcut executable was rebuilt.
+Fresh live WeChat acceptance after reopening remains pending. Only the two
+authorized official DeepSeek analyses above were called; no SiliconFlow model
+request was made during these checks.
+
+The five changes are: preserve visible OCR uncertainty and authoritative manual
+edits; disclose ambiguous definitions in the lookup prompt; show the selected-word
+recovery shortcut in a text-fitting hint; record anonymous once-per-chunk caption
+outcomes and queue-to-result time; ask only duration when a calendar draft solely
+lacks its end. No duration is guessed and no reminder/calendar was created.
+
+Current-source build, five targeted native diagnostics, the exact failed-crop
+probe, Python and OCR-worker syntax checks passed. Offline regression: 237/237
+OK (25.665s). CompactWorkflowTest suppressed screenshots. Live ambiguity quality,
+actual duration-confirmation interaction and sustained real English audio remain
+unverified; source/isolated evidence does not close those acceptance items.
+
+Live follow-up: after the user reopened the final executable, the actual WeChat
+AIGC bubble click returned AGI and AIGC unchanged, with a matching concise
+explanation. The OCR-review label remained visible. Verification used window
+text, not new screenshots. This closes this specific reproduction only.
+
+`LocalVideoCaptureTest.exe <video-path>` plays a user-designated video through
+the existing decoder and production process-specific audio capture. It makes
+zero provider requests and retains only numeric summaries. A completed local
+capture does not establish ASR transcription, English accuracy or subtitle
+latency. Chunk emission intervals can include silence and music and cannot be
+treated as missing speech. Run it separately; it is compiled but not part of
+the automatic offline suite because it plays real audio in real time.
+
+Real designated-video run (2026-10-05): input duration 195.86s, played 197.55s
+including drain; production process-isolated capture emitted 25 segments,
+first at 8.03s and last at 196.60s. Maximum segment duration was 8.00s;
+largest inter-emission interval was 22.07s. These intervals are segmentation
+measurements, not model/subtitle latency or proven speech losses. Audio was not
+persisted; only aggregate log values remain in ignored diagnostics output.
+Playback and capture disposed successfully; exit 0. Provider requests: zero.
+
+Live transcription was not attempted: local HTTPS pricing requests failed TLS
+handshake using Python, Windows curl and Windows HTTP, including a direct probe.
+The free-price runtime guard stayed closed. The official pricing search result
+lists SenseVoiceSmall as free, but this does not bypass the program's own fresh
+verification requirement. No proxy/system setting or credential was changed.
+
+### 2026-10-05 caption boundary comparison
+- Actual old/new native segmenters, same 195.86s video and 69 visually reviewed
+  subtitle lines (467 words): word agreement 88.6510% -> 90.3640%.
+- S/D/I: 14/33/6 -> 15/25/5; 27 -> 29 requests. Reference is embedded subtitles,
+  not human-listened audio ground truth. File decoding/core pipeline benchmark,
+  not complete live UI acceptance. Fixed non-overlap 8s prior results are separate.
+- Preserve one-second context across forced cuts, keep active, attach overlap and
+  sequence to chunks, trim exact overlap only across adjacent successful chunks.
+  No reference-specific vocabulary substitutions; fee guard unchanged.
+- Full native build + audio segmentation/text/reliability diagnostics pass;
+  Python offline 237/237 passes. Runtime replacement hash verified.
+- Single-video improvement does not establish cross-audio accuracy or faster
+  network latency; extra context increased segment count by two in this sample.
+
+### 2026-10-06 targeted natural-pause refinement
+- Actual native segmentation/core pipeline, same 195.86s video + reviewed
+  69 subtitle lines/467 words: 90.3640% -> 92.2912% agreement, S/D/I
+  15/25/5 -> 11/11/14. More inserted words are disclosed; not audio-ground-truth
+  WER, cross-meeting accuracy, or live meeting UI acceptance.
+- Submit at >=3s buffer plus >=0.25s quiet; shorter buffers keep0.7s endpoint.
+  Source phrase "your bags" released at89.1s vs92s, before network processing.
+  Other missing expressions returned; no reference-specific vocabulary rewriting.
+- Segments29 ->30. Full native build and AudioSegmentationTest/CaptionTextTest
+  passed, installed target matches candidate hash. No unrelated broad re-audit.

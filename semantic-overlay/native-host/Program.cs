@@ -24,14 +24,27 @@ namespace SemanticOverlay.NativeHost
         private static void Main()
         {
             bool created;
+            using (EventWaitHandle activation = new EventWaitHandle(false,
+                EventResetMode.AutoReset, "Local\\RealtimeDictionary.NativeHost.Activate.v1"))
             using (Mutex mutex = new Mutex(true, "Local\\RealtimeDictionary.NativeHost.v1", out created))
             {
                 if (!created)
+                {
+                    activation.Set();
                     return;
+                }
                 NativeMethods.SetProcessDPIAware();
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
-                Application.Run(new OverlayContext());
+                using (var context = new OverlayContext())
+                using (var activationTimer = new System.Windows.Forms.Timer { Interval = 250 })
+                {
+                    activationTimer.Tick += delegate {
+                        if (activation.WaitOne(0)) context.RevealRunningApplication();
+                    };
+                    activationTimer.Start();
+                    Application.Run(context);
+                }
             }
         }
     }

@@ -1083,6 +1083,18 @@ class TaskExtractionTests(unittest.TestCase):
 
 
 class LookupContextTests(unittest.TestCase):
+    def test_brief_refresh_stays_concise_and_provenance_is_metadata(self):
+        generated = json.dumps({"explanation": "此处指集中培训。", "entities": []}, ensure_ascii=False)
+        with mock.patch.object(server, "API_KEY", "test-key"), \
+                mock.patch.object(server, "call_llm_with_deadline", return_value=generated) as call:
+            result = server.lookup("bootcamp", context="两周集中训练", detail="brief",
+                                   refresh=True, previous_explanation="旧解释")
+        messages = call.call_args.args[0]
+        self.assertIn("不展开背景或例子", messages[1]["content"])
+        self.assertNotIn("并给出贴合语境的小例子", messages[1]["content"])
+        self.assertEqual("此处指集中培训。", result["explanation"])
+        self.assertEqual("model", result["lookup_mode"])
+
     def test_brief_lookup_is_context_first_without_nested_terms(self):
         generated = json.dumps({"canonical_term": "RAG",
             "explanation": "这里的 RAG 指检索资料后据此回答。",
@@ -1285,9 +1297,9 @@ class LookupContextTests(unittest.TestCase):
         self.assertEqual("local-model", model)
 
     def test_context_is_normalized_and_bounded(self):
-        context = "  第一行\n\n第二行  " + ("很长" * 400)
+        context = "  第一行\n\n第二行  " + ("很长" * 800)
         normalized = server.normalize_lookup_context(context)
-        self.assertLessEqual(len(normalized), 500)
+        self.assertEqual(len(normalized), 1000)
         self.assertFalse(normalized.startswith(" "))
         self.assertNotIn("\n", normalized)
 

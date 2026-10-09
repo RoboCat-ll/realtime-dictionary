@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -23,6 +23,17 @@ namespace SemanticOverlay.NativeHost
         public byte[] Wav { get; set; }
         public DateTime CapturedAt { get; set; }
         public int Attempts { get; set; }
+        public bool HasOverlap { get; set; }
+        public int Sequence { get; set; }
+        private readonly Stopwatch elapsed = Stopwatch.StartNew();
+        private int completed;
+        public int ElapsedMilliseconds { get { return (int)Math.Min(600000, elapsed.ElapsedMilliseconds); } }
+        public void Complete(string outcome, Action<string, int, int> record)
+        {
+            if (Interlocked.Exchange(ref completed, 1) != 0) return;
+            elapsed.Stop();
+            if (record != null) record(outcome, ElapsedMilliseconds, Attempts);
+        }
     }
 
     internal sealed class CaptionAudioBacklog
@@ -40,10 +51,11 @@ namespace SemanticOverlay.NativeHost
         public int PendingCount { get { return pending.Count; } }
         public bool HasWork { get { return retry != null || pending.Count > 0; } }
 
-        public CaptionAudioChunk Enqueue(byte[] wav, DateTime capturedAt)
+        public CaptionAudioChunk Enqueue(byte[] wav, DateTime capturedAt, bool hasOverlap = false, int sequence = 0)
         {
             CaptionAudioChunk dropped = pending.Count >= pendingLimit ? pending.Dequeue() : null;
-            pending.Enqueue(new CaptionAudioChunk { Wav = wav, CapturedAt = capturedAt });
+            pending.Enqueue(new CaptionAudioChunk { Wav = wav, CapturedAt = capturedAt,
+                HasOverlap = hasOverlap, Sequence = sequence });
             return dropped;
         }
 
@@ -63,10 +75,43 @@ namespace SemanticOverlay.NativeHost
             return true;
         }
 
-        public void Clear()
+        public void Clear(Action<string, int, int> record = null)
         {
-            pending.Clear();
+            while (pending.Count > 0) pending.Dequeue().Complete("cancelled", record);
+            if (retry != null) retry.Complete("cancelled", record);
             retry = null;
+        }
+    }
+
+    // All access is on the UI thread. A later result waits for an earlier retry.
+    internal sealed class CaptionOrderedCompletions
+    {
+        private readonly SortedDictionary<int, Tuple<CaptionAudioChunk, Func<bool>>> ready =
+            new SortedDictionary<int, Tuple<CaptionAudioChunk, Func<bool>>>();
+        private int next = 1;
+        internal int Count { get { return ready.Count; } }
+        internal void Add(CaptionAudioChunk chunk, Func<bool> deliver)
+        {
+            if (chunk.Sequence < next || ready.ContainsKey(chunk.Sequence))
+                throw new InvalidOperationException("Duplicate or stale caption completion.");
+            ready.Add(chunk.Sequence, Tuple.Create(chunk, deliver));
+        }
+        internal void Drain(Func<bool> current)
+        {
+            Tuple<CaptionAudioChunk, Func<bool>> item;
+            while (current() && ready.TryGetValue(next, out item))
+            {
+                ready.Remove(next);
+                bool final = item.Item2();
+                if (!current() || !final) return;
+                next++;
+            }
+        }
+        internal void Clear(Action<string, int, int> record = null)
+        {
+            foreach (var item in ready.Values) item.Item1.Complete("cancelled", record);
+            ready.Clear();
+            next = 1;
         }
     }
 
@@ -78,6 +123,16 @@ namespace SemanticOverlay.NativeHost
         public bool is_gap { get; set; }
         public string session_key { get; set; }
         public string session_label { get; set; }
+    }
+
+    internal sealed class CaptionArchiveReadResult
+    {
+        public List<CaptionEntry> Entries = new List<CaptionEntry>();
+        public int SkippedFiles;
+        public int SkippedLines;
+        public bool Truncated;
+        public CaptionArchiveCursor Next;
+        public bool Incomplete { get { return SkippedFiles > 0 || SkippedLines > 0 || Truncated; } }
     }
 
     internal sealed class CaptionHistoryArchive
@@ -99,6 +154,8 @@ namespace SemanticOverlay.NativeHost
             get { return Path.Combine(Environment.GetFolderPath(
                 Environment.SpecialFolder.ApplicationData), "RealtimeDictionary", "caption-history"); }
         }
+
+        public DateTime CurrentDate { get { return currentStart.Date; } }
 
         public int DeleteDate(DateTime date)
         {
@@ -156,31 +213,44 @@ namespace SemanticOverlay.NativeHost
 
         public List<CaptionEntry> LoadDate(DateTime date)
         {
-            var result = new List<CaptionEntry>();
+            return LoadDateWithStatus(date).Entries;
+        }
+
+        public CaptionArchiveReadResult LoadPage(DateTime date, CaptionArchiveCursor cursor)
+        {
+            return CaptionArchivePages.Read(Path.Combine(root, date.ToString("yyyy-MM-dd")), cursor);
+        }
+
+        public CaptionArchiveReadResult LoadDateWithStatus(DateTime date)
+        {
+            var serializer = new JavaScriptSerializer();
+            var loaded = new CaptionArchiveReadResult();
+            var result = loaded.Entries;
             string directory = Path.Combine(root, date.ToString("yyyy-MM-dd"));
-            if (!Directory.Exists(directory)) return result;
+            if (!Directory.Exists(directory)) return loaded;
             string[] files;
             try { files = Directory.GetFiles(directory, "*.jsonl"); }
-            catch { return result; }
+            catch { loaded.SkippedFiles++; return loaded; }
             Array.Sort(files, StringComparer.Ordinal);
             foreach (string file in files)
             {
                 var session = new List<CaptionEntry>();
                 try
                 {
-                    if (new FileInfo(file).Length > 20 * 1024 * 1024) continue;
+                    if (new FileInfo(file).Length > 20 * 1024 * 1024) { loaded.SkippedFiles++; continue; }
                     foreach (string line in File.ReadLines(file, Encoding.UTF8))
                     {
-                        if (line.Length == 0 || line.Length > 10000) continue;
+                        if (line.Length == 0) continue;
+                        if (line.Length > 10000) { loaded.SkippedLines++; continue; }
                         try
                         {
                             var record = serializer.Deserialize<Dictionary<string, object>>(line);
                             if (record == null || !record.ContainsKey("kind") ||
-                                !record.ContainsKey("timestamp") || !record.ContainsKey("text")) continue;
+                                !record.ContainsKey("timestamp") || !record.ContainsKey("text")) { loaded.SkippedLines++; continue; }
                             string text = record["text"] as string;
                             DateTime stamp;
                             if (String.IsNullOrWhiteSpace(text) || text.Length > 2000 ||
-                                !DateTime.TryParse(record["timestamp"] as string, out stamp)) continue;
+                                !DateTime.TryParse(record["timestamp"] as string, out stamp)) { loaded.SkippedLines++; continue; }
                             string started = record.ContainsKey("session_started")
                                 ? record["session_started"] as string : null;
                             DateTime start;
@@ -188,7 +258,7 @@ namespace SemanticOverlay.NativeHost
                             string source = record.ContainsKey("source")
                                 ? record["source"] as string : null;
                             string kind = record["kind"] as string;
-                            if (kind != "line" && kind != "replace_last" && kind != "gap") continue;
+                            if (kind != "line" && kind != "replace_last" && kind != "gap") { loaded.SkippedLines++; continue; }
                             string rawText = record.ContainsKey("raw_text")
                                 ? record["raw_text"] as string : null;
                             if (rawText != null && rawText.Length > 2000) rawText = null;
@@ -204,15 +274,17 @@ namespace SemanticOverlay.NativeHost
                             else
                                 session.Add(entry);
                         }
-                        catch { /* Skip one damaged line and keep later captions. */ }
+                        catch { loaded.SkippedLines++; }
                     }
                 }
-                catch { /* One unreadable session must not hide other days or sessions. */ }
+                catch { loaded.SkippedFiles++; }
                 result.AddRange(session.OrderBy(entry => entry.timestamp));
-                if (result.Count > MaxDailyEntries)
+                if (result.Count > MaxDailyEntries) {
+                    loaded.Truncated = true;
                     result.RemoveRange(0, result.Count - MaxDailyEntries);
+                }
             }
-            return result;
+            return loaded;
         }
     }
 
@@ -694,9 +766,21 @@ namespace SemanticOverlay.NativeHost
         public Func<string, CaptionTranslationResponse> Translate;
         public Func<string, AnalyzeResponse> Analyze;
         public Func<DateTime, List<CaptionEntry>> ArchiveDateRequested;
+        public Func<DateTime, CaptionArchiveReadResult> ArchiveStatusRequested;
+        public Func<DateTime, CaptionArchiveCursor, CaptionArchiveReadResult> ArchivePageRequested;
         public Func<DateTime, int> DeleteDateRequested;
         public Func<List<CaptionEntry>> SessionEntriesRequested;
         public bool ArchiveEnabled = true;
+        private bool viewingSession;
+        private int archiveGeneration;
+        private bool archiveLoading;
+        private readonly List<CaptionEntry> pendingLive = new List<CaptionEntry>();
+        private readonly List<CaptionArchiveCursor> pageStarts = new List<CaptionArchiveCursor>();
+        private CaptionArchiveCursor nextPage;
+        private readonly Button previousPageButton = new Button { Text = "上一页", AutoSize = true };
+        private readonly Button nextPageButton = new Button { Text = "下一页", AutoSize = true };
+        private string archiveWarning = String.Empty;
+        private List<CaptionEntry> visibleEntries = new List<CaptionEntry>();
         public event Action<HighlightItem> EditTaskRequested;
         private readonly Button taskButton = new Button();
         private int taskVersion;
@@ -744,10 +828,15 @@ namespace SemanticOverlay.NativeHost
             archiveDatePicker.Width = 156;
             archiveDatePicker.MaxDate = DateTime.Today;
             archiveDatePicker.Value = DateTime.Today;
-            archiveDatePicker.ValueChanged += delegate { ResetQueryView(); RefreshArchiveDate(); };
+            archiveDatePicker.ValueChanged += delegate { viewingSession = false; ResetQueryView(); RefreshArchiveDate(); };
             dateBar.Controls.Add(archiveDatePicker);
             Button currentSession = new Button { Text = "本次字幕", AutoSize = true };
             currentSession.Click += delegate {
+                archiveGeneration++;
+                archiveLoading = false;
+                pendingLive.Clear();
+                previousPageButton.Enabled = nextPageButton.Enabled = false;
+                viewingSession = true;
                 ResetQueryView();
                 if (SessionEntriesRequested != null) SetEntries(SessionEntriesRequested());
                 notice.Text = "正在查看本次运行的字幕；关闭保存后，这些内容不会写入历史。";
@@ -778,6 +867,23 @@ namespace SemanticOverlay.NativeHost
             };
             dateBar.Controls.Add(previousDay);
             dateBar.Controls.Add(nextDay);
+            previousPageButton.Enabled = nextPageButton.Enabled = false;
+            previousPageButton.Click += delegate {
+                if (archiveLoading || pageStarts.Count < 2) return;
+                pageStarts.RemoveAt(pageStarts.Count - 1);
+                ResetQueryView();
+                LoadArchivePage(false, pageStarts[pageStarts.Count - 1]);
+            };
+            nextPageButton.Click += delegate {
+                if (archiveLoading || nextPage == null) return;
+                pageStarts.Add(nextPage);
+                ResetQueryView();
+                LoadArchivePage(false, nextPage);
+            };
+            dateBar.Controls.Add(previousPageButton);
+            dateBar.Controls.Add(nextPageButton);
+            dateBar.Height = ClientSize.Width < 850 ? 96 : 43;
+            SizeChanged += delegate { dateBar.Height = ClientSize.Width < 850 ? 96 : 43; };
 
             transcript = new RichTextBox();
             transcript.Dock = DockStyle.Fill;
@@ -952,6 +1058,9 @@ namespace SemanticOverlay.NativeHost
                 if (args.CloseReason == CloseReason.UserClosing)
                 {
                     args.Cancel = true;
+                    archiveGeneration++;
+                    archiveLoading = false;
+                    pendingLive.Clear();
                     Hide();
                 }
             };
@@ -979,21 +1088,79 @@ namespace SemanticOverlay.NativeHost
 
         public void RefreshArchiveDate(bool evenWhenHidden = false)
         {
-            if (ArchiveDateRequested == null || (!evenWhenHidden && !Visible)) return;
-            Text = "字幕记录 · " + archiveDatePicker.Value.ToString("yyyy-MM-dd");
-            try
+            pageStarts.Clear();
+            pageStarts.Add(null);
+            LoadArchivePage(evenWhenHidden, null);
+        }
+
+        private void LoadArchivePage(bool evenWhenHidden, CaptionArchiveCursor cursor)
+        {
+            if ((ArchiveDateRequested == null && ArchiveStatusRequested == null && ArchivePageRequested == null) ||
+                (!evenWhenHidden && !Visible)) return;
+            int version = ++archiveGeneration;
+            viewingSession = false;
+            DateTime date = archiveDatePicker.Value.Date;
+            Text = "字幕记录 · " + date.ToString("yyyy-MM-dd");
+            archiveLoading = true;
+            pendingLive.Clear();
+            nextPage = null;
+            previousPageButton.Enabled = nextPageButton.Enabled = false;
+            SetEntries(new List<CaptionEntry>());
+            notice.Text = "正在读取这一天的字幕…";
+            if (!ArchiveEnabled && date == DateTime.Today && SessionEntriesRequested != null)
             {
-                if (!ArchiveEnabled && archiveDatePicker.Value.Date == DateTime.Today && SessionEntriesRequested != null)
-                {
-                    SetEntries(SessionEntriesRequested());
-                    notice.Text = "字幕保存已关闭；当前显示本次运行内容。以前的历史仍可选择日期回看。";
-                }
-                else SetEntries(ArchiveDateRequested(archiveDatePicker.Value.Date));
+                SetEntries(SessionEntriesRequested());
+                archiveLoading = false;
+                notice.Text = "字幕保存已关闭；当前显示本次运行内容。以前的历史仍可选择日期回看。";
+                return;
             }
-            catch
+            var readPage = ArchivePageRequested;
+            var readStatus = ArchiveStatusRequested;
+            var readDate = ArchiveDateRequested;
+            // Ensure a UI-thread handle before starting work; do not depend on
+            // ambient SynchronizationContext (diagnostics and hidden tray forms
+            // may not have a running Application.Run yet).
+            IntPtr uiHandle = Handle;
+            Task.Factory.StartNew(delegate {
+                CaptionArchiveReadResult result = null;
+                bool failed = false;
+                try {
+                    result = readPage != null ? readPage(date, cursor) :
+                        (readStatus != null ? readStatus(date) : new CaptionArchiveReadResult { Entries = readDate(date) });
+                } catch { failed = true; }
+                if (IsDisposed || !IsHandleCreated) return;
+                try {
+                    BeginInvoke((Action)delegate { ApplyArchiveRead(result, failed, version, date, readPage != null); });
+                } catch (InvalidOperationException) { /* Form was disposed while the read completed. */ }
+            }, CancellationToken.None, TaskCreationOptions.None, TaskScheduler.Default);
+        }
+
+        private void ApplyArchiveRead(CaptionArchiveReadResult result, bool failed, int version, DateTime date, bool paged)
+        {
+            if (IsDisposed || version != archiveGeneration || viewingSession || date != archiveDatePicker.Value.Date) return;
+            archiveLoading = false;
+            var buffered = new List<CaptionEntry>(pendingLive);
+            pendingLive.Clear();
+            if (failed || result == null)
             {
+                previousPageButton.Enabled = pageStarts.Count > 1;
                 notice.Text = "这一天的字幕记录暂时无法读取；本次内存中的字幕仍可使用。";
+                return;
             }
+            SetEntries(result.Entries);
+            nextPage = result.Next;
+            if (result.Incomplete) archiveWarning = "历史未完整读取：" + result.SkippedFiles +
+                " 个文件、" + result.SkippedLines + " 行跳过" +
+                (result.Truncated ? "；仅显示最近 20000 条" : "") + "。当前显示可读取部分。";
+            if (paged) archiveWarning += (archiveWarning.Length > 0 ? " " : "") +
+                "第 " + pageStarts.Count + " 页（从早到晚）" +
+                (nextPage != null ? "；还有记录，请点下一页。" : "；已到最后一页。");
+            if (archiveWarning.Length > 0) notice.Text = archiveWarning;
+            previousPageButton.Enabled = pageStarts.Count > 1;
+            nextPageButton.Enabled = nextPage != null;
+            foreach (var entry in buffered)
+                if (!visibleEntries.Any(value => value.timestamp == entry.timestamp && value.text == entry.text &&
+                    value.session_key == entry.session_key)) AppendLiveEntry(entry, date, true);
         }
 
         private void PresentVisible()
@@ -1146,9 +1313,53 @@ namespace SemanticOverlay.NativeHost
             Height = Math.Max(Height, Math.Min(650, Screen.FromControl(this).WorkingArea.Height));
         }
 
+        public void AppendLiveEntry(CaptionEntry entry, DateTime archiveDate, bool saved)
+        {
+            if (!Visible || entry == null) return;
+            DateTime shownDay = ArchiveEnabled ? archiveDate.Date : DateTime.Today;
+            if (!viewingSession && (archiveDatePicker.Value.Date != shownDay || (ArchiveEnabled && !saved))) return;
+            if (archiveLoading) {
+                if (pendingLive.Count == 2000) pendingLive.RemoveAt(0);
+                pendingLive.Add(entry);
+                return;
+            }
+            if (!viewingSession && nextPage != null) return;
+            int limit = !viewingSession && ArchivePageRequested != null ? 2000 : 20000;
+            if (visibleEntries.Count >= limit || (visibleEntries.Count > 0 &&
+                entry.timestamp < visibleEntries[visibleEntries.Count - 1].timestamp)) {
+                string warning = archiveWarning;
+                var next = new List<CaptionEntry>(visibleEntries); next.Add(entry);
+                SetEntries(next.OrderBy(value => value.timestamp).Skip(Math.Max(0, next.Count - limit)).ToList());
+                archiveWarning = warning + (next.Count > limit && !warning.Contains("当前仅显示最近") ?
+                    " 当前仅显示最近 " + limit + " 条；前面的记录仍保存在本机。" : "");
+                if (archiveWarning.Length > 0) notice.Text = archiveWarning;
+                return;
+            }
+            string session = visibleEntries.Count == 0 ? null : visibleEntries[visibleEntries.Count - 1].session_key;
+            StringBuilder added = new StringBuilder();
+            if (!String.IsNullOrEmpty(entry.session_key) && session != entry.session_key) {
+                if (transcript.TextLength > 0) added.AppendLine().AppendLine();
+                added.Append("【").Append(entry.session_label ?? "会议字幕").Append("】");
+            }
+            if (transcript.TextLength > 0 || added.Length > 0) added.AppendLine();
+            if (entry.is_gap) added.Append("⚠ ");
+            added.Append('[').Append(entry.timestamp.ToString("yyyy-MM-dd HH:mm:ss")).Append("] ").Append(entry.text);
+            if (!entry.is_gap && !String.IsNullOrWhiteSpace(entry.raw_text) && entry.raw_text != entry.text)
+                added.AppendLine().Append("    ↳ 原始识别：").Append(entry.raw_text);
+            visibleEntries.Add(entry);
+            int gaps = visibleEntries.Count(value => value.is_gap);
+            notice.Text = "共 " + (visibleEntries.Count - gaps) + " 条字幕、" + gaps + " 处缺口；选词查解释或按需翻译。";
+            if (archiveWarning.Length > 0) notice.Text += " " + archiveWarning;
+            translateButton.Enabled = visibleEntries.Count > gaps;
+            ApplyTranscriptText(transcript.Text + added.ToString());
+        }
+
         public void SetEntries(List<CaptionEntry> entries)
         {
             if (entries == null) entries = new List<CaptionEntry>();
+            archiveWarning = String.Empty;
+            visibleEntries = entries.Where(entry => entry != null).OrderBy(entry => entry.timestamp).ToList();
+            entries = visibleEntries;
             int gapCount = entries.Count(entry => entry != null && entry.is_gap);
             notice.Text = entries.Count == 0
                 ? "这一天暂无已保存的字幕。录制成功的字幕会自动归档在本机。"
@@ -1190,6 +1401,11 @@ namespace SemanticOverlay.NativeHost
             string updated = builder.ToString();
             copyButton.Enabled = clearButton.Enabled = exportButton.Enabled = updated.Length > 0;
             translateButton.Enabled = entries.Count > gapCount;
+            ApplyTranscriptText(updated);
+        }
+
+        private void ApplyTranscriptText(string updated)
+        {
             if (updated == transcript.Text) return;
             string previous = transcript.Text;
             bool preserveReading = Visible && transcript.IsHandleCreated && previous.Length > 0;

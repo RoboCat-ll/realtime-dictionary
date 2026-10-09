@@ -22,6 +22,14 @@ namespace SemanticOverlay.NativeHost
     {
         private void TrackTarget(object sender, EventArgs args)
         {
+            if (messageHintWindow != null && messageHintWindow.Visible)
+            {
+                NativeRect hintBounds;
+                if (NativeMethods.GetForegroundWindow() != messageHintTarget ||
+                    !NativeMethods.GetWindowRect(messageHintTarget, out hintBounds))
+                    HideMessageHint(messageHintGeneration);
+                else messageHintWindow.PositionFor(hintBounds);
+            }
             if (messageClickArmedUntilUtc != DateTime.MinValue && !MessageClickArmed)
             {
                 DisarmMessageClick("expired");

@@ -16,6 +16,43 @@ from request_validation import MAX_BODY_BYTES, RequestInputError, read_json_obje
 
 
 class RequestValidationTests(unittest.TestCase):
+    def test_server_log_rotates_and_retains_new_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            logfile = Path(directory) / '_server.log'
+            logfile.write_bytes(b'x' * (2 * 1024 * 1024))
+            with mock.patch.object(server, 'HERE', directory), mock.patch('builtins.print'):
+                server.log('synthetic latest event')
+            self.assertIn('synthetic latest event', logfile.read_text(encoding='utf-8'))
+            self.assertEqual(2 * 1024 * 1024, Path(str(logfile) + '.1').stat().st_size)
+
+    def test_analyze_and_lookup_reject_invalid_fields_without_dispatch(self):
+        http_server = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+        thread = threading.Thread(target=http_server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with mock.patch.object(server, 'PORT', http_server.server_address[1]), \
+                    mock.patch.object(server, 'log'), \
+                    mock.patch.object(server, 'analyze') as analyze, \
+                    mock.patch.object(server, 'lookup') as lookup:
+                for path, field, limit in (('/analyze', 'text', 20000), ('/lookup', 'term', 200)):
+                    for value in (None, 123, True, [], {}, 'x' * (limit + 1)):
+                        with self.subTest(path=path, value_type=type(value).__name__):
+                            connection = http.client.HTTPConnection(*http_server.server_address, timeout=3)
+                            try:
+                                connection.request('POST', path, json.dumps({field: value}),
+                                                   {'X-RealtimeDictionary-Token': server.TOKEN})
+                                response = connection.getresponse()
+                                self.assertEqual(400, response.status)
+                                self.assertIn('error', json.loads(response.read()))
+                            finally:
+                                connection.close()
+                analyze.assert_not_called()
+                lookup.assert_not_called()
+        finally:
+            http_server.shutdown()
+            http_server.server_close()
+            thread.join(2)
+
     def test_retired_validation_endpoint_and_health_cannot_enable_typesafe(self):
         http_server = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
         thread = threading.Thread(target=http_server.serve_forever, daemon=True)

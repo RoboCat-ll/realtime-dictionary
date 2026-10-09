@@ -9,6 +9,62 @@ from calendar_export import export_calendar, check_calendar, clarify_calendar
 
 
 class CalendarExportTests(unittest.TestCase):
+    def test_beijing_default_needs_only_duration_and_exports_correct_instant(self):
+        result = clarify_calendar({'time_text': '今晚八点腾讯会议', 'supplement': '持续1小时'},
+                                  now=datetime(2026, 10, 6, 8))
+        self.assertEqual('+08:00', result['utc_offset'])
+        self.assertEqual([], result['missing'])
+        self.assertNotIn('时区', result['message'])
+        exported = export_calendar(dict(result, confirmed=True, title='腾讯会议'))
+        self.assertIn('DTSTART:20261006T120000Z', exported['ics'])
+        self.assertIn('DTEND:20261006T130000Z', exported['ics'])
+
+    def test_relative_dates_and_chinese_hours_need_no_retyping(self):
+        cases = {
+            '今晚八点腾讯会议': '2026-10-06T20:00',
+            '明天下午三点开周会': '2026-10-07T15:00',
+            '下周一上午十点跟客户对齐需求': '2026-10-12T10:00',
+            '这周五下午五点交周报': '2026-10-09T17:00',
+            '明晚九点讨论': '2026-10-07T21:00',
+            '十月八号下午五点参加班会': '2026-10-08T17:00',
+            '明天下午三点半开会': '2026-10-07T15:30',
+            '明天下午两点十五分开会': '2026-10-07T14:15',
+            '下周一上午十点一刻开会': '2026-10-12T10:15',
+        }
+        for phrase, expected in cases.items():
+            with self.subTest(phrase=phrase):
+                result = clarify_calendar({'time_text': phrase}, now=datetime(2026, 10, 6, 8))
+                self.assertEqual(expected, result['start'])
+                self.assertEqual('', result['end'])
+                self.assertEqual('+08:00', result['utc_offset'])
+
+    def test_relative_deadline_does_not_invent_a_clock(self):
+        for phrase in ('周三之前把方案发我', '这周五下班前交周报', '下周开会再说'):
+            with self.subTest(phrase=phrase):
+                result = clarify_calendar({'time_text': phrase}, now=datetime(2026, 10, 6))
+                self.assertEqual('', result['start'])
+                self.assertTrue(any('几点' in missing for missing in result['missing']))
+
+    def test_relative_supplement_overrides_date_without_rolling_past_events(self):
+        result = clarify_calendar({'time_text': '今晚八点',
+                                   'supplement': '改成明天下午三点，持续1小时，北京时间'},
+                                  now=datetime(2026, 10, 6, 21))
+        self.assertEqual('2026-10-07T15:00', result['start'])
+        self.assertEqual('2026-10-07T16:00', result['end'])
+        self.assertEqual('+08:00', result['utc_offset'])
+        past = clarify_calendar({'time_text': '今天上午八点'}, now=datetime(2026, 10, 6, 21))
+        self.assertEqual('2026-10-06T08:00', past['start'])
+        self.assertIn('已过去', past['message'])
+
+    def test_duration_after_clock_is_not_misread_as_minutes(self):
+        result = clarify_calendar({'time_text': '明天上午九点一小时，北京时间'},
+                                  now=datetime(2026, 10, 6))
+        self.assertEqual('2026-10-07T09:00', result['start'])
+        self.assertEqual('2026-10-07T10:00', result['end'])
+        half = clarify_calendar({'time_text': '明天下午三点半', 'supplement': '持续半小时，北京时间'},
+                                now=datetime(2026, 10, 6))
+        self.assertEqual('2026-10-07T16:00', half['end'])
+
     def test_utc_offset_does_not_replace_meeting_clock(self):
         result = clarify_calendar({'time_text': '9月3号下午14:00',
                                    'supplement': '2027年，持续1小时，UTC+08:00'})
@@ -45,7 +101,7 @@ class CalendarExportTests(unittest.TestCase):
         unresolved = clarify_calendar({'time_text': phrase, 'supplement': ''}, now=datetime(2026, 9, 30))
         self.assertEqual('2026-10-08T17:00', unresolved['start'])
         self.assertEqual('', unresolved['end'])
-        self.assertEqual('', unresolved['utc_offset'])
+        self.assertEqual('+08:00', unresolved['utc_offset'])
         self.assertFalse(any('几点开始' in item for item in unresolved['missing']))
         completed = clarify_calendar({
             'time_text': phrase,

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -158,7 +158,7 @@ namespace SemanticOverlay.NativeHost
                 Right = region.Right, Bottom = region.Bottom }, 1.7f);
             try
             {
-                List<OcrWord> words = ReadWindowsOcrWords(path);
+                List<OcrWord> words = ReadWindowsOcrWords(path, true);
                 words = RepairSplitOcrGlyphs(words);
                 StringBuilder text = new StringBuilder();
                 OcrWord previous = null;
@@ -201,7 +201,57 @@ namespace SemanticOverlay.NativeHost
             return repaired;
         }
 
-        private List<OcrWord> ReadWindowsOcrWords(string capturePath)
+        internal static List<OcrWord> RepairLatinOcrArtifacts(List<OcrWord> primary, List<OcrWord> english)
+        {
+            if (primary == null) return new List<OcrWord>();
+            if (english == null || english.Count == 0) return primary;
+            var output = new List<OcrWord>();
+            for (int index = 0; index < primary.Count; index++)
+            {
+                OcrWord word = primary[index];
+                bool repaired = false;
+                string token = "";
+                double left=word.x, top=word.y, right=word.x+word.w, bottom=word.y+word.h;
+                for (int end=index; end<primary.Count && end<index+5; end++)
+                {
+                    var part=primary[end];
+                    string fragment=part.text ?? "";
+                    if (!Regex.IsMatch(fragment, @"^[A-Z℃°]+$")) break;
+                    if (end>index) {
+                        double height=Math.Max(word.h,part.h);
+                        var previous=primary[end-1];
+                        double gap=part.x-previous.x-previous.w;
+                        if (height<=0 || gap>height*.35 || gap< -height*.15 ||
+                            Math.Abs((part.y+part.h/2)-(word.y+word.h/2))>height*.35) break;
+                    }
+                    token+=fragment;
+                    left=Math.Min(left,part.x); top=Math.Min(top,part.y);
+                    right=Math.Max(right,part.x+part.w); bottom=Math.Max(bottom,part.y+part.h);
+                    if (token.Length>8) break;
+                    if (!Regex.IsMatch(token, @"^[A-Z][A-Z℃°]{1,7}$") ||
+                        (token.IndexOf('℃')<0 && token.IndexOf('°')<0) || right<=left || bottom<=top) continue;
+                    string original=token;
+                    double x=left,y=top,w=right-left,h=bottom-top;
+                    var aligned=english.Where(candidate=> {
+                        string value=candidate.text ?? "";
+                        if (!Regex.IsMatch(value,@"^[A-Z]{2,8}$") || value[0]!=original[0] ||
+                            value[value.Length-1]!=original[original.Length-1] || candidate.w<=0 || candidate.h<=0) return false;
+                        double width=Math.Max(0,Math.Min(x+w,candidate.x+candidate.w)-Math.Max(x,candidate.x));
+                        double height=Math.Max(0,Math.Min(y+h,candidate.y+candidate.h)-Math.Max(y,candidate.y));
+                        double intersection=width*height;
+                        double union=w*h+candidate.w*candidate.h-intersection;
+                        return union>0 && intersection/union>=.75;
+                    }).ToList();
+                    if (aligned.Count!=1) continue;
+                    output.Add(new OcrWord { text=aligned[0].text,x=x,y=y,w=w,h=h });
+                    index=end; repaired=true; break;
+                }
+                if (!repaired) output.Add(word);
+            }
+            return output;
+        }
+
+        private List<OcrWord> ReadWindowsOcrWords(string capturePath, bool includeLatin = false)
         {
             Exception workerError = null;
             for (int attempt = 0; attempt < 2; attempt++)
@@ -214,6 +264,7 @@ namespace SemanticOverlay.NativeHost
                         string requestId = Guid.NewGuid().ToString("N");
                         string request = serializer.Serialize(new Dictionary<string, string> {
                             { "request_id", requestId },
+                            { "include_latin", includeLatin ? "true" : "false" },
                             { "image_path_base64", Convert.ToBase64String(
                                 Encoding.UTF8.GetBytes(Path.GetFullPath(capturePath))) }
                         });
@@ -233,7 +284,8 @@ namespace SemanticOverlay.NativeHost
                                 (ocr == null ? "empty response" : ocr.error));
                         Log("Windows OCR worker: decode " + ocr.decode_ms + "ms, recognize " +
                             ocr.recognize_ms + "ms, worker " + ocr.worker_ms + "ms");
-                        return ocr.words ?? new List<OcrWord>();
+                        return includeLatin ? RepairLatinOcrArtifacts(ocr.words, ocr.latin_words) :
+                            (ocr.words ?? new List<OcrWord>());
                     }
                 }
                 catch (Exception error)

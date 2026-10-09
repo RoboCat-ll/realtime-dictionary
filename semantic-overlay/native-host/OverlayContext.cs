@@ -43,6 +43,9 @@ namespace SemanticOverlay.NativeHost
         private readonly List<HighlightForm> windows = new List<HighlightForm>();
         private readonly List<HighlightItem> relativeHighlights = new List<HighlightItem>();
         private readonly StatusForm statusWindow;
+        private readonly StatusForm messageHintWindow;
+        private IntPtr messageHintTarget;
+        private int messageHintGeneration;
         private readonly CaptionStatusForm captionStatusWindow;
         private readonly DefinitionForm definitionWindow;
         private readonly AssistantPanelForm assistantPanel;
@@ -132,6 +135,8 @@ namespace SemanticOverlay.NativeHost
         private SystemAudioCaptionCapture audioCapture;
         private int audioSessionGeneration;
         private bool audioTranscriptionRunning;
+        private int audioTranscriptionsInFlight;
+        private readonly CaptionOrderedCompletions audioCompletions = new CaptionOrderedCompletions();
         private readonly CaptionAudioBacklog queuedAudio = new CaptionAudioBacklog(AudioQueueLimit);
         private readonly System.Windows.Forms.Timer audioHealthTimer;
         private DateTime audioCaptureStartedUtc = DateTime.MinValue;
@@ -139,6 +144,7 @@ namespace SemanticOverlay.NativeHost
         private string audioTargetLabel = "会议窗口";
         private string lastAudioTranscript;
         private string lastAudioTranscriptIdentity;
+        private DateTime lastAudioTranscriptCapturedAt;
         private bool audioFailureShown;
         private int audioTransientFailures;
         private int audioDroppedChunks;
@@ -149,6 +155,14 @@ namespace SemanticOverlay.NativeHost
         public OverlayContext()
         {
             services = new ServiceManager();
+            DateTime lastPreferenceWarning = DateTime.MinValue;
+            services.PreferenceSaveFailed = delegate {
+                try { dispatcher.BeginInvoke(new Action(delegate {
+                    if ((DateTime.UtcNow - lastPreferenceWarning).TotalSeconds < 5) return;
+                    lastPreferenceWarning = DateTime.UtcNow;
+                    ShowNotice("设置未能保存，仅本次运行生效。请检查配置目录后重试。", ToolTipIcon.Warning);
+                })); } catch { }
+            };
             services.CloudConsentRequested = delegate(string provider) {
                 Func<bool> ask = delegate {
                     return MessageBox.Show("将把本次选中的消息或词语及上下文发送到 " + provider +
@@ -161,6 +175,7 @@ namespace SemanticOverlay.NativeHost
             refineWords = services.RefineWords;
             reminders = new LocalReminderManager();
             statusWindow = new StatusForm();
+            messageHintWindow = new StatusForm(true);
             captionStatusWindow = new CaptionStatusForm();
             definitionWindow = new DefinitionForm();
             assistantPanel = new AssistantPanelForm();
@@ -175,6 +190,8 @@ namespace SemanticOverlay.NativeHost
             audioHealthTimer.Tick += RefreshAudioHealth;
             captionHistoryWindow = new CaptionHistoryForm();
             captionHistoryWindow.ArchiveDateRequested = captionArchive.LoadDate;
+            captionHistoryWindow.ArchiveStatusRequested = captionArchive.LoadDateWithStatus;
+            captionHistoryWindow.ArchivePageRequested = captionArchive.LoadPage;
             captionHistoryWindow.DeleteDateRequested = captionArchive.DeleteDate;
             captionHistoryWindow.SessionEntriesRequested = delegate { return new List<CaptionEntry>(captionHistory); };
             captionHistoryWindow.VisibleChanged += delegate {
@@ -308,14 +325,33 @@ namespace SemanticOverlay.NativeHost
             messageClickArmedUntilUtc = DateTime.UtcNow.AddSeconds(MessageClickArmSeconds);
             trayStatusItem.Text = "状态：等待点击消息（10 秒）";
             services.Log("One-click message armed for 10 seconds");
-            ShowNotice("已准备：请在 10 秒内单击一条微信或 QQ 消息。",
-                ToolTipIcon.Info);
+            ShowMessageHint("点击消息 · 10 秒", NativeMethods.GetForegroundWindow(),
+                MessageClickArmSeconds * 1000, selectionGeneration);
+        }
+
+        private void ShowMessageHint(string text, IntPtr target, int milliseconds, int generation)
+        {
+            if (messageHintWindow == null || target == IntPtr.Zero) return;
+            NativeRect bounds;
+            if (!NativeMethods.GetWindowRect(target, out bounds)) return;
+            messageHintTarget = target;
+            messageHintGeneration = generation;
+            messageHintWindow.ShowMessage(text, bounds, milliseconds);
+        }
+
+        private void HideMessageHint(int generation)
+        {
+            if (messageHintWindow == null || generation != messageHintGeneration) return;
+            messageHintWindow.Hide();
+            messageHintTarget = IntPtr.Zero;
         }
 
         private void DisarmMessageClick(string reason)
         {
             if (messageClickArmedUntilUtc == DateTime.MinValue) return;
             messageClickArmedUntilUtc = DateTime.MinValue;
+            if (messageHintWindow != null) messageHintWindow.Hide();
+            messageHintTarget = IntPtr.Zero;
             services.Log("One-click message disarmed: " + reason);
         }
 
@@ -562,6 +598,28 @@ namespace SemanticOverlay.NativeHost
             tray.ShowBalloonTip(2500);
         }
 
+        internal void RevealRunningApplication()
+        {
+            services.Log("Existing instance activation received");
+            if (selectionAnalysis != null && !selectionAnalysis.IsDisposed)
+            {
+                selectionAnalysis.RestoreReadingCard();
+                return;
+            }
+            if (manualLookup != null && !manualLookup.IsDisposed)
+            {
+                manualLookup.Show();
+                manualLookup.Activate();
+                return;
+            }
+            ShowNotice(services.ContinuousLookupEnabled
+                ? "已在运行。回到 QQ 或微信，" +
+                    (services.ContinuousLookupTrigger == "alt_click" ? "按住 Alt 单击消息" : "双击消息") +
+                    "即可解释；选词查询可按 Ctrl+Alt+D。"
+                : "已在运行。按 Ctrl+Alt+K，再点击一条消息；选中文字后按 Ctrl+Alt+D 查词。",
+                ToolTipIcon.Info);
+        }
+
         private void QueueShowCaptionHistory()
         {
             historyOpenTimer.Stop();
@@ -618,6 +676,7 @@ namespace SemanticOverlay.NativeHost
             foreach (HighlightForm window in windows)
                 window.Dispose();
             statusWindow.Dispose();
+            messageHintWindow.Dispose();
             captionStatusWindow.Dispose();
             definitionWindow.Dispose();
             captionLyricWindow.Dispose();

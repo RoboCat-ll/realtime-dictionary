@@ -19,6 +19,7 @@ namespace SemanticOverlay.NativeHost {
             Check(predicate(), "UI operation timed out");
         }
         static void Snapshot(Form form, string name) {
+            if (Environment.GetEnvironmentVariable("SKIP_UI_SCREENSHOTS") == "1") return;
             form.Activate(); Application.DoEvents(); Thread.Sleep(200); Application.DoEvents();
             using (Bitmap bitmap = new Bitmap(form.Width, form.Height)) {
                 using (Graphics graphics = Graphics.FromImage(bitmap))
@@ -57,8 +58,9 @@ namespace SemanticOverlay.NativeHost {
                     start_iso = "2026-10-08T17:00", end_iso = "", utc_offset = "+08:00" },
                     payload => { throw new Exception("Complete start must not trigger initial clarification"); }, null, null, null)) {
                     form.Show(); Application.DoEvents();
-                    Check(!Field<TextBox>(form, "start").Visible && Field<TextBox>(form, "end").Visible,
-                        "Only missing calendar fields should be expanded");
+                    Check(!Field<TextBox>(form, "start").Visible && !Field<TextBox>(form, "end").Visible &&
+                        Field<ComboBox>(form, "durationChoices").Visible,
+                        "Only missing duration should be offered without duplicate freeform fields");
                     var duration = Field<ComboBox>(form, "durationChoices");
                     Check(duration.SelectedIndex == -1 && Field<TextBox>(form, "end").Text == "",
                         "Missing duration was silently invented");

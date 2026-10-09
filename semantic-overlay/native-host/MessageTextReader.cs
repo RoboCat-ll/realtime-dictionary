@@ -167,13 +167,21 @@ namespace SemanticOverlay.NativeHost
 
         internal static string Normalize(string text)
         {
-            return Regex.Replace(text ?? String.Empty, @"\s+", " ").Trim();
+            string source = (text ?? String.Empty).Replace("\r\n", "\n").Replace('\r', '\n');
+            return Regex.Replace(source, @"[^\S\n]+", " ").Trim();
+        }
+
+        internal static bool FitsBubble(Rectangle bounds, Rectangle bubble)
+        {
+            if (bubble.IsEmpty) return true;
+            bubble.Inflate(8, 8);
+            return !bounds.IsEmpty && bubble.Contains(bounds);
         }
 
         internal static bool IsCandidate(string text, string controlType, Rectangle bounds,
             Rectangle window, Point point, int maxLength)
         {
-            if (String.IsNullOrWhiteSpace(text) || text.Length < 2 || bounds.IsEmpty ||
+            if (String.IsNullOrWhiteSpace(text) || bounds.IsEmpty ||
                 !bounds.Contains(point) || !window.IntersectsWith(bounds)) return false;
             string kind = (controlType ?? String.Empty).ToLowerInvariant();
             if (kind.Contains("edit") || kind.Contains("button") || kind.Contains("menu") ||
@@ -185,7 +193,7 @@ namespace SemanticOverlay.NativeHost
             if (text.Length <= 30 && Regex.IsMatch(text,
                 @"^\s*(?:\d{4}[/\-.年])?\d{1,2}[/\-.月]\d{1,2}(?:日)?(?:\s+\d{1,2}:\d{2})?\s*$"))
                 return false;
-            return text.Length <= maxLength + 1;
+            return text.Length <= maxLength;
         }
     }
 

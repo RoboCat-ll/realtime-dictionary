@@ -32,6 +32,15 @@ namespace SemanticOverlay.NativeHost
                     bounds.Bottom > 130) return 7;
             }
             Console.WriteLine("bubble-glyph-island-and-adjacent-message-isolation-ok");
+            if (MessageTextReader.Normalize("第一行\r\n第二行  RAG") != "第一行\n第二行 RAG") return 11;
+            var oneBubble = new Rectangle(100, 100, 250, 70);
+            if (!MessageTextReader.FitsBubble(new Rectangle(110, 110, 200, 40), oneBubble) ||
+                MessageTextReader.FitsBubble(new Rectangle(100, 50, 250, 120), oneBubble)) return 12;
+            if (MessageTextReader.IsCandidate(new string('a', 1001), "text", oneBubble,
+                new Rectangle(0, 0, 800, 800), new Point(120, 120), 1000) ||
+                !MessageTextReader.IsCandidate(new string('a', 1000), "text", oneBubble,
+                new Rectangle(0, 0, 800, 800), new Point(120, 120), 1000)) return 13;
+            Console.WriteLine("source-paragraph-length-and-accessibility-neighbor-boundary-ok");
             var splitGlyph = new List<OcrWord> {
                 new OcrWord { text = "另", x = 1082, y = 32, w = 21, h = 38 },
                 new OcrWord { text = "刂", x = 1107, y = 30, w = 13, h = 40 },

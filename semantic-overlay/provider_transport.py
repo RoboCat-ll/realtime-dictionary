@@ -214,7 +214,8 @@ def open_connection(request, connection_class, pool=POOL):
     key = (request.type, request.host.lower(), tunnel, origin, identity)
 
     def factory():
-        connection = connection_class(request.host, timeout=min(3.0, remaining(request)))
+        connection = connection_class(request.host, timeout=min(
+            float(getattr(request, "rd_connect_budget", 3.0)), remaining(request)))
         if tunnel:
             connection.set_tunnel(tunnel, headers={"Proxy-Authorization": proxy_auth} if proxy_auth else {})
         return connection
@@ -257,7 +258,8 @@ def open_connection(request, connection_class, pool=POOL):
         if guard is not None:
             guard.stop()
         pool.give_back(key, connection, False)
-        if (header_deadline is not None and time.monotonic() >= header_deadline and
+        if (header_deadline is not None and
+                (isinstance(error, TimeoutError) or time.monotonic() >= header_deadline) and
                 time.monotonic() < request.rd_deadline and isinstance(error, Exception)):
             raise HeaderBudgetTimeout("Initial response header budget exhausted") from None
         raise

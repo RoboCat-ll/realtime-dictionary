@@ -5,6 +5,52 @@ import server
 
 
 class SelectionAccuracyTests(unittest.TestCase):
+    def test_ocr_correction_must_not_invent_actor_or_time(self):
+        for original, corrected in (
+            ('请在3点参加项目进度讨论会议', '请在下午3点参加项目进度讨论会议'),
+            ('负责整理本次项目会议的纪要', '我负责整理本次项目会议的纪要'),
+            ('请参加项目讨论会议并准备材料', '请明天参加项目讨论会议并准备材料'),
+            ('请在三点参加项目讨论会议', '请在十三点参加项目讨论会议'),
+            ('请在3点参加项目讨论会议', '请在3点半参加项目讨论会议'),
+        ):
+            with self.subTest(original=original):
+                self.assertEqual((original, False), server.accept_selection_correction(original, corrected))
+
+    def test_cancelled_and_tentative_arrangements_are_not_candidates(self):
+        for text in (
+            '明天下午三点的会议取消了，不用参加。',
+            '明天下午三点的会议延期了，新时间另行通知。',
+            '如果明天下午三点开会，到时候再定。',
+            '明天下午三点可能开会，尚未确定。',
+            '明天下午三点不用参加会议。',
+        ):
+            with self.subTest(text=text):
+                self.assertEqual([], server.selection_actions(text))
+
+    def test_definite_arrangement_survives_unrelated_cancelled_sentence(self):
+        for text in (
+            '明天下午三点开会，不用带电脑。',
+            '明天下午三点开会，别忘了参加。',
+            '明天下午三点的会议不会取消，照常参加。',
+            '明天下午三点的会议不能取消，照常参加。',
+            '明天下午三点讨论取消订单的方案。',
+            '今天的会议取消了。明天下午三点开会。',
+            '明天下午三点的会议取消，改到后天下午四点开会。',
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(1, len(server.selection_actions(text)))
+
+    def test_selected_message_context_keeps_late_word_and_disambiguation(self):
+        passage = '前面的项目进展已经同步。' * 48 + '这里的灰度是让少量用户先使用新版，不是图像颜色。'
+        self.assertLessEqual(len(passage), 1000)
+        self.assertEqual(passage, server.normalize_lookup_context(passage))
+
+    def test_local_name_guard_does_not_invent_a_meeting(self):
+        explanation = server.selection_term_explanation('我和oneAPI的同事聊了聊。', 'oneAPI', '某厂商的产品')
+        self.assertNotIn('讨论会', explanation)
+        self.assertNotIn('某厂商的产品', explanation)
+        self.assertIn('不能确定', explanation)
+
     def test_ocr_does_not_swallow_words_next_to_a_complete_known_term(self):
         for text in ('GitHub is useful', 'a GitLab project', 'bootcamp is tomorrow',
                      'we use OAuth for login', 'DeepSeek can explain this'):

@@ -17,9 +17,17 @@
 !/semantic-overlay/PRODUCT_SCOPE.md
 !/semantic-overlay/METRICS.md
 !/semantic-overlay/REAL_WORLD_TEST_PROTOCOL.md
+!/semantic-overlay/PROJECT_AUDIT_2026-10-04.md
 !/semantic-overlay/media/
 /semantic-overlay/media/*
 !/semantic-overlay/media/*.gif
+!/semantic-overlay/media/*.mp4
+!/semantic-overlay/media/README.md
+!/semantic-overlay/DISTRIBUTION.md
+!/semantic-overlay/IMPROVEMENT_PLAN.md
+!/semantic-overlay/RELEASE_NOTES.md
+!/semantic-overlay/使用说明.md
+!/semantic-overlay/OUTLOOK_SETUP.md
 !/semantic-overlay/native-host/
 /semantic-overlay/native-host/*
 !/semantic-overlay/native-host/*.cs
@@ -28,6 +36,7 @@
 /semantic-overlay/native-host/diagnostics/*
 !/semantic-overlay/native-host/diagnostics/*.cs
 !/semantic-overlay/native-host/diagnostics/*.ps1
+!/semantic-overlay/native-host/diagnostics/render_feature_tour.py
 !/semantic-overlay/installer/
 /semantic-overlay/installer/*
 !/semantic-overlay/installer/*.cs
@@ -37,6 +46,7 @@
 !/semantic-overlay/tests/test_*.py
 !/semantic-overlay/tests/run_offline.py
 !/semantic-overlay/tests/local_model_fixture.py
+!/semantic-overlay/tests/local_whisper_benchmark.py
 !/semantic-overlay/tests/*.cjs
 !/semantic-overlay/vendor/
 /semantic-overlay/vendor/*

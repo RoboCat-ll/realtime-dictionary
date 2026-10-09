@@ -171,6 +171,11 @@ namespace SemanticOverlay.NativeHost
                     form.ArchiveDateRequested = archive.LoadDate;
                     form.PresentArchive();
                     Field<DateTimePicker>(form, "archiveDatePicker").Value = day;
+                    DateTime archiveDeadline = DateTime.UtcNow.AddSeconds(5);
+                    while (Field<bool>(form, "archiveLoading") && DateTime.UtcNow < archiveDeadline) {
+                        Application.DoEvents(); System.Threading.Thread.Sleep(10);
+                    }
+                    if (Field<bool>(form, "archiveLoading")) throw new Exception("Date archive read did not finish");
                     if (!form.Visible || !form.TopMost ||
                         !Field<RichTextBox>(form, "transcript").Text.Contains(marker + " one") ||
                         !Field<RichTextBox>(form, "transcript").Text.Contains(

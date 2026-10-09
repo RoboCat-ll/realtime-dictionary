@@ -1,6 +1,11 @@
-# Semantic Overlay Project Rules
+﻿# Semantic Overlay Project Rules
 
 ## Model billing policy (2026-09-28)
+
+- Speech defaults to `FunAudioLLM/SenseVoiceSmall`; the speech interface must
+  still pass the live zero-price guard. Never substitute an unverified model.
+  Saving a SiliconFlow speech credential must preserve the separately bound
+  official DeepSeek text credential and endpoint.
 
 - Follow `C:\Users\17863\AGENTS.md`, section `硅基流动费用约束`, before any
   API-backed action or test. SiliconFlow permits only currently verified free
@@ -11,6 +16,14 @@
   Documentation updates alone do not implement a runtime network guard.
 
 ## Accuracy refinement contract (2026-09-30)
+
+- OCR correction must not insert actors or date/time qualifiers absent from the
+  captured source. Preserve uncertainty rather than inventing an appointment.
+- Initial float visibility repair must respect intentional hiding on foreground
+  loss/minimize and obsolete OpenText generations. It must not revive old cards.
+- Installer verification must accept the current browser-free package, reject
+  missing production dependencies and version mismatch. Package verification is
+  not proof of clean-machine installation or update rollback.
 
 - Local OCR repairs must not consume a recognized whole technical token together
   with its neighboring English words. Join only bounded whitespace/dot OCR gaps,
@@ -30,7 +43,121 @@
 - Jev/TypeSafe is retired. Do not read its saved/environment credentials, offer its configuration UI, invoke its endpoint, or build/run its dedicated diagnostics. Shared OCR, candidate extraction, local fallback and generative analysis remain supported. Existing user credential files and historical evidence are not rewritten or deleted.
 - Analysis uses the configured generative provider, otherwise explicitly labeled local results. Current documentation and UI previews must reflect this routing.
 
+## Caption endpoint refinement (2026-10-06)
+
+- After at least three seconds of buffered speech/context, a quarter-second
+  local quiet pause may end the segment before its hard eight-second cap.
+  Shorter buffers retain the existing seven-tenths-second endpoint, avoiding
+  fragmentation on brief hesitation. This changes segmentation, not vocabulary.
+- Compare against the existing one-second-overlap version using the same
+  video and reviewed subtitle reference. Record insertions as well as omissions;
+  do not claim a universal accuracy or network-speed improvement from one video.
+
+## Caption boundary accuracy contract (2026-10-05)
+
+- A forced duration cut during continuous speech retains bounded audio context
+  and stays active; do not reacquire a voice attack or discard the retained tail.
+- Overlap metadata travels with the original chunk through retries. Trim only
+  exact complete-word suffix/prefix matches for adjacent successful chunks that
+  actually share audio; never trim across a dropped/failed chunk or a new session.
+  Preserve deliberate repetition inside a chunk; do not force reference-video
+  vocabulary into a general-purpose transcript.
+- Accuracy comparisons must use the same video/reference and actual native
+  segmentation before and after. Fixed non-overlapping clips are a separate
+  benchmark, not proof of the old live segmenter's quality. Reference subtitles
+  are not human-listened audio ground truth. Keep decoded audio in memory only.
+
 ## Product Contract
+
+- Contextual understanding refinement (2026-10-08): sentence explanations
+  translate essential jargon into concrete meaning while preserving speaker,
+  recipient, negation and conditions; do not invent instructions for the reader.
+  Explicit word lookup retains up to the complete 1000-character selected
+  message, never reads neighboring messages, and treats quoted instructions as
+  data. Uncertain names remain uncertain. Calendar candidates require definite
+  arrangements; cancelled, postponed-without-new-time and tentative clauses
+  must not become actionable suggestions. Keep separate definite sentences.
+  Validate semantic output with bounded synthetic live text probes separately
+  from offline parsing tests; do not claim a measured client-wide accuracy gain.
+
+- Core lookup refinement (2026-10-06): active word lookup uses one brief
+  request after deterministic shortcut resolution, without a preliminary
+  server glossary request. Refresh failure preserves the same query's prior
+  model definition, with an explicit failed-refresh notice and retry action;
+  edited/new queries invalidate that protection. Failed refreshes are not
+  recorded as successful model results. Captions are outside this refinement.
+  Sentence reanalysis follows the same rule: keep its successful model meaning,
+  corrected source, term links and pending calendar candidates while refreshing
+  the identical source. A failed refresh cannot replace them with a fallback.
+  Editing or opening another message invalidates this protection. Status and
+  operation metrics must disclose the unsuccessful refresh.
+  The selected-word action row must fit its button's actual preferred height
+  and margins at the current DPI; it must not acquire a scrollbar for one
+  button. Keep its recovery hint short and non-wrapping.
+
+- Five-area repair (2026-10-06): preserve accessibility source paragraph breaks
+  and reject oversized sources rather than truncate. When bubble geometry is
+  available, do not accept an accessibility parent spanning neighboring messages.
+  Brief refresh keeps the same concise detail policy; provenance belongs in
+  metadata, not appended definition prose. Enabling continuous lookup enables
+  its message-click prerequisite; disabling that prerequisite disables continuous
+  mode. Speech reconnection retries the identical WAV at most once within a
+  shared 25-second deadline, without retrying auth/payment/policy errors or
+  replacing the free provider. Calendar supplementation must not erase known
+  fields; an explicitly chosen duration follows start edits until the user
+  manually edits the end. Supplementation parses the current visible start/zone
+  rather than reverting user edits to the source date. Calendar parse/check/export
+  completions update controls on the UI thread even without a synchronization
+  context. Verification must identify isolated versus live results.
+  Real calendar continuation found relative dates/Chinese clock numbers missing:
+  deterministic clarification must resolve explicit today/tomorrow/weekday dates
+  against local current time, and Chinese numeric hours without inventing a time
+  for vague deadlines. Timezone and duration still require explicit information.
+  VideoMeetingTarget is a local playback fixture for the authorized video's audio,
+  not a mock transcript. It exposes a window for the installed caption app to
+  capture, closes its decoder/output on completion, and creates no audio files.
+
+- Five-point refinement (2026-10-05): OCR-derived source must remain visibly
+  labeled for review even after model correction. User-edited source is
+  authoritative: do not run OCR correction again on it. Brief definitions lead
+  with the context-specific meaning; unresolved abbreviations disclose ambiguity.
+  Capture failures show the existing selected-word shortcut as a recovery path.
+  Caption telemetry contains categorical outcomes/queue-to-result timing only,
+  no audio or transcript. Measure retries as one chunk, never as multiple speech
+  successes. If a calendar draft only lacks its end, prefer explicit duration
+  selection over duplicate freeform fields; do not silently assume a duration.
+  For mixed-language OCR, an installed English recognizer may re-read the same
+  bounded bubble bitmap. Repair only a short uppercase token with an anomalous
+  degree glyph when a unique English token occupies the same box and preserves
+  its first/last letters. Never replace legitimate ACC, numeric temperatures,
+  Chinese words or neighboring tokens; absence of English OCR is not an error
+  and must not install a language pack or call a model.
+  A user-provided video may be used by an isolated local audio diagnostic with
+  the existing decoder and process-specific capture. Keep only aggregate timing
+  and chunk counts; do not persist captured audio or claim this proves ASR.
+  Such a diagnostic must stop its playback/capture on completion or failure.
+
+- Unified audit repairs (2026-10-04): follow PROJECT_AUDIT_2026-10-04.md IDs.
+  Repair existing chat, caption and reminder reliability; this authorization
+  does not add browser capability or change credentials or reminder schemas.
+  Failed reminder reads must preserve the original file and block writes;
+  mutations become visible only after persistence succeeds. Failed preference
+  saves may retain explicitly disclosed session-only values and must not escape
+  UI callbacks. Clean up only temporary files created by the failing operation.
+  The legacy hourly analysis quota is for compatibility scanning, not a promise
+  about all model requests; label it accordingly until a separate budget contract
+  is adopted. Preserve original captions and bounded memory during history repair.
+  Compatibility scan text is capped at 20000 characters and lookup terms at 200;
+  reject wrong field types and oversize values with 400, never silent truncation.
+  Runtime logs retain at most a 2 MB current journal and one previous journal;
+  anonymous interaction metrics use 5 MB journals with one retained predecessor.
+  New captions append to a visible matching date/session without disk reload;
+  retained history must disclose skipped files/lines and display truncation.
+  Date-history reads run off the UI thread and apply only to their current
+  request generation. Large archives use bounded forward pages (2000 entries,
+  8 MB input work plus at most one bounded record per page) with explicit
+  navigation, never an unbounded load.
+  Separate the continuous-lookup toggle leaf from its trigger settings submenu.
 
 - Browser integration is retired by user decision (2026-10-01). Remove the DOM
   extension, browser-specific desktop routing, /browser endpoints, extension CORS,
@@ -42,6 +169,17 @@
   details expand only on explicit lookup, and empty schedule sections take no
   space. Source highlighter is the primary term navigation; do not duplicate
   every highlighted term as a button. Manual selected-word lookup stays available.
+- Manual-sized reading cards use remaining client height only as a content
+  ceiling, never force short text to fill it. Meaning, source and fixed actions
+  stay grouped at the top; long text may use more space before scrolling.
+  Source may grow when meaning is short and source overflows. Automatic-size caps remain unchanged;
+  short text does not acquire a scrollbar merely because a user resized. Keep
+  fixed actions visible, preserve user size and never request analysis on resize.
+- One-shot arming uses a separate nonactivating, mouse-transparent compact hint,
+  never a routine tray balloon. It expires with the 10-second arm, clears when
+  consumed/cancelled and hides if its source window loses foreground. Reading
+  shows in that hint; results continue using existing model progress/retry UI.
+  Compatibility scanning/caption status windows must not be reused or disturbed.
 - The message explanation panel is a lightweight borderless float attached near
   the clicked message bubble (v2, 2026-10-01). It shows without stealing chat
   focus (ShowWithoutActivation + topmost via SetWindowPos), but it never uses
@@ -50,9 +188,15 @@
   Escape hook. Placement derives from the bubble rectangle and the per-monitor
   working area (right side first, flip left, clear the input zone, never cover
   the target bubble). While open, a 400 ms heartbeat: target move follows unless
-  the user dragged the float; target resize closes it; minimize/foreground-loss
-  hides and restores it; target close closes it; chat scroll is not re-probed
+  the user dragged the float; target resize preserves the reading card but
+  invalidates its bubble anchor (no new OCR/model request); minimize/foreground-loss
+  hides and restores it; target close closes it; observed foreground chat wheel
+  scrolling detaches the bubble anchor and labels the retained message, without
+  re-probing text. Scrollbar dragging and keyboard scrolling are not detected
   (the float has no pointer and its content is self-contained).
+- Reopening the desktop shortcut must signal the existing instance, restore its
+  explanation if available, otherwise show concise trigger instructions. Never
+  launch a second host or make a model request merely to acknowledge startup.
 - Term lookup and word detail render inside the same float instance as a word
   view with an explicit back link, never as stacked popups; returning restores
   the sentence view with source, meaning and reading position intact. Unmarked
@@ -68,6 +212,13 @@
 - Calendar confirmation summarizes known fields and presents missing fields;
   an explicit edit toggle reveals all fields. Preserve complete visible dates,
   inference notices, manual overrides and explicit creation confirmation.
+- Caption-history translation uses the same independent text provider and credential as word
+  lookup, matching the text-send consent; speech credentials are not a fallback
+  for an explicitly invalid text configuration.
+- A socket timeout during an armed response-header budget is classified as a
+  header-budget timeout while the total deadline is still open, even if the OS
+  timer returns just before the nominal budget. Preserve the global deadline
+  and attempt cap; body timeouts do not acquire this retry classification.
 - Caption-history query details stay collapsed until requested. Switching archive
   dates or explicitly switching to the current session invalidates old pending
   lookups/translations/tasks; incoming lines must still preserve reading position
@@ -495,11 +646,15 @@
   text to build an editable proposal (Chinese date/time, duration, Beijing time
   or numeric UTC offset). Unqualified month/day may prefill the next occurrence
   year as specified below, never a default duration.
-  Missing or ambiguous fields stay empty; clarification never exports an event.
+  Missing or ambiguous date/time/duration fields stay empty; clarification never
+  exports an event. An unspecified timezone defaults to Beijing (+08:00).
+  Calendar confirmation must not ask users to enter or edit a timezone; retain
+  the numeric offset internally for correct reminder/export instants. Explicit
+  source offsets remain authoritative rather than silently changing an instant.
 - Local mode may extract only high-confidence schedule language containing both
   a time expression and an action cue. A bare date or time must not become a task.
 - The primary task outcome is a local reminder, not a cloud calendar write.
-  After the user completes title, start, end and UTC offset, they can choose a
+  After the user completes title, start and end, they can choose a
   lead time and explicitly create one reminder. Persist reminders only below the
   current user's RealtimeDictionary profile, never in the install directory.
 - The tray host checks reminders locally. At the due time show one compact,
@@ -576,6 +731,16 @@
   checks. It must not claim measured completion percentage or real-client acceptance.
 
 ## Structure
+
+- `.local-asr/`: ignored, project-local Whisper feasibility environment. Keep
+  its virtual environment in `venv/`, public model weights in `models/`, and
+  private diagnostic results/logs in `results/`. Never include these in Git or
+  distributable packages. Install dependencies only in this virtual environment;
+  do not alter global Python, system CUDA, drivers, credentials or cloud routing.
+  Local transcription uses only the user-designated video. Compare warm chunk
+  latency separately from model loading and full-file throughput; without a
+  reference transcript, do not report a word-error rate. Integrate into the app
+  only after an explicit measurable feasibility result.
 
 - `native-host/`: Windows tray host, hotkeys, tracking, small highlight windows,
   adaptive audio segmentation, and the process-loopback activation bridge.
@@ -755,6 +920,17 @@ uses the most recently compiled executable and does not build newer sources.
   remain unless the user separately requests their removal.
 
 ## Verification
+
+- Caption transcription may have at most two in-flight requests. Buffer completed
+  results by capture sequence and deliver in source order; a bounded same-chunk
+  retry must hold its position. Dropped chunks advance the delivery sequence with
+  an explicit gap, and stopping a session cancels buffered results. Keep the
+  existing provider, consent, price guards and bounded pending queue unchanged.
+- Speech transport has an explicit eight-second connection budget within its
+  existing 25-second total budget. Report the observed timeout phase and elapsed
+  time; an early connect/header timeout must not be mislabeled as 25 seconds.
+  Permit one immediate retry only for a timeout before request submission, sharing
+  the original deadline. Never retry authentication/payment/policy errors.
 
 - Offline regression: `python tests/run_offline.py`. The runner must isolate
   `%APPDATA%` and provider credential environment variables before importing

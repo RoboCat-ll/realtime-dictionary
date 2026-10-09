@@ -4,7 +4,7 @@
 
 **当前为开发中的 Beta 源码快照。** 真实聊天软件兼容性、滚动跟随、多显示器和长时间会议仍需验证；不保证所有软件和布局都能准确识别。本仓库首次上传不包含安装包，历史本地安装包也不代表当前源码。
 
-当前源码版本由 `semantic-overlay/version.txt` 定义（`0.20.3-beta`）。这一版完成宿主职责拆分，修复请求中修改输入后的按钮与迟到结果，并保留费用拦截、加密保存和数据控制；尚不代表已通过公司部署验收。
+当前源码版本由 `semantic-overlay/version.txt` 定义（`0.20.4-beta`）。这一版完成宿主职责拆分，修复请求中修改输入后的按钮与迟到结果，并保留费用拦截、加密保存和数据控制；尚不代表已通过公司部署验收。
 
 2026-10-03 补验：QQ 与微信各 3 条真实消息完成点击解释试跑；单显示器上实际横向/纵向独立调整浮框、保存与程序重启后恢复 1180×528 尺寸通过。六条消息不代表正式 50 条验收，也不能证明故障率低于 1%。详细范围见真实验收记录。
 
@@ -12,15 +12,23 @@
 
 - 微信与 QQ 共用的单次消息解释：按 `Ctrl+Alt+K` 后点击一次目标消息；优先读取完整消息控件，读不到时自动定位整个消息气泡并 OCR。
 - 每次只发送当前消息，最多 1000 个字符；一次返回整段中文解释和 0-5 个原文术语。原文在面板中始终可见、可修改。
-- 查词卡片立即打开；除含义确定的程序快捷键外，每次主动查词都会自动请求
+- 查词卡片立即打开；除含义确定的程序快捷键及已命中的结果缓存外，主动查词会请求
   在线 AI 解释。本地内容只用于等待期间的即时预览，不需要再点一次 AI 查询。
 - 整窗 OCR、悬浮助手与原文高亮保留为兼容实验；Jev/TypeSafe 已移除。
 - 递归查词、返回、主动选词查询与可编辑输入兜底。
-- 会议字幕和日程提醒保留为冻结的实验功能，不属于当前首次使用或产品验证主路径。
+- 日程作为需要确认的轻量辅助；会议字幕仍为实验能力，不属于当前成熟度承诺。
 
 产品范围、指标和真实验收分别见 [PRODUCT_SCOPE.md](semantic-overlay/PRODUCT_SCOPE.md)、[METRICS.md](semantic-overlay/METRICS.md) 与 [REAL_WORLD_TEST_PROTOCOL.md](semantic-overlay/REAL_WORLD_TEST_PROTOCOL.md)。
 
 ## 效果演示
+
+**新版功能导览（约 40 秒）**：当前原生程序界面，使用合成消息、预设解释和字幕数据；非现场模型/OCR/语音识别录像，不代表实际响应时间或准确率。日程停在确认前，字幕明确标为实验能力。
+
+![实时字典功能导览](semantic-overlay/media/feature-tour.gif)
+
+[下载 MP4，方便聊天分享](semantic-overlay/media/feature-tour.mp4) · [演示范围](semantic-overlay/media/README.md) · [版本与已知问题](semantic-overlay/RELEASE_NOTES.md)
+
+下面保留历史真实 QQ 操作片段，旧版样式可能与当前界面不同。
 
 主流程是 `Ctrl+Alt+K` → 单击微信或 QQ 的一条消息 → 阅读整句解释 → 按需点术语查看注释。下面的 QQ 动图由一次真实操作的三个画面拼成：点击消息后，程序解释整句；再点原文中的 `token`，查看它在该句中的含义。画面只保留被点击的气泡和解释面板，其他会话、联系人和消息均已遮盖；动图经过剪辑，不能用来衡量响应延迟。
 
@@ -97,7 +105,7 @@ semantic-overlay/
 在 `semantic-overlay` 目录运行：
 
 ```powershell
-python -m unittest discover -s tests -v
+python tests/run_offline.py
 python -m py_compile ocr_service.py server.py
 powershell -File native-host/build.ps1
 ```

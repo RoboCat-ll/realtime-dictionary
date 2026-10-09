@@ -30,6 +30,68 @@ def silent_wav():
 
 
 class SpeechTests(unittest.TestCase):
+    def test_connect_timeout_retries_before_submission_with_same_budget(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"text":"Recovered connection"}'
+        requests = []
+        def open_attempt(request, timeout):
+            requests.append((request.data, request.rd_deadline, request.rd_connect_budget))
+            if len(requests) == 1:
+                request.rd_timing["phase"] = "connecting"
+                raise urllib.error.URLError(TimeoutError())
+            return response
+        with mock.patch.object(server, "API_KEY", "test-key"), \
+             mock.patch.object(server, "BASE_URL", "https://api.siliconflow.cn/v1"), \
+             mock.patch.object(server, "provider_urlopen", side_effect=open_attempt):
+            self.assertEqual("Recovered connection", server.transcribe_audio(wav())["text"])
+        self.assertEqual(2, len(requests))
+        self.assertEqual(requests[0], requests[1])
+        self.assertEqual(8, requests[0][2])
+
+    def test_early_header_timeout_is_not_named_25_seconds_or_retried(self):
+        def failed(request, timeout):
+            request.rd_timing["phase"] = "awaiting_headers"
+            raise TimeoutError()
+        with mock.patch.object(server, "API_KEY", "test-key"), \
+             mock.patch.object(server, "BASE_URL", "https://api.siliconflow.cn/v1"), \
+             mock.patch.object(server, "provider_urlopen", side_effect=failed) as opened, \
+             mock.patch.object(server, "log"):
+            with self.assertRaisesRegex(server.SpeechProviderError, "等待响应超时") as caught:
+                server.transcribe_audio(wav())
+        self.assertNotIn("25秒", str(caught.exception))
+        self.assertEqual(1, opened.call_count)
+
+    def test_connection_reset_recovers_identical_audio_with_shared_deadline(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"text":"Recovered sentence"}'
+        requests = []
+        def open_attempt(request, timeout):
+            requests.append((request.data, request.rd_deadline, timeout))
+            if len(requests) == 1:
+                raise ConnectionResetError("private detail")
+            return response
+        with mock.patch.object(server, "API_KEY", "test-key"), \
+             mock.patch.object(server, "BASE_URL", "https://api.siliconflow.cn/v1"), \
+             mock.patch.object(server, "provider_urlopen", side_effect=open_attempt):
+            result = server.transcribe_audio(wav())
+        self.assertEqual("Recovered sentence", result["text"])
+        self.assertEqual(2, len(requests))
+        self.assertEqual(requests[0][:2], requests[1][:2])
+        self.assertLessEqual(requests[1][2], requests[0][2])
+
+    def test_reset_near_deadline_does_not_start_another_request(self):
+        def failed(request, timeout):
+            request.rd_deadline = server.time.monotonic() + 0.1
+            raise ConnectionResetError()
+        with mock.patch.object(server, "API_KEY", "test-key"), \
+             mock.patch.object(server, "BASE_URL", "https://api.siliconflow.cn/v1"), \
+             mock.patch.object(server, "provider_urlopen", side_effect=failed) as opened:
+            with self.assertRaises(server.SpeechProviderError):
+                server.transcribe_audio(wav())
+        self.assertEqual(1, opened.call_count)
+
     def test_http_transcribe_requires_token_and_returns_text(self):
         http = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
         thread = Thread(target=http.serve_forever, daemon=True); thread.start()
@@ -59,7 +121,7 @@ class SpeechTests(unittest.TestCase):
             result = server.transcribe_audio(wav())
         self.assertEqual("你好 OneAPI", result["text"])
         request = opened.call_args.args[0]
-        self.assertIn(b'TeleAI/TeleSpeechASR', request.data)
+        self.assertIn(b'FunAudioLLM/SenseVoiceSmall', request.data)
         self.assertIn(b'speech.wav', request.data)
 
     def test_transcription_repairs_only_context_supported_terms(self):
@@ -83,6 +145,8 @@ class SpeechTests(unittest.TestCase):
                          server.repair_caption_terms("book cam 是摄像头型号。"))
 
     def test_speech_model_override_is_bounded(self):
+        with mock.patch.dict('os.environ', {"REALTIME_DICTIONARY_SPEECH_MODEL": ""}):
+            self.assertEqual("FunAudioLLM/SenseVoiceSmall", server.configured_speech_model())
         with mock.patch.dict('os.environ', {"REALTIME_DICTIONARY_SPEECH_MODEL":
                                             "FunAudioLLM/SenseVoiceSmall"}):
             self.assertEqual("FunAudioLLM/SenseVoiceSmall", server.configured_speech_model())
